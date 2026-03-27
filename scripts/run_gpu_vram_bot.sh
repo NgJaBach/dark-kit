@@ -73,4 +73,4 @@ echo "  Poll    : ${GPU_POLL_INTERVAL_SECS:-60}s  |  Alert threshold: ${VRAM_LOW
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-exec "$PYTHON" "$BOT_DIR/cuda_mem_guard.py"
+exec "$PYTHON" "$BOT_DIR/just_training.py"

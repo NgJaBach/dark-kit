@@ -147,7 +147,7 @@ NgJaBach-Shadow-Army/
 │       └── subscribers.json   # Subscribed chat IDs
 │
 └── GpuVramService/
-    ├── cuda_mem_guard.py      # Bot source (single file)
+    ├── just_training.py       # Bot source (single file)
     ├── .env                   # Secrets — gitignored
     ├── .gitignore
     ├── docs/

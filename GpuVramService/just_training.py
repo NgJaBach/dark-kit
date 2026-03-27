@@ -35,8 +35,8 @@ BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")
 THREAD_ID      = int(os.environ["TELEGRAM_THREAD_ID"]) if os.environ.get("TELEGRAM_THREAD_ID") else None
 POLL_INTERVAL  = int(os.environ.get("GPU_POLL_INTERVAL_SECS", "60"))
-LOW_THRESHOLD  = int(os.environ.get("VRAM_LOW_THRESHOLD_PCT", "10"))
-LOW_COOLDOWN   = 600   # minimum seconds between low-VRAM alerts per GPU
+HIGH_THRESHOLD = int(os.environ.get("VRAM_HIGH_THRESHOLD_PCT", "50"))  # alert when free VRAM >= this %
+HIGH_COOLDOWN  = 600   # minimum seconds between high-VRAM alerts per GPU
 
 BOT_DATA_DIR    = Path(__file__).parent / "bot_data"
 SUBS_PATH       = BOT_DATA_DIR / "subscribers.json"
@@ -489,14 +489,15 @@ def fmt_gpu_status() -> str:
     return "\n".join(lines)
 
 
-def fmt_low_vram_alert(gpu: dict) -> str:
+def fmt_high_vram_alert(gpu: dict, bot_username: Optional[str] = None) -> str:
+    mention = f"@{bot_username}" if bot_username else "@bot"
     return (
-        f"⚠️ <b>VRAM Low — GPU {gpu['index']}: {gpu['name']}</b>\n\n"
-        f"Free VRAM has dropped to <b>{gpu['free_pct']}%</b> "
-        f"({gpu['free_mb']:,}MB of {gpu['total_mb']:,}MB remaining).\n"
+        f"🟢 <b>VRAM Available — GPU {gpu['index']}: {gpu['name']}</b>\n\n"
+        f"Free VRAM: <b>{gpu['free_pct']}%</b> "
+        f"({gpu['free_mb']:,}MB of {gpu['total_mb']:,}MB).\n"
         f"Compute util: {gpu['util_pct']}%  ·  Temp: {gpu['temp_c']}°C\n\n"
-        f"<i>Monarch Bach — the territory is being seized. Your orders?</i>\n"
-        f"Use <code>@bot bloat</code> to pre-reserve VRAM."
+        f"<i>Bloating strike window open, Monarch Bach.</i>\n"
+        f"Use <code>{mention} bloat</code> to claim the territory now."
     )
 
 
@@ -578,8 +579,8 @@ def cmd_arise(chat_id: str, subs: SubscriberStore) -> str:
             "⚔️ <b>Garrison activated.</b>\n\n"
             "Bach the Monarch — the VRAM Sentinel stands guard.\n\n"
             "Every GPU on this server is under my surveillance. "
-            f"When free VRAM falls below {LOW_THRESHOLD}% on any device, "
-            "I will report it immediately. When you order occupation, "
+            f"When free VRAM rises above {HIGH_THRESHOLD}% on any unoccupied device, "
+            "I will report the strike window immediately. When you order occupation, "
             "I execute without hesitation and hold the line.\n\n"
             "No trivial model will claim your compute unchallenged.\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
@@ -614,7 +615,7 @@ def cmd_help(bot_username: Optional[str]) -> str:
         f"<code>{m} arise</code>     — Subscribe this chat to VRAM alerts\n"
         f"<code>{m} dismiss</code>   — Unsubscribe this chat\n\n"
         f"<code>{m} help</code>      — This registry\n\n"
-        f"Auto-alert fires when free VRAM drops below <b>{LOW_THRESHOLD}%</b> on any GPU.\n"
+        f"Auto-alert fires when free VRAM rises above <b>{HIGH_THRESHOLD}%</b> on any unoccupied GPU.\n"
         f"Alerts suppressed for actively-bloated GPUs.\n\n"
         f"<i>Monarch Bach, your garrison awaits your command.</i>"
     )
@@ -788,11 +789,11 @@ def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str]) -> No
 
 # ── GPU monitor thread ────────────────────────────────────────────────────────
 
-def gpu_monitor_loop(subs: SubscriberStore) -> None:
+def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None) -> None:
     """
     Poll GPU stats every POLL_INTERVAL seconds.
-    Alert if free VRAM < LOW_THRESHOLD% on any GPU that is not actively bloated.
-    Alert cooldown: LOW_COOLDOWN seconds per GPU to avoid spam.
+    Alert if free VRAM >= HIGH_THRESHOLD% on any GPU that is not actively bloated.
+    Alert cooldown: HIGH_COOLDOWN seconds per GPU to avoid spam.
     """
     last_alert: dict[int, float] = {}
 
@@ -804,16 +805,16 @@ def gpu_monitor_loop(subs: SubscriberStore) -> None:
 
             for g in gpus:
                 idx = g["index"]
-                # Skip alert if we are the ones occupying this GPU
+                # Skip alert if we are already occupying this GPU
                 if idx in bloated_gpus:
                     continue
-                if g["free_pct"] < LOW_THRESHOLD:
+                if g["free_pct"] >= HIGH_THRESHOLD:
                     now     = time.time()
                     last_ts = last_alert.get(idx, 0)
-                    if now - last_ts > LOW_COOLDOWN:
+                    if now - last_ts > HIGH_COOLDOWN:
                         last_alert[idx] = now
-                        _send_all(fmt_low_vram_alert(g), subs)
-                        print(f"[monitor] Low VRAM alert — GPU {idx}: {g['free_pct']}% free")
+                        _send_all(fmt_high_vram_alert(g, bot_username), subs)
+                        print(f"[monitor] High VRAM alert — GPU {idx}: {g['free_pct']}% free")
 
             summary = "  ".join(
                 f"GPU{g['index']}:{g['used_mb']}MB/{g['total_mb']}MB({g['used_pct']}%)"
@@ -860,7 +861,7 @@ def main() -> None:
         target=telegram_poll_loop, args=(subs, bot_username), daemon=True
     ).start()
     threading.Thread(
-        target=gpu_monitor_loop, args=(subs,), daemon=True
+        target=gpu_monitor_loop, args=(subs, bot_username), daemon=True
     ).start()
 
     try:
