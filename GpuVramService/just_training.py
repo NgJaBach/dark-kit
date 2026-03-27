@@ -40,6 +40,7 @@ HIGH_COOLDOWN  = 600   # minimum seconds between high-VRAM alerts per GPU
 
 BOT_DATA_DIR    = Path(__file__).parent / "bot_data"
 SUBS_PATH       = BOT_DATA_DIR / "subscribers.json"
+NAMES_PATH      = BOT_DATA_DIR / "names.json"
 
 REQUEST_TIMEOUT = 15
 POLL_TIMEOUT    = 30
@@ -350,6 +351,38 @@ class SubscriberStore:
             return list(self._ids)
 
 
+class NameStore:
+    """Persists per-chat display names. Default name for the primary chat is 'Bach'."""
+
+    def __init__(self, path: Path, primary_id: str):
+        self.path     = path
+        self._lock    = threading.Lock()
+        self._names: dict[str, str] = {str(primary_id): "Bach"}
+        self._load()
+
+    def _load(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                with self.path.open("r", encoding="utf-8") as f:
+                    self._names.update(json.load(f))
+            except Exception:
+                pass
+
+    def _save(self):
+        with self.path.open("w", encoding="utf-8") as f:
+            json.dump(self._names, f, indent=2)
+
+    def set(self, chat_id: str, name: str) -> None:
+        with self._lock:
+            self._names[str(chat_id)] = name
+            self._save()
+
+    def get(self, chat_id: str) -> str:
+        with self._lock:
+            return self._names.get(str(chat_id), "Commander")
+
+
 # ── Telegram I/O ─────────────────────────────────────────────────────────────
 
 def _send(text: str, chat_id: str = None, thread_id: int = None,
@@ -379,6 +412,12 @@ def _send(text: str, chat_id: str = None, thread_id: int = None,
 def _send_all(text: str, subs: SubscriberStore) -> None:
     for cid in subs.all():
         _send(text, cid)
+
+
+def _broadcast_named(fmt_fn, subs: SubscriberStore, names: NameStore) -> None:
+    """Send a personalized message to each subscriber using their registered name."""
+    for cid in subs.all():
+        _send(fmt_fn(names.get(cid)), cid)
 
 
 def _edit_message(chat_id: str, message_id: int, text: str,
@@ -530,12 +569,12 @@ def _bar(pct: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
-def fmt_gpu_status() -> str:
+def fmt_gpu_status(name: str = "Bach") -> str:
     gpus = get_gpu_stats()
     if not gpus:
         return (
             "⚠️ <b>No GPU data available.</b>\n"
-            "nvidia-smi failed to respond, Monarch Bach."
+            f"nvidia-smi failed to respond, Monarch {name}."
         )
     with _sessions_lock:
         active_sessions = dict(_sessions)
@@ -561,57 +600,57 @@ def fmt_gpu_status() -> str:
             f"  Compute: {g['util_pct']}%   Temp: {g['temp_c']}°C"
         )
 
-    lines.append("\n<i>Garrison report complete, Monarch Bach.</i>")
+    lines.append(f"\n<i>Garrison report complete, Monarch {name}.</i>")
     return "\n".join(lines)
 
 
-def fmt_high_vram_alert(gpu: dict, bot_username: Optional[str] = None) -> str:
+def fmt_high_vram_alert(gpu: dict, bot_username: Optional[str] = None, name: str = "Bach") -> str:
     mention = f"@{bot_username}" if bot_username else "@bot"
     return (
         f"🟢 <b>VRAM Available — GPU {gpu['index']}: {gpu['name']}</b>\n\n"
         f"Free VRAM: <b>{gpu['free_pct']}%</b> "
         f"({gpu['free_mb']:,}MB of {gpu['total_mb']:,}MB).\n"
         f"Compute util: {gpu['util_pct']}%  ·  Temp: {gpu['temp_c']}°C\n\n"
-        f"<i>Bloating strike window open, Monarch Bach.</i>\n"
+        f"<i>Bloating strike window open, Monarch {name}.</i>\n"
         f"Use <code>{mention} bloat</code> to claim the territory now."
     )
 
 
-def fmt_bloat_results(results: list[tuple[bool, int, str]]) -> str:
+def fmt_bloat_results(results: list[tuple[bool, int, str]], name: str = "Bach") -> str:
     all_ok = all(ok for ok, _, _ in results)
     header = "🔒 <b>VRAM Occupation — Successful</b>" if all_ok else "⚠️ <b>VRAM Occupation — Partial/Failed</b>"
     lines  = [header, ""]
     for ok, mb, msg in results:
         lines.append(f"{'✅' if ok else '❌'} {msg}")
     if all_ok:
-        lines.append("\n<i>Territory claimed and held, Monarch Bach.</i>")
+        lines.append(f"\n<i>Territory claimed and held, Monarch {name}.</i>")
     else:
         lines.append("\n<i>Occupation incomplete. Verify VRAM availability.</i>")
     return "\n".join(lines)
 
 
-def fmt_release_results(results: list[tuple[int, int]]) -> str:
+def fmt_release_results(results: list[tuple[int, int]], name: str = "Bach") -> str:
     if not results:
         return "No active bloat was found to release."
     lines = ["🔓 <b>VRAM Released</b>\n"]
     for idx, mb in results:
         lines.append(f"✅ GPU {idx}: {mb:,}MB freed")
-    lines.append("\n<i>Garrison withdrawn. Territory relinquished, Monarch Bach.</i>")
+    lines.append(f"\n<i>Garrison withdrawn. Territory relinquished, Monarch {name}.</i>")
     return "\n".join(lines)
 
 
-def fmt_killer_armed(gpu_indices: list[int], threshold_pct: int) -> str:
+def fmt_killer_armed(gpu_indices: list[int], threshold_pct: int, name: str = "Bach") -> str:
     gpu_list = ", ".join(f"GPU {i}" for i in sorted(gpu_indices))
     return (
         f"☠️ <b>KILLER MODE ARMED — {gpu_list}</b>\n\n"
         f"Trigger: free VRAM drops below <b>{threshold_pct}%</b>\n"
         f"Action:  immediate full VRAM seizure (100% occupation)\n\n"
-        f"<i>Autopilot engaged. I will strike without waiting for orders, Monarch Bach.\n"
+        f"<i>Autopilot engaged. I will strike without waiting for orders, Monarch {name}.\n"
         f"Reminders every {KILLER_REMINDER_SECS}s until disarmed.</i>"
     )
 
 
-def fmt_killer_reminder(gpus: list[dict]) -> str:
+def fmt_killer_reminder(gpus: list[dict], name: str = "Bach") -> str:
     with _killer_lock:
         active = dict(_killer_sessions)
     with _sessions_lock:
@@ -630,33 +669,40 @@ def fmt_killer_reminder(gpus: list[dict]) -> str:
             )
         else:
             lines.append(f"GPU {idx}: threshold &lt; {ks.threshold_pct}% free  |  no data")
-    lines.append("\n<i>Killer mode still armed. Use <code>unkill</code> to stand down.</i>")
+    lines.append(f"\n<i>Killer mode still armed, Monarch {name}. Use <code>unkill</code> to stand down.</i>")
     return "\n".join(lines)
 
 
-def fmt_killer_strike(gpu: dict, allocated_mb: int) -> str:
+def fmt_killer_strike(gpu: dict, allocated_mb: int, name: str = "Bach") -> str:
     return (
         f"☠️ <b>KILLER MODE STRUCK — GPU {gpu['index']}: {gpu['name']}</b>\n\n"
         f"Free VRAM fell to <b>{gpu['free_pct']}%</b> — autopilot triggered.\n"
         f"Allocated <b>{allocated_mb:,}MB</b> — VRAM maxed out.\n\n"
-        f"<i>Territory seized automatically, Monarch Bach.</i>"
+        f"<i>Territory seized automatically, Monarch {name}.</i>"
     )
 
 
-def fmt_killer_disarmed(indices: list[int]) -> str:
+def fmt_killer_disarmed(indices: list[int], name: str = "Bach") -> str:
     if not indices:
         return "No active killer mode to disarm."
     gpu_list = ", ".join(f"GPU {i}" for i in sorted(indices))
     return (
         f"🔓 <b>Killer Mode Disarmed — {gpu_list}</b>\n\n"
-        f"<i>Autopilot stood down. Manual control restored, Monarch Bach.</i>"
+        f"<i>Autopilot stood down. Manual control restored, Monarch {name}.</i>"
     )
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
-def cmd_status() -> str:
-    return fmt_gpu_status()
+def cmd_status(name: str = "Bach") -> str:
+    return fmt_gpu_status(name)
+
+
+def cmd_setname(chat_id: str, new_name: str, names: NameStore) -> str:
+    if not new_name.strip():
+        return "Provide a name. Usage: <code>setname YourName</code>"
+    names.set(chat_id, new_name.strip())
+    return f"Acknowledged. I will address you as <b>{new_name.strip()}</b>."
 
 
 def cmd_bloat(chat_id: str, thread_id: Optional[int]) -> None:
@@ -740,12 +786,12 @@ def cmd_unkill(chat_id: str, thread_id: Optional[int]) -> None:
     )
 
 
-def cmd_arise(chat_id: str, subs: SubscriberStore) -> str:
+def cmd_arise(chat_id: str, subs: SubscriberStore, name: str = "Bach") -> str:
     added = subs.add(chat_id)
     if added:
         return (
             "⚔️ <b>Garrison activated.</b>\n\n"
-            "Bach the Monarch — the VRAM Sentinel stands guard.\n\n"
+            f"{name} the Monarch — the VRAM Sentinel stands guard.\n\n"
             "Every GPU on this server is under my surveillance. "
             f"When free VRAM rises above {HIGH_THRESHOLD}% on any unoccupied device, "
             "I will report the strike window immediately. When you order occupation, "
@@ -754,22 +800,22 @@ def cmd_arise(chat_id: str, subs: SubscriberStore) -> str:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>VRAM Sentinel, standing by.</b>"
         )
-    return "This channel already receives garrison reports, Monarch Bach."
+    return f"This channel already receives garrison reports, Monarch {name}."
 
 
-def cmd_dismiss(chat_id: str, subs: SubscriberStore) -> str:
+def cmd_dismiss(chat_id: str, subs: SubscriberStore, name: str = "Bach") -> str:
     if chat_id == subs.primary:
         return (
-            "The primary command channel cannot be removed, Monarch Bach.\n"
+            f"The primary command channel cannot be removed, Monarch {name}.\n"
             "<i>The sentinel remains at post.</i>"
         )
     removed = subs.remove(chat_id)
     if removed:
         return "This channel has been removed from garrison reports.\n<i>Order carried out.</i>"
-    return "This channel was not receiving reports, Monarch Bach."
+    return f"This channel was not receiving reports, Monarch {name}."
 
 
-def cmd_help(bot_username: Optional[str]) -> str:
+def cmd_help(bot_username: Optional[str], name: str = "Bach") -> str:
     m = f"@{bot_username}" if bot_username else "@bot"
     return (
         f"📋 <b>VRAM Sentinel — Command Registry</b>\n"
@@ -786,11 +832,12 @@ def cmd_help(bot_username: Optional[str]) -> str:
         f"Reminders fire every {KILLER_REMINDER_SECS}s while armed.\n\n"
         f"<b>Notifications</b>\n"
         f"<code>{m} arise</code>     — Subscribe this chat to VRAM alerts\n"
-        f"<code>{m} dismiss</code>   — Unsubscribe this chat\n\n"
+        f"<code>{m} dismiss</code>   — Unsubscribe this chat\n"
+        f"<code>{m} setname Name</code> — Set the name the bot uses to address you\n\n"
         f"<code>{m} help</code>      — This registry\n\n"
         f"Auto-alert fires when free VRAM rises above <b>{HIGH_THRESHOLD}%</b> on any unoccupied GPU.\n"
         f"Alerts suppressed for actively-bloated GPUs.\n\n"
-        f"<i>Monarch Bach, your garrison awaits your command.</i>"
+        f"<i>Monarch {name}, your garrison awaits your command.</i>"
     )
 
 
@@ -807,7 +854,7 @@ def _match_prefix(text: str, bot_username: Optional[str]) -> Optional[str]:
 
 
 def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
-                  chat_id: str, thread_id: Optional[int]) -> None:
+                  chat_id: str, thread_id: Optional[int], names: NameStore = None) -> None:
     rest = _match_prefix(text, bot_username)
     if rest is None:
         return
@@ -818,8 +865,10 @@ def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
     if cmd != "arise" and chat_id not in subs.all():
         return  # Not subscribed — ignore all commands except arise
 
+    name = names.get(chat_id) if names else "Bach"
+
     if cmd == "status":
-        _send(cmd_status(), chat_id, thread_id)
+        _send(cmd_status(name), chat_id, thread_id)
     elif cmd == "bloat":
         cmd_bloat(chat_id, thread_id)
     elif cmd == "release":
@@ -829,23 +878,26 @@ def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
     elif cmd == "unkill":
         cmd_unkill(chat_id, thread_id)
     elif cmd == "arise":
-        _send(cmd_arise(chat_id, subs), chat_id, thread_id)
+        _send(cmd_arise(chat_id, subs, name), chat_id, thread_id)
     elif cmd == "dismiss":
-        _send(cmd_dismiss(chat_id, subs), chat_id, thread_id)
+        _send(cmd_dismiss(chat_id, subs, name), chat_id, thread_id)
+    elif cmd == "setname":
+        new_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        _send(cmd_setname(chat_id, new_name, names) if names else "Name store unavailable.", chat_id, thread_id)
     elif cmd == "help":
-        _send(cmd_help(bot_username), chat_id, thread_id)
+        _send(cmd_help(bot_username, name), chat_id, thread_id)
     else:
-        name = f"@{bot_username}" if bot_username else "@bot"
+        mention = f"@{bot_username}" if bot_username else "@bot"
         _send(
             f"Unknown command: <code>{cmd}</code>. "
-            f"Use <code>{name} help</code> for the registry.",
+            f"Use <code>{mention} help</code> for the registry.",
             chat_id, thread_id,
         )
 
 
 # ── Callback query handler ────────────────────────────────────────────────────
 
-def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
+def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) -> None:
     """
     Callback data protocol:
       G:{gpu_spec}          — GPU selection step (gpu_spec: "0", "1", ..., "all")
@@ -865,6 +917,8 @@ def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
     if chat_id not in subs.all():
         _answer_callback(cbq_id, "Not authorized.")
         return
+
+    name = names.get(chat_id) if names else "Bach"
 
     # ── Cancel ────────────────────────────────────────────────────────────────
     if data == "X":
@@ -909,7 +963,7 @@ def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
             ok, mb, msg_txt = bloat_gpu(idx, pct)
             results.append((ok, mb, msg_txt))
 
-        _edit_message(chat_id, message_id, fmt_bloat_results(results))
+        _edit_message(chat_id, message_id, fmt_bloat_results(results, name))
         return
 
     # ── Release: R:{gpu_spec} ─────────────────────────────────────────────────
@@ -919,12 +973,12 @@ def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
 
         if gpu_spec == "all":
             freed       = release_all()
-            result_text = fmt_release_results(freed)
+            result_text = fmt_release_results(freed, name)
         else:
             idx  = int(gpu_spec)
             ok, mb, msg_txt = release_gpu(idx)
             result_text = (
-                fmt_release_results([(idx, mb)])
+                fmt_release_results([(idx, mb)], name)
                 if ok else f"⚠️ {msg_txt}"
             )
 
@@ -959,7 +1013,7 @@ def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
         for idx in targets:
             killer_arm(idx, threshold)
 
-        _edit_message(chat_id, message_id, fmt_killer_armed(targets, threshold))
+        _edit_message(chat_id, message_id, fmt_killer_armed(targets, threshold, name))
         return
 
     # ── Disarm killer mode: UK:{gpu_spec} ────────────────────────────────────
@@ -974,7 +1028,7 @@ def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
             ok, _ = killer_disarm(idx)
             indices = [idx] if ok else []
 
-        _edit_message(chat_id, message_id, fmt_killer_disarmed(indices))
+        _edit_message(chat_id, message_id, fmt_killer_disarmed(indices, name))
         return
 
     _answer_callback(cbq_id)
@@ -982,7 +1036,7 @@ def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
 
 # ── Telegram poll thread ──────────────────────────────────────────────────────
 
-def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str]) -> None:
+def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str], names: NameStore = None) -> None:
     offset = 0
     while True:
         updates = _get_updates(offset)
@@ -992,7 +1046,7 @@ def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str]) -> No
                 # Callback query (inline button press)
                 cbq = upd.get("callback_query")
                 if cbq:
-                    _handle_callback(cbq, subs)
+                    _handle_callback(cbq, subs, names)
                     continue
 
                 # Text message
@@ -1008,14 +1062,14 @@ def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str]) -> No
                 if not text:
                     continue
                 print(f"[update] chat={chat_id} thread={thread_id} text={text[:60]!r}")
-                dispatch_text(text, subs, bot_username, chat_id, thread_id)
+                dispatch_text(text, subs, bot_username, chat_id, thread_id, names)
             except Exception as e:
                 print(f"[telegram handler error] {e}")
 
 
 # ── GPU monitor thread ────────────────────────────────────────────────────────
 
-def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None) -> None:
+def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None, names: NameStore = None) -> None:
     """
     Poll GPU stats every POLL_INTERVAL seconds.
     Alert if free VRAM >= HIGH_THRESHOLD% on any GPU that is not actively bloated.
@@ -1042,7 +1096,10 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None) 
                         print(f"[killer] GPU {idx}: {g['free_pct']}% free < {ks.threshold_pct}% — striking")
                         ok, allocated_mb, _ = bloat_gpu(idx, 100)
                         if ok:
-                            _send_all(fmt_killer_strike(g, allocated_mb), subs)
+                            if names:
+                                _broadcast_named(lambda n, _g=g, _mb=allocated_mb: fmt_killer_strike(_g, _mb, n), subs, names)
+                            else:
+                                _send_all(fmt_killer_strike(g, allocated_mb), subs)
                         continue  # skip high-VRAM alert for this GPU this cycle
 
                 # ── High VRAM alert (bloat opportunity) ───────────────────────
@@ -1053,7 +1110,10 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None) 
                     last_ts = last_alert.get(idx, 0)
                     if now - last_ts > HIGH_COOLDOWN:
                         last_alert[idx] = now
-                        _send_all(fmt_high_vram_alert(g, bot_username), subs)
+                        if names:
+                            _broadcast_named(lambda n, _g=g: fmt_high_vram_alert(_g, bot_username, n), subs, names)
+                        else:
+                            _send_all(fmt_high_vram_alert(g, bot_username), subs)
                         print(f"[monitor] High VRAM alert — GPU {idx}: {g['free_pct']}% free")
 
             summary = "  ".join(
@@ -1070,7 +1130,7 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None) 
 
 # ── Killer reminder thread ────────────────────────────────────────────────────
 
-def killer_reminder_loop(subs: SubscriberStore) -> None:
+def killer_reminder_loop(subs: SubscriberStore, names: NameStore = None) -> None:
     """Send a reminder every KILLER_REMINDER_SECS while any killer session is armed."""
     while True:
         time.sleep(KILLER_REMINDER_SECS)
@@ -1080,10 +1140,11 @@ def killer_reminder_loop(subs: SubscriberStore) -> None:
             if not active:
                 continue
             gpus = get_gpu_stats()
-            msg  = fmt_killer_reminder(gpus)
-            if msg:
-                _send_all(msg, subs)
-                print(f"[killer] Reminder sent — {len(active)} GPU(s) armed")
+            if names:
+                _broadcast_named(lambda n, g=gpus: fmt_killer_reminder(g, n), subs, names)
+            else:
+                _send_all(fmt_killer_reminder(gpus), subs)
+            print(f"[killer] Reminder sent — {len(active)} GPU(s) armed")
         except Exception as e:
             print(f"[killer reminder error] {e}")
 
@@ -1098,7 +1159,8 @@ def main() -> None:
         )
 
     BOT_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    subs = SubscriberStore(SUBS_PATH, CHAT_ID)
+    subs  = SubscriberStore(SUBS_PATH, CHAT_ID)
+    names = NameStore(NAMES_PATH, CHAT_ID)
 
     bot_username = _fetch_bot_username()
     if bot_username:
@@ -1118,13 +1180,13 @@ def main() -> None:
         print("[bot] WARNING: No GPUs detected")
 
     threading.Thread(
-        target=telegram_poll_loop, args=(subs, bot_username), daemon=True
+        target=telegram_poll_loop, args=(subs, bot_username, names), daemon=True
     ).start()
     threading.Thread(
-        target=killer_reminder_loop, args=(subs,), daemon=True
+        target=killer_reminder_loop, args=(subs, names), daemon=True
     ).start()
     threading.Thread(
-        target=gpu_monitor_loop, args=(subs, bot_username), daemon=True
+        target=gpu_monitor_loop, args=(subs, bot_username, names), daemon=True
     ).start()
 
     try:

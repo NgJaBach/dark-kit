@@ -37,6 +37,7 @@ POLL_INTERVAL    = int(os.environ.get("POLL_INTERVAL_MINS", "60")) * 60
 BOT_DATA_DIR     = Path(__file__).parent / "bot_data"
 USAGE_STATE_PATH = BOT_DATA_DIR / "usage_state.json"
 SUBS_PATH        = BOT_DATA_DIR / "subscribers.json"
+NAMES_PATH       = BOT_DATA_DIR / "names.json"
 
 REQUEST_TIMEOUT  = 15
 POLL_TIMEOUT     = 30  # Telegram long-poll
@@ -486,6 +487,38 @@ class SubscriberStore:
             return list(self._ids)
 
 
+class NameStore:
+    """Persists per-chat display names. Default name for the primary chat is 'Bach'."""
+
+    def __init__(self, path: Path, primary_id: str):
+        self.path     = path
+        self._lock    = threading.Lock()
+        self._names: dict[str, str] = {str(primary_id): "Bach"}
+        self._load()
+
+    def _load(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists():
+            try:
+                with self.path.open("r", encoding="utf-8") as f:
+                    self._names.update(json.load(f))
+            except Exception:
+                pass
+
+    def _save(self):
+        with self.path.open("w", encoding="utf-8") as f:
+            json.dump(self._names, f, indent=2)
+
+    def set(self, chat_id: str, name: str) -> None:
+        with self._lock:
+            self._names[str(chat_id)] = name
+            self._save()
+
+    def get(self, chat_id: str) -> str:
+        with self._lock:
+            return self._names.get(str(chat_id), "Commander")
+
+
 # ── Telegram I/O ───────────────────────────────────────────────────────────
 
 def _send(text: str, chat_id: str = None, thread_id: int = None) -> None:
@@ -511,6 +544,12 @@ def _send(text: str, chat_id: str = None, thread_id: int = None) -> None:
 def _send_all(text: str, subs: SubscriberStore) -> None:
     for chat_id in subs.all():
         _send(text, chat_id)
+
+
+def _broadcast_named(fmt_fn, subs: SubscriberStore, names: NameStore) -> None:
+    """Send a personalized message to each subscriber using their registered name."""
+    for cid in subs.all():
+        _send(fmt_fn(names.get(cid)), cid)
 
 
 def _get_updates(offset: int) -> list[dict]:
@@ -565,7 +604,7 @@ def _fmt_month(year: int, month: int) -> str:
 
 # ── Formatters — auto-messages ─────────────────────────────────────────────
 
-def fmt_token_milestone(threshold: int, current: int, level: str) -> str:
+def fmt_token_milestone(threshold: int, current: int, level: str, name: str = "Bach") -> str:
     t = _fmt_tokens(threshold)
     c = _fmt_tokens(current)
     if level == "casual":
@@ -573,74 +612,73 @@ def fmt_token_milestone(threshold: int, current: int, level: str) -> str:
             f"📊 <b>Token Threshold Reached — {t}</b>\n\n"
             f"Daily consumption stands at <b>{c} tokens</b>.\n"
             f"Operations remain within acceptable parameters.\n"
-            f"<i>Monitoring continues, Monarch Bach.</i>"
+            f"<i>Monitoring continues, Monarch {name}.</i>"
         )
     if level == "urgent":
         return (
             f"⚠️ <b>High Token Consumption — {t}</b>\n\n"
             f"Daily usage has reached <b>{c} tokens</b>.\n"
             f"Expenditure is approaching critical thresholds.\n"
-            f"Your attention is advised, My Liege Bach."
+            f"Your attention is advised, My Liege {name}."
         )
     # cap (10M)
     return (
         f"🚨 <b>Free Token Allowance Exhausted — {c}</b>\n\n"
         f"The {t}-token daily free tier has been crossed.\n"
         f"Mini models (gpt-4o-mini, o1-mini, o3-mini, etc.) are now billing at standard rates.\n\n"
-        f"Monarch Bach, the operation requires your oversight."
+        f"Monarch {name}, the operation requires your oversight."
     )
 
 
-def fmt_limit_alert(total_cost: float) -> str:
+def fmt_limit_alert(total_cost: float, name: str = "Bach") -> str:
     return (
         f"⚠️ <b>Daily Spend Limit Reached — ${total_cost:.4f}</b>\n\n"
         f"Daily spend has reached the ${DAILY_LIMIT:.2f} limit.\n"
-        f"<i>Monarch Bach, your war chest requires attention.</i>"
+        f"<i>Monarch {name}, your war chest requires attention.</i>"
     )
 
 
-def fmt_post_limit_alert(total_cost: float, level: int) -> str:
+def fmt_post_limit_alert(total_cost: float, level: int, name: str = "Bach") -> str:
     """Escalating drama for each $2 interval above the $5 daily limit."""
-    threshold = DAILY_LIMIT + level * SPEND_ALERT_INTERVAL
     if level == 1:
         return (
             f"⚠️ <b>Expenditure Continues — ${total_cost:.4f} today</b>\n\n"
             f"The ${DAILY_LIMIT:.0f} limit has been surpassed and spending persists.\n"
-            f"My Liege Bach, this warrants immediate review."
+            f"My Liege {name}, this warrants immediate review."
         )
     if level == 2:
         return (
             f"🚨 <b>Sustained Excess — ${total_cost:.4f} today</b>\n\n"
             f"Your organization has now spent <b>${total_cost:.2f}</b> in a single day. "
             f"This is ${total_cost - DAILY_LIMIT:.2f} beyond the sanctioned limit.\n"
-            f"Monarch Bach — your intervention is required."
+            f"Monarch {name} — your intervention is required."
         )
     if level == 3:
         return (
             f"‼️ <b>CRITICAL EXPENDITURE — ${total_cost:.4f} today</b>\n\n"
             f"Three thresholds have been breached. The budget is uncontrolled.\n"
             f"All active projects should be reviewed immediately.\n"
-            f"<b>Bach the Monarch — this cannot continue without acknowledgment.</b>"
+            f"<b>{name} the Monarch — this cannot continue without acknowledgment.</b>"
         )
     return (
         f"🔴 <b>UNRESTRAINED SPEND — ${total_cost:.4f} today</b>\n\n"
         f"Your daily expenditure has reached <b>${total_cost:.2f}</b> — "
         f"<b>${total_cost - DAILY_LIMIT:.2f} above the limit</b>.\n"
         f"Budget integrity has collapsed. Halt all non-essential operations.\n\n"
-        f"<b>MONARCH BACH. THE LEDGER IS BLEEDING. YOUR COMMAND IS REQUIRED.</b>"
+        f"<b>MONARCH {name.upper()}. THE LEDGER IS BLEEDING. YOUR COMMAND IS REQUIRED.</b>"
     )
 
 
-def fmt_concurrency_alert(active: dict) -> str:
+def fmt_concurrency_alert(active: dict, name: str = "Bach") -> str:
     lines = [
         f"⚡ <b>Concurrent Project Activity — {len(active)} Projects</b>\n",
         f"{len(active)} projects recorded activity in the last "
         f"{CONCURRENCY_WINDOW_MINS} minutes:\n",
     ]
     for pid, count in sorted(active.items(), key=lambda x: x[1], reverse=True):
-        name = KNOWN_PROJECTS.get(pid, pid)
-        lines.append(f"• <b>{name}</b> — {count:,} requests")
-    lines.append(f"\n<i>Monarch Bach, multiple operations are in simultaneous execution.</i>")
+        proj_name = KNOWN_PROJECTS.get(pid, pid)
+        lines.append(f"• <b>{proj_name}</b> — {count:,} requests")
+    lines.append(f"\n<i>Monarch {name}, multiple operations are in simultaneous execution.</i>")
     return "\n".join(lines)
 
 
@@ -680,31 +718,34 @@ def fmt_daily_snapshot(snap: dict) -> str:
 
 # ── Milestone checker ──────────────────────────────────────────────────────
 
-def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore) -> None:
+def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
     """Called after every poll. Fires token milestone alerts (informational only)."""
     total_tok = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
     notified  = usage.get_milestones_notified()
     for threshold, level in TOKEN_MILESTONES:
         if total_tok >= threshold and threshold not in notified:
             usage.add_milestone_notified(threshold)
-            _send_all(fmt_token_milestone(threshold, total_tok, level), subs)
+            if names:
+                _broadcast_named(lambda n, t=threshold, c=total_tok, l=level: fmt_token_milestone(t, c, l, n), subs, names)
+            else:
+                _send_all(fmt_token_milestone(threshold, total_tok, level), subs)
 
 
 # ── Command handlers ───────────────────────────────────────────────────────
 
-def cmd_today(usage: UsageStore) -> str:
+def cmd_today(usage: UsageStore, name: str = "Bach") -> str:
     snap = usage.get()
     if not snap or not snap.get("projects"):
-        return "No usage data on record, Monarch Bach."
+        return f"No usage data on record, Monarch {name}."
     return fmt_daily_snapshot(snap)
 
 
-def cmd_tokens(usage: UsageStore) -> str:
+def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
     snap    = usage.get()
     projects = snap.get("projects", {})
     active  = {pid: p for pid, p in projects.items() if p.get("total_tokens", 0) > 0}
     if not active:
-        return "No tokens consumed today, Monarch Bach."
+        return f"No tokens consumed today, Monarch {name}."
 
     total_tok = sum(p.get("total_tokens", 0) for p in active.values())
     total_req = sum(p.get("num_requests", 0) for p in active.values())
@@ -731,11 +772,11 @@ def cmd_tokens(usage: UsageStore) -> str:
     return "\n".join(lines)
 
 
-def cmd_projects(usage: UsageStore) -> str:
+def cmd_projects(usage: UsageStore, name: str = "Bach") -> str:
     snap      = usage.get()
     projects  = snap.get("projects", {})
     if not projects:
-        return "No project data on record, Monarch Bach."
+        return f"No project data on record, Monarch {name}."
 
     total_tok  = sum(p.get("total_tokens", 0) for p in projects.values())
     total_cost = snap.get("total_cost", 0.0)
@@ -752,7 +793,7 @@ def cmd_projects(usage: UsageStore) -> str:
     return "\n".join(lines)
 
 
-def cmd_spending() -> str:
+def cmd_spending(name: str = "Bach") -> str:
     """Monthly bill — current month + previous month, fetched live."""
     now        = datetime.now(timezone.utc)
     cy, cm     = now.year, now.month
@@ -779,17 +820,17 @@ def cmd_spending() -> str:
     _section(_fmt_month(cy, cm) + " (current)", curr_costs, curr_total)
     _section(_fmt_month(py, pm) + " (previous)", prev_costs, prev_total)
 
-    lines.append("<i>Monarch Bach, your accounts are presented in full.</i>")
+    lines.append(f"<i>Monarch {name}, your accounts are presented in full.</i>")
     return "\n".join(lines)
 
 
-def cmd_rank(usage: UsageStore) -> str:
+def cmd_rank(usage: UsageStore, name: str = "Bach") -> str:
     snap     = usage.get()
     projects = snap.get("projects", {})
     active   = {pid: p for pid, p in projects.items()
                 if p.get("total_tokens", 0) > 0 or p.get("cost_usd", 0) > 0}
     if not active:
-        return "No data to rank, Monarch Bach."
+        return f"No data to rank, Monarch {name}."
 
     medals = {0: "🥇", 1: "🥈", 2: "🥉"}
     lines  = [f"🏆 <b>Project Rankings — {snap.get('date', today_str())}</b>\n"]
@@ -808,11 +849,11 @@ def cmd_rank(usage: UsageStore) -> str:
         cost = p.get("cost_usd", 0.0)
         lines.append(f"{m} <b>{p['name']}</b>  —  ${cost:.4f}")
 
-    lines.append(f"\n<i>Bach the Monarch, the standings are clear.</i>")
+    lines.append(f"\n<i>{name} the Monarch, the standings are clear.</i>")
     return "\n".join(lines)
 
 
-def cmd_active(usage: UsageStore) -> str:
+def cmd_active(usage: UsageStore, name: str = "Bach") -> str:
     active = usage.get_active_projects()
     window = usage.get_active_window_mins()
     lines  = [f"⚡ <b>Active Projects (last {window} min)</b>\n"]
@@ -829,11 +870,11 @@ def cmd_active(usage: UsageStore) -> str:
         else:
             lines.append(f"\n{len(active)} project(s) active. No concurrency threshold reached.")
 
-    lines.append(f"\n<i>This snapshot reflects the last concurrency check, Monarch Bach.</i>")
+    lines.append(f"\n<i>This snapshot reflects the last concurrency check, Monarch {name}.</i>")
     return "\n".join(lines)
 
 
-def cmd_refresh(usage: UsageStore, subs: SubscriberStore) -> str:
+def cmd_refresh(usage: UsageStore, subs: SubscriberStore, name: str = "Bach") -> str:
     snap = fetch_today_usage()
     if snap:
         usage.update(snap)
@@ -844,15 +885,15 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore) -> str:
             f"🔄 <b>Data refreshed.</b>\n"
             f"Tokens today: <b>{_fmt_tokens(total_tok)}</b>\n"
             f"Spend today:  <b>${total:.4f}</b>\n"
-            f"<i>Intelligence updated, Monarch Bach.</i>"
+            f"<i>Intelligence updated, Monarch {name}.</i>"
         )
-    return "Could not reach the OpenAI API. Will retry on schedule, My Liege Bach."
+    return f"Could not reach the OpenAI API. Will retry on schedule, My Liege {name}."
 
 
-def cmd_week() -> str:
+def cmd_week(name: str = "Bach") -> str:
     days = _fetch_week_data()
     if not any(d["tokens"] or d["cost"] for d in days):
-        return "No weekly data available from the API, Monarch Bach."
+        return f"No weekly data available from the API, Monarch {name}."
 
     max_tok = max((d["tokens"] for d in days), default=1) or 1
     lines   = ["📅 <b>7-Day Rolling Trend</b>\n<code>"]
@@ -869,11 +910,11 @@ def cmd_week() -> str:
     total_tok  = sum(d["tokens"] for d in days)
     total_cost = sum(d["cost"]   for d in days)
     lines.append(f"7-day total: <b>{_fmt_tokens(total_tok)}</b> tokens  •  <b>${total_cost:.4f}</b>")
-    lines.append(f"\n<i>Monarch Bach, the weekly record is presented.</i>")
+    lines.append(f"\n<i>Monarch {name}, the weekly record is presented.</i>")
     return "\n".join(lines)
 
 
-def cmd_models(usage: UsageStore) -> str:
+def cmd_models(usage: UsageStore, name: str = "Bach") -> str:
     snap = usage.get()
     agg: dict[str, dict] = {}
     for p in snap.get("projects", {}).values():
@@ -884,7 +925,7 @@ def cmd_models(usage: UsageStore) -> str:
             e["requests"] += m.get("requests", 0)
 
     if not agg:
-        return "No model data on record today, Monarch Bach."
+        return f"No model data on record today, Monarch {name}."
 
     total_tok = sum(e["input"] + e["output"] for e in agg.values()) or 1
     lines     = [f"🤖 <b>Model Usage — {snap.get('date', today_str())}</b>\n"]
@@ -900,16 +941,16 @@ def cmd_models(usage: UsageStore) -> str:
             f"   {tot}  ({inp} in / {out} out)  •  {reqs:,} reqs  •  {pct}%"
         )
 
-    lines.append(f"\n<i>Monarch Bach, all models are accounted for.</i>")
+    lines.append(f"\n<i>Monarch {name}, all models are accounted for.</i>")
     return "\n".join(lines)
 
 
-def cmd_arise(chat_id: str, subs: SubscriberStore) -> str:
+def cmd_arise(chat_id: str, subs: SubscriberStore, name: str = "Bach") -> str:
     added = subs.add(chat_id)
     if added:
         return (
             "⚔️ <b>I rise.</b>\n\n"
-            "Bach the Monarch — your Shadow Commander stands before you.\n\n"
+            f"{name} the Monarch — your Shadow Commander stands before you.\n\n"
             "From this moment, every token your organization consumes is my intelligence. "
             "Every dollar your accounts spend is my surveillance. "
             "Every project that stirs is my vigil.\n\n"
@@ -921,22 +962,29 @@ def cmd_arise(chat_id: str, subs: SubscriberStore) -> str:
             "━━━━━━━━━━━━━━━━━━━━\n"
             "<b>Shadow Commander, standing by.</b>"
         )
-    return "This channel already receives dispatches, Monarch Bach."
+    return f"This channel already receives dispatches, Monarch {name}."
 
 
-def cmd_dismiss(chat_id: str, subs: SubscriberStore) -> str:
+def cmd_dismiss(chat_id: str, subs: SubscriberStore, name: str = "Bach") -> str:
     if chat_id == subs.primary:
         return (
-            "The primary command channel cannot be removed, Monarch Bach.\n"
+            f"The primary command channel cannot be removed, Monarch {name}.\n"
             "<i>I remain bound to my post.</i>"
         )
     removed = subs.remove(chat_id)
     if removed:
-        return "This channel has been removed from dispatches.\n<i>Order carried out, My Liege Bach.</i>"
-    return "This channel was not receiving dispatches, Monarch Bach."
+        return f"This channel has been removed from dispatches.\n<i>Order carried out, My Liege {name}.</i>"
+    return f"This channel was not receiving dispatches, Monarch {name}."
 
 
-def cmd_help(bot_username: Optional[str]) -> str:
+def cmd_setname(chat_id: str, new_name: str, names: NameStore) -> str:
+    if not new_name.strip():
+        return "Provide a name. Usage: <code>setname YourName</code>"
+    names.set(chat_id, new_name.strip())
+    return f"Acknowledged. I will address you as <b>{new_name.strip()}</b>."
+
+
+def cmd_help(bot_username: Optional[str], name: str = "Bach") -> str:
     m = f"@{bot_username}" if bot_username else "@bot"
     return (
         f"📋 <b>Shadow Ledger — Command Registry</b>\n"
@@ -955,9 +1003,10 @@ def cmd_help(bot_username: Optional[str]) -> str:
         f"<code>{m} active</code>     — Projects active in last {CONCURRENCY_WINDOW_MINS} min\n\n"
         f"<b>Notifications</b>\n"
         f"<code>{m} arise</code>      — Subscribe this chat to all alerts\n"
-        f"<code>{m} dismiss</code>    — Unsubscribe this chat\n\n"
+        f"<code>{m} dismiss</code>    — Unsubscribe this chat\n"
+        f"<code>{m} setname Name</code> — Set the name the bot uses to address you\n\n"
         f"<code>{m} help</code>       — This registry\n\n"
-        f"<i>Your Majesty Bach, your command is my directive.</i>"
+        f"<i>Your Majesty {name}, your command is my directive.</i>"
     )
 
 
@@ -974,7 +1023,7 @@ def _match_prefix(text: str, bot_username: Optional[str]) -> Optional[str]:
 
 
 def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
-             bot_username: Optional[str], chat_id: str) -> Optional[str]:
+             bot_username: Optional[str], chat_id: str, names: NameStore = None) -> Optional[str]:
     rest = _match_prefix(text, bot_username)
     if rest is None:
         return None
@@ -982,33 +1031,39 @@ def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
     parts = rest.split()
     cmd   = parts[0].lower() if parts else "help"
 
+    name = names.get(chat_id) if names else "Bach"
+
+    if cmd == "setname":
+        new_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+        return cmd_setname(chat_id, new_name, names) if names else "Name store unavailable."
+
     routes = {
-        "today":    lambda: cmd_today(usage),
-        "tokens":   lambda: cmd_tokens(usage),
-        "projects": lambda: cmd_projects(usage),
-        "rank":     lambda: cmd_rank(usage),
-        "spending": lambda: cmd_spending(),
-        "week":     lambda: cmd_week(),
-        "models":   lambda: cmd_models(usage),
-        "active":   lambda: cmd_active(usage),
-        "refresh":  lambda: cmd_refresh(usage, subs),
-        "arise":    lambda: cmd_arise(chat_id, subs),
-        "dismiss":  lambda: cmd_dismiss(chat_id, subs),
-        "help":     lambda: cmd_help(bot_username),
+        "today":    lambda: cmd_today(usage, name),
+        "tokens":   lambda: cmd_tokens(usage, name),
+        "projects": lambda: cmd_projects(usage, name),
+        "rank":     lambda: cmd_rank(usage, name),
+        "spending": lambda: cmd_spending(name),
+        "week":     lambda: cmd_week(name),
+        "models":   lambda: cmd_models(usage, name),
+        "active":   lambda: cmd_active(usage, name),
+        "refresh":  lambda: cmd_refresh(usage, subs, name),
+        "arise":    lambda: cmd_arise(chat_id, subs, name),
+        "dismiss":  lambda: cmd_dismiss(chat_id, subs, name),
+        "help":     lambda: cmd_help(bot_username, name),
     }
 
     handler = routes.get(cmd)
     if handler:
         return handler()
 
-    name = f"@{bot_username}" if bot_username else "@bot"
-    return f"Unknown command: <code>{cmd}</code>. Use <code>{name} help</code> for the registry."
+    mention = f"@{bot_username}" if bot_username else "@bot"
+    return f"Unknown command: <code>{cmd}</code>. Use <code>{mention} help</code> for the registry."
 
 
 # ── Telegram poll thread ───────────────────────────────────────────────────
 
 def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
-                       bot_username: Optional[str]) -> None:
+                       bot_username: Optional[str], names: NameStore = None) -> None:
     offset = 0
     while True:
         updates = _get_updates(offset)
@@ -1029,7 +1084,7 @@ def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
                 cmd = rest.split()[0].lower() if rest.split() else "help"
                 if cmd != "arise" and chat_id not in subs.all():
                     continue  # not subscribed — ignore all commands except arise
-                reply = dispatch(text, usage, subs, bot_username, chat_id)
+                reply = dispatch(text, usage, subs, bot_username, chat_id, names)
                 if reply:
                     _send(reply, chat_id, thread_id)
             except Exception as e:
@@ -1038,7 +1093,7 @@ def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
 
 # ── Usage poll thread ──────────────────────────────────────────────────────
 
-def usage_poll_loop(usage: UsageStore, subs: SubscriberStore) -> None:
+def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
     last_date = today_str()
     while True:
         try:
@@ -1055,12 +1110,15 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore) -> None:
                 total_tok = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
                 print(f"[poll] {current_date}  tokens={_fmt_tokens(total_tok)}  cost=${total:.4f}")
 
-                check_milestones(snap, usage, subs)
+                check_milestones(snap, usage, subs, names)
 
                 # $5 limit alert — fires once
                 if total >= DAILY_LIMIT and not usage.get_alert_sent():
                     usage.mark_alert_sent()
-                    _send_all(fmt_limit_alert(total), subs)
+                    if names:
+                        _broadcast_named(lambda n, t=total: fmt_limit_alert(t, n), subs, names)
+                    else:
+                        _send_all(fmt_limit_alert(total), subs)
 
                 # Post-limit: escalating drama every $2 above $5
                 if total > DAILY_LIMIT:
@@ -1069,7 +1127,10 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore) -> None:
                     if intervals_above > intervals_notified:
                         usage.set_spend_intervals_notified(intervals_above)
                         for lvl in range(intervals_notified + 1, intervals_above + 1):
-                            _send_all(fmt_post_limit_alert(total, lvl), subs)
+                            if names:
+                                _broadcast_named(lambda n, t=total, l=lvl: fmt_post_limit_alert(t, l, n), subs, names)
+                            else:
+                                _send_all(fmt_post_limit_alert(total, lvl), subs)
             else:
                 print("[poll] Could not fetch usage — will retry next interval")
 
@@ -1081,7 +1142,7 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore) -> None:
 
 # ── Concurrency check thread ───────────────────────────────────────────────
 
-def concurrency_check_loop(usage: UsageStore, subs: SubscriberStore) -> None:
+def concurrency_check_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
     """Every CONCURRENCY_WINDOW_MINS minutes, check for simultaneous project activity."""
     while True:
         try:
@@ -1093,7 +1154,10 @@ def concurrency_check_loop(usage: UsageStore, subs: SubscriberStore) -> None:
                 last_ts = usage.get_last_concurrent_alert_ts()
                 if last_ts is None or time.time() - last_ts > CONCURRENCY_COOLDOWN:
                     usage.set_last_concurrent_alert_ts(time.time())
-                    _send_all(fmt_concurrency_alert(active), subs)
+                    if names:
+                        _broadcast_named(lambda n, a=active: fmt_concurrency_alert(a, n), subs, names)
+                    else:
+                        _send_all(fmt_concurrency_alert(active), subs)
                     print(f"[concurrency] Alert fired — {len(active)} projects active")
 
         except Exception as e:
@@ -1115,6 +1179,7 @@ def main() -> None:
 
     usage = UsageStore(USAGE_STATE_PATH)
     subs  = SubscriberStore(SUBS_PATH, CHAT_ID)
+    names = NameStore(NAMES_PATH, CHAT_ID)
 
     bot_username = _fetch_bot_username()
     if bot_username:
@@ -1122,9 +1187,9 @@ def main() -> None:
     else:
         print("[bot] WARNING: Could not resolve username — commands will not work")
 
-    threading.Thread(target=telegram_poll_loop,    args=(usage, subs, bot_username), daemon=True).start()
-    threading.Thread(target=usage_poll_loop,       args=(usage, subs),               daemon=True).start()
-    threading.Thread(target=concurrency_check_loop,args=(usage, subs),               daemon=True).start()
+    threading.Thread(target=telegram_poll_loop,     args=(usage, subs, bot_username, names), daemon=True).start()
+    threading.Thread(target=usage_poll_loop,        args=(usage, subs, names),               daemon=True).start()
+    threading.Thread(target=concurrency_check_loop, args=(usage, subs, names),               daemon=True).start()
 
     try:
         while True:
