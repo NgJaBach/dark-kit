@@ -44,7 +44,9 @@ SUBS_PATH       = BOT_DATA_DIR / "subscribers.json"
 REQUEST_TIMEOUT = 15
 POLL_TIMEOUT    = 30
 
-BLOAT_LEVELS    = [20, 50, 70, 90]   # % occupation targets
+BLOAT_LEVELS          = [20, 50, 70, 90]   # % occupation targets
+KILLER_THRESHOLDS     = [10, 50, 70]       # free VRAM % triggers for killer mode
+KILLER_REMINDER_SECS  = 60                 # reminder interval while killer mode is armed
 
 
 # ── CUDA Driver API ─────────────────────────────────────────────────────────
@@ -81,6 +83,13 @@ def _cuda_init() -> bool:
 # ── Bloat session management ─────────────────────────────────────────────────
 
 @dataclass
+class KillerSession:
+    gpu_idx:      int
+    threshold_pct: int   # auto-bloat fires when free VRAM drops below this %
+    armed_at:     float = field(default_factory=time.time)
+
+
+@dataclass
 class BloatSession:
     gpu_idx:      int
     target_pct:   int
@@ -92,6 +101,9 @@ class BloatSession:
 
 _sessions:      dict[int, BloatSession] = {}
 _sessions_lock: threading.Lock          = threading.Lock()
+
+_killer_sessions:      dict[int, KillerSession] = {}
+_killer_lock:          threading.Lock            = threading.Lock()
 
 
 def _alloc_cuda_vram(gpu_idx: int, target_mb: int) -> tuple[
@@ -216,6 +228,39 @@ def release_all() -> list[tuple[int, int]]:
         _free_session(session)
         results.append((idx, session.allocated_mb))
     return results
+
+
+# ── Killer mode management ────────────────────────────────────────────────────
+
+def killer_arm(gpu_idx: int, threshold_pct: int) -> tuple[bool, str]:
+    """Arm killer mode on a GPU. Returns (success, message)."""
+    with _killer_lock:
+        if gpu_idx in _killer_sessions:
+            existing = _killer_sessions[gpu_idx]
+            _killer_sessions[gpu_idx] = KillerSession(gpu_idx=gpu_idx, threshold_pct=threshold_pct)
+            return True, (
+                f"GPU {gpu_idx}: killer mode re-armed at {threshold_pct}% threshold "
+                f"(was {existing.threshold_pct}%)."
+            )
+        _killer_sessions[gpu_idx] = KillerSession(gpu_idx=gpu_idx, threshold_pct=threshold_pct)
+    return True, f"GPU {gpu_idx}: killer mode armed — auto-bloat fires when free VRAM < {threshold_pct}%."
+
+
+def killer_disarm(gpu_idx: int) -> tuple[bool, str]:
+    """Disarm killer mode on a single GPU."""
+    with _killer_lock:
+        session = _killer_sessions.pop(gpu_idx, None)
+    if session is None:
+        return False, f"GPU {gpu_idx} has no active killer mode."
+    return True, f"GPU {gpu_idx}: killer mode disarmed."
+
+
+def killer_disarm_all() -> list[int]:
+    """Disarm killer mode on all GPUs. Returns list of disarmed gpu indices."""
+    with _killer_lock:
+        indices = list(_killer_sessions.keys())
+        _killer_sessions.clear()
+    return indices
 
 
 # ── GPU stats ────────────────────────────────────────────────────────────────
@@ -447,6 +492,37 @@ def kb_release_select(gpus: list[dict]) -> dict:
     return _kb(rows)
 
 
+def kb_killer_gpu_select(gpus: list[dict]) -> dict:
+    """GPU selection keyboard for killer mode."""
+    rows = []
+    for g in gpus:
+        label = f"GPU {g['index']}: {g['name']}  ({g['free_pct']}% free)"
+        rows.append([(label, f"K:{g['index']}")])
+    rows.append([("All GPUs", "K:all")])
+    rows.append([("❌ Cancel", "X")])
+    return _kb(rows)
+
+
+def kb_killer_threshold_select(gpu_spec: str) -> dict:
+    """Threshold selection keyboard for killer mode."""
+    row = [(f"< {t}% free", f"KT:{t}:{gpu_spec}") for t in KILLER_THRESHOLDS]
+    return _kb([row, [("❌ Cancel", "X")]])
+
+
+def kb_unkill_select(active: dict[int, "KillerSession"]) -> dict:
+    """Disarm selection keyboard based on active killer sessions."""
+    if not active:
+        return _kb([[("No killer mode active", "X")]])
+    rows = []
+    for idx, s in sorted(active.items()):
+        label = f"Disarm GPU {idx}  (threshold: < {s.threshold_pct}% free)"
+        rows.append([(label, f"UK:{idx}")])
+    if len(active) > 1:
+        rows.append([("Disarm All GPUs", "UK:all")])
+    rows.append([("❌ Cancel", "X")])
+    return _kb(rows)
+
+
 # ── Formatters ────────────────────────────────────────────────────────────────
 
 def _bar(pct: int, width: int = 10) -> str:
@@ -524,6 +600,59 @@ def fmt_release_results(results: list[tuple[int, int]]) -> str:
     return "\n".join(lines)
 
 
+def fmt_killer_armed(gpu_indices: list[int], threshold_pct: int) -> str:
+    gpu_list = ", ".join(f"GPU {i}" for i in sorted(gpu_indices))
+    return (
+        f"☠️ <b>KILLER MODE ARMED — {gpu_list}</b>\n\n"
+        f"Trigger: free VRAM drops below <b>{threshold_pct}%</b>\n"
+        f"Action:  immediate full VRAM seizure (100% occupation)\n\n"
+        f"<i>Autopilot engaged. I will strike without waiting for orders, Monarch Bach.\n"
+        f"Reminders every {KILLER_REMINDER_SECS}s until disarmed.</i>"
+    )
+
+
+def fmt_killer_reminder(gpus: list[dict]) -> str:
+    with _killer_lock:
+        active = dict(_killer_sessions)
+    with _sessions_lock:
+        bloated = dict(_sessions)
+
+    if not active:
+        return ""
+
+    lines = ["☠️ <b>KILLER MODE ACTIVE — Reminder</b>\n"]
+    for idx, ks in sorted(active.items()):
+        g = next((g for g in gpus if g["index"] == idx), None)
+        if g:
+            state = "🔒 BLOATED" if idx in bloated else f"{g['free_pct']}% free"
+            lines.append(
+                f"GPU {idx}: threshold &lt; {ks.threshold_pct}% free  |  now: {state}"
+            )
+        else:
+            lines.append(f"GPU {idx}: threshold &lt; {ks.threshold_pct}% free  |  no data")
+    lines.append("\n<i>Killer mode still armed. Use <code>unkill</code> to stand down.</i>")
+    return "\n".join(lines)
+
+
+def fmt_killer_strike(gpu: dict, allocated_mb: int) -> str:
+    return (
+        f"☠️ <b>KILLER MODE STRUCK — GPU {gpu['index']}: {gpu['name']}</b>\n\n"
+        f"Free VRAM fell to <b>{gpu['free_pct']}%</b> — autopilot triggered.\n"
+        f"Allocated <b>{allocated_mb:,}MB</b> — VRAM maxed out.\n\n"
+        f"<i>Territory seized automatically, Monarch Bach.</i>"
+    )
+
+
+def fmt_killer_disarmed(indices: list[int]) -> str:
+    if not indices:
+        return "No active killer mode to disarm."
+    gpu_list = ", ".join(f"GPU {i}" for i in sorted(indices))
+    return (
+        f"🔓 <b>Killer Mode Disarmed — {gpu_list}</b>\n\n"
+        f"<i>Autopilot stood down. Manual control restored, Monarch Bach.</i>"
+    )
+
+
 # ── Command handlers ──────────────────────────────────────────────────────────
 
 def cmd_status() -> str:
@@ -572,6 +701,45 @@ def cmd_release(chat_id: str, thread_id: Optional[int]) -> None:
     )
 
 
+def cmd_killer(chat_id: str, thread_id: Optional[int]) -> None:
+    gpus = get_gpu_stats()
+    if not gpus:
+        _send("⚠️ No GPUs detected. nvidia-smi unavailable.", chat_id, thread_id)
+        return
+
+    if len(gpus) == 1:
+        g    = gpus[0]
+        text = (
+            f"☠️ <b>Killer Mode — GPU {g['index']}: {g['name']}</b>\n\n"
+            f"Current: {g['used_mb']:,}MB / {g['total_mb']:,}MB  ({g['free_pct']}% free)\n\n"
+            f"Set trigger threshold — auto-bloat fires when free VRAM drops below:"
+        )
+        _send(text, chat_id, thread_id, reply_markup=kb_killer_threshold_select("0"))
+    else:
+        _send(
+            "☠️ <b>Killer Mode — Select Target GPU(s)</b>\n\nArm killer mode on:",
+            chat_id, thread_id,
+            reply_markup=kb_killer_gpu_select(gpus),
+        )
+
+
+def cmd_unkill(chat_id: str, thread_id: Optional[int]) -> None:
+    with _killer_lock:
+        active = dict(_killer_sessions)
+    if not active:
+        _send(
+            "🔓 <b>No Active Killer Mode</b>\n\n"
+            "Autopilot is not armed on any GPU, Monarch Bach.",
+            chat_id, thread_id,
+        )
+        return
+    _send(
+        "☠️ <b>Disarm Killer Mode</b>\n\nSelect what to stand down:",
+        chat_id, thread_id,
+        reply_markup=kb_unkill_select(active),
+    )
+
+
 def cmd_arise(chat_id: str, subs: SubscriberStore) -> str:
     added = subs.add(chat_id)
     if added:
@@ -611,6 +779,11 @@ def cmd_help(bot_username: Optional[str]) -> str:
         f"<b>VRAM Control</b>\n"
         f"<code>{m} bloat</code>     — Pre-reserve VRAM (interactive buttons)\n"
         f"<code>{m} release</code>   — Release held VRAM (interactive buttons)\n\n"
+        f"<b>Killer Mode (Autopilot)</b>\n"
+        f"<code>{m} killer</code>    — Arm autopilot: full VRAM seizure when threshold crossed\n"
+        f"<code>{m} unkill</code>    — Disarm killer mode (interactive buttons)\n"
+        f"Thresholds: {', '.join(f'{t}%' for t in KILLER_THRESHOLDS)} free VRAM\n"
+        f"Reminders fire every {KILLER_REMINDER_SECS}s while armed.\n\n"
         f"<b>Notifications</b>\n"
         f"<code>{m} arise</code>     — Subscribe this chat to VRAM alerts\n"
         f"<code>{m} dismiss</code>   — Unsubscribe this chat\n\n"
@@ -651,6 +824,10 @@ def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
         cmd_bloat(chat_id, thread_id)
     elif cmd == "release":
         cmd_release(chat_id, thread_id)
+    elif cmd == "killer":
+        cmd_killer(chat_id, thread_id)
+    elif cmd == "unkill":
+        cmd_unkill(chat_id, thread_id)
     elif cmd == "arise":
         _send(cmd_arise(chat_id, subs), chat_id, thread_id)
     elif cmd == "dismiss":
@@ -671,10 +848,13 @@ def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
 def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
     """
     Callback data protocol:
-      G:{gpu_spec}        — GPU selection step (gpu_spec: "0", "1", ..., "all")
-      P:{pct}:{gpu_spec}  — Bloat execution (pct: 20/50/70/90)
-      R:{gpu_spec}        — Release execution
-      X                   — Cancel
+      G:{gpu_spec}          — GPU selection step (gpu_spec: "0", "1", ..., "all")
+      P:{pct}:{gpu_spec}    — Bloat execution (pct: 20/50/70/90)
+      R:{gpu_spec}          — Release execution
+      K:{gpu_spec}          — Killer mode GPU selection, show threshold picker
+      KT:{threshold}:{gpu_spec} — Arm killer mode at threshold %
+      UK:{gpu_spec}         — Disarm killer mode
+      X                     — Cancel
     """
     cbq_id     = cbq["id"]
     data       = cbq.get("data", "")
@@ -751,6 +931,52 @@ def _handle_callback(cbq: dict, subs: SubscriberStore) -> None:
         _edit_message(chat_id, message_id, result_text)
         return
 
+    # ── Killer GPU selection: K:{gpu_spec} ───────────────────────────────────
+    if data.startswith("K:"):
+        gpu_spec = data[2:]
+        _answer_callback(cbq_id)
+        _edit_message(
+            chat_id, message_id,
+            f"☠️ <b>Killer Mode — Target: {'All GPUs' if gpu_spec == 'all' else f'GPU {gpu_spec}'}</b>\n\n"
+            f"Set trigger threshold — auto-bloat fires when free VRAM drops below:",
+            reply_markup=kb_killer_threshold_select(gpu_spec),
+        )
+        return
+
+    # ── Arm killer mode: KT:{threshold}:{gpu_spec} ───────────────────────────
+    if data.startswith("KT:"):
+        _, threshold_str, gpu_spec = data.split(":", 2)
+        threshold = int(threshold_str)
+
+        _answer_callback(cbq_id, f"Arming killer mode at < {threshold}% free...")
+        _edit_message(
+            chat_id, message_id,
+            f"☠️ <b>Killer Mode — Arming...</b>\n<i>Setting autopilot...</i>",
+        )
+
+        gpus    = get_gpu_stats()
+        targets = [g["index"] for g in gpus] if gpu_spec == "all" else [int(gpu_spec)]
+        for idx in targets:
+            killer_arm(idx, threshold)
+
+        _edit_message(chat_id, message_id, fmt_killer_armed(targets, threshold))
+        return
+
+    # ── Disarm killer mode: UK:{gpu_spec} ────────────────────────────────────
+    if data.startswith("UK:"):
+        gpu_spec = data[3:]
+        _answer_callback(cbq_id, "Disarming...")
+
+        if gpu_spec == "all":
+            indices = killer_disarm_all()
+        else:
+            idx = int(gpu_spec)
+            ok, _ = killer_disarm(idx)
+            indices = [idx] if ok else []
+
+        _edit_message(chat_id, message_id, fmt_killer_disarmed(indices))
+        return
+
     _answer_callback(cbq_id)
 
 
@@ -803,9 +1029,23 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None) 
             with _sessions_lock:
                 bloated_gpus = set(_sessions.keys())
 
+            with _killer_lock:
+                killer_gpus = dict(_killer_sessions)
+
             for g in gpus:
                 idx = g["index"]
-                # Skip alert if we are already occupying this GPU
+
+                # ── Killer mode: auto-bloat to 100% when threshold crossed ──
+                if idx in killer_gpus and idx not in bloated_gpus:
+                    ks = killer_gpus[idx]
+                    if g["free_pct"] < ks.threshold_pct:
+                        print(f"[killer] GPU {idx}: {g['free_pct']}% free < {ks.threshold_pct}% — striking")
+                        ok, allocated_mb, _ = bloat_gpu(idx, 100)
+                        if ok:
+                            _send_all(fmt_killer_strike(g, allocated_mb), subs)
+                        continue  # skip high-VRAM alert for this GPU this cycle
+
+                # ── High VRAM alert (bloat opportunity) ───────────────────────
                 if idx in bloated_gpus:
                     continue
                 if g["free_pct"] >= HIGH_THRESHOLD:
@@ -826,6 +1066,26 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None) 
             print(f"[monitor error] {e}")
 
         time.sleep(POLL_INTERVAL)
+
+
+# ── Killer reminder thread ────────────────────────────────────────────────────
+
+def killer_reminder_loop(subs: SubscriberStore) -> None:
+    """Send a reminder every KILLER_REMINDER_SECS while any killer session is armed."""
+    while True:
+        time.sleep(KILLER_REMINDER_SECS)
+        try:
+            with _killer_lock:
+                active = dict(_killer_sessions)
+            if not active:
+                continue
+            gpus = get_gpu_stats()
+            msg  = fmt_killer_reminder(gpus)
+            if msg:
+                _send_all(msg, subs)
+                print(f"[killer] Reminder sent — {len(active)} GPU(s) armed")
+        except Exception as e:
+            print(f"[killer reminder error] {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -859,6 +1119,9 @@ def main() -> None:
 
     threading.Thread(
         target=telegram_poll_loop, args=(subs, bot_username), daemon=True
+    ).start()
+    threading.Thread(
+        target=killer_reminder_loop, args=(subs,), daemon=True
     ).start()
     threading.Thread(
         target=gpu_monitor_loop, args=(subs, bot_username), daemon=True
