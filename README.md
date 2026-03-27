@@ -73,7 +73,7 @@ POLL_INTERVAL_MINS=60
 
 ### 2. GPU VRAM Sentinel — `@GruVramBot`
 
-**Location:** `GpuVramBot/`
+**Location:** `GpuVramService/`
 **Run:** `bash scripts/run_gpu_vram_bot.sh`
 
 #### What it does
@@ -107,7 +107,7 @@ Monitors VRAM usage across all detected GPUs on the host machine. Sends automati
 
 `20%` · `50%` · `70%` · `90%` of total VRAM on the selected GPU.
 
-#### `.env` file — `GpuVramBot/.env`
+#### `.env` file — `GpuVramService/.env`
 
 ```env
 # Telegram bot token from @BotFather (different bot from @BachsSlave2Bot)
@@ -146,8 +146,8 @@ NgJaBach-Shadow-Army/
 │       ├── usage_state.json   # Today's usage snapshot
 │       └── subscribers.json   # Subscribed chat IDs
 │
-└── GpuVramBot/
-    ├── gpu_vram_bot.py        # Bot source (single file)
+└── GpuVramService/
+    ├── cuda_mem_guard.py      # Bot source (single file)
     ├── .env                   # Secrets — gitignored
     ├── .gitignore
     ├── docs/

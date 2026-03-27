@@ -7,7 +7,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BOT_DIR="$REPO_ROOT/GpuVramBot"
+BOT_DIR="$REPO_ROOT/GpuVramService"
 VENV_DIR="$REPO_ROOT/.venv"
 PYTHON=python3
 
@@ -73,4 +73,4 @@ echo "  Poll    : ${GPU_POLL_INTERVAL_SECS:-60}s  |  Alert threshold: ${VRAM_LOW
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-exec "$PYTHON" "$BOT_DIR/gpu_vram_bot.py"
+exec "$PYTHON" "$BOT_DIR/cuda_mem_guard.py"
