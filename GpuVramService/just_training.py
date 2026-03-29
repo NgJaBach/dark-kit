@@ -31,26 +31,33 @@ import requests
 
 dotenv.load_dotenv()
 
-BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID", "")
-THREAD_ID      = int(os.environ["TELEGRAM_THREAD_ID"]) if os.environ.get("TELEGRAM_THREAD_ID") else None
-POLL_INTERVAL  = int(os.environ.get("GPU_POLL_INTERVAL_SECS", "60"))
-HIGH_THRESHOLD = int(os.environ.get("VRAM_HIGH_THRESHOLD_PCT", "50"))  # alert when free VRAM >= this %
-HIGH_COOLDOWN  = 600   # minimum seconds between high-VRAM alerts per GPU
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+THREAD_ID = (
+    int(os.environ["TELEGRAM_THREAD_ID"])
+    if os.environ.get("TELEGRAM_THREAD_ID")
+    else None
+)
+POLL_INTERVAL = int(os.environ.get("GPU_POLL_INTERVAL_SECS", "60"))
+HIGH_THRESHOLD = int(
+    os.environ.get("VRAM_HIGH_THRESHOLD_PCT", "50")
+)  # alert when free VRAM >= this %
+HIGH_COOLDOWN = 600  # minimum seconds between high-VRAM alerts per GPU
 
-BOT_DATA_DIR    = Path(__file__).parent / "bot_data"
-SUBS_PATH       = BOT_DATA_DIR / "subscribers.json"
-NAMES_PATH      = BOT_DATA_DIR / "names.json"
+BOT_DATA_DIR = Path(__file__).parent / "bot_data"
+SUBS_PATH = BOT_DATA_DIR / "subscribers.json"
+NAMES_PATH = BOT_DATA_DIR / "names.json"
 
 REQUEST_TIMEOUT = 15
-POLL_TIMEOUT    = 30
+POLL_TIMEOUT = 30
 
-BLOAT_LEVELS          = [20, 50, 70, 90]   # % occupation targets
-KILLER_THRESHOLDS     = [10, 50, 70]       # free VRAM % triggers for killer mode
-KILLER_REMINDER_SECS  = 60                 # reminder interval while killer mode is armed
+BLOAT_LEVELS = [20, 50, 70, 90]  # % occupation targets
+KILLER_THRESHOLDS = [10, 50, 70]  # free VRAM % triggers for killer mode
+KILLER_REMINDER_SECS = 60  # reminder interval while killer mode is armed
 
 
 # ── CUDA Driver API ─────────────────────────────────────────────────────────
+
 
 def _load_cuda_lib():
     """Load the CUDA Driver API shared library (platform-agnostic)."""
@@ -66,7 +73,7 @@ def _load_cuda_lib():
     return None
 
 
-_cuda_lib   = _load_cuda_lib()
+_cuda_lib = _load_cuda_lib()
 _cuda_ready = False
 
 
@@ -77,38 +84,40 @@ def _cuda_init() -> bool:
     if _cuda_lib is None:
         return False
     ret = _cuda_lib.cuInit(ctypes.c_uint(0))
-    _cuda_ready = (ret == 0)
+    _cuda_ready = ret == 0
     return _cuda_ready
 
 
 # ── Bloat session management ─────────────────────────────────────────────────
 
+
 @dataclass
 class KillerSession:
-    gpu_idx:      int
-    threshold_pct: int   # auto-bloat fires when free VRAM drops below this %
-    armed_at:     float = field(default_factory=time.time)
+    gpu_idx: int
+    threshold_pct: int  # auto-bloat fires when free VRAM drops below this %
+    armed_at: float = field(default_factory=time.time)
 
 
 @dataclass
 class BloatSession:
-    gpu_idx:      int
-    target_pct:   int
+    gpu_idx: int
+    target_pct: int
     allocated_mb: int
-    ctx:          ctypes.c_void_p
-    ptr:          ctypes.c_uint64
-    started_at:   float = field(default_factory=time.time)
+    ctx: ctypes.c_void_p
+    ptr: ctypes.c_uint64
+    started_at: float = field(default_factory=time.time)
 
 
-_sessions:      dict[int, BloatSession] = {}
-_sessions_lock: threading.Lock          = threading.Lock()
+_sessions: dict[int, BloatSession] = {}
+_sessions_lock: threading.Lock = threading.Lock()
 
-_killer_sessions:      dict[int, KillerSession] = {}
-_killer_lock:          threading.Lock            = threading.Lock()
+_killer_sessions: dict[int, KillerSession] = {}
+_killer_lock: threading.Lock = threading.Lock()
 
 
-def _alloc_cuda_vram(gpu_idx: int, target_mb: int) -> tuple[
-        Optional[ctypes.c_void_p], Optional[ctypes.c_uint64], int]:
+def _alloc_cuda_vram(
+    gpu_idx: int, target_mb: int
+) -> tuple[Optional[ctypes.c_void_p], Optional[ctypes.c_uint64], int]:
     """
     Create a CUDA context on gpu_idx and allocate up to target_mb of VRAM.
     Steps down in 256MB increments on OOM to find the largest viable allocation.
@@ -129,13 +138,17 @@ def _alloc_cuda_vram(gpu_idx: int, target_mb: int) -> tuple[
 
     mb = target_mb
     while mb >= 128:
-        ptr  = ctypes.c_uint64(0)
-        ret  = _cuda_lib.cuMemAlloc_v2(ctypes.byref(ptr), ctypes.c_size_t(mb * 1024 * 1024))
+        ptr = ctypes.c_uint64(0)
+        ret = _cuda_lib.cuMemAlloc_v2(
+            ctypes.byref(ptr), ctypes.c_size_t(mb * 1024 * 1024)
+        )
         if ret == 0:
             # Force physical VRAM residency — critical under WDDM where pages are
             # lazily committed. cuMemsetD8 writes every byte, ensuring the OS
             # actually reserves physical VRAM rather than just virtual addresses.
-            _cuda_lib.cuMemsetD8_v2(ptr, ctypes.c_uint8(0), ctypes.c_size_t(mb * 1024 * 1024))
+            _cuda_lib.cuMemsetD8_v2(
+                ptr, ctypes.c_uint8(0), ctypes.c_size_t(mb * 1024 * 1024)
+            )
             popped = ctypes.c_void_p(0)
             _cuda_lib.cuCtxPopCurrent_v2(ctypes.byref(popped))
             return ctx, ptr, mb
@@ -168,31 +181,40 @@ def bloat_gpu(gpu_idx: int, target_pct: int) -> tuple[bool, int, str]:
     with _sessions_lock:
         if gpu_idx in _sessions:
             s = _sessions[gpu_idx]
-            return (False, 0,
-                    f"GPU {gpu_idx} already has active occupation at {s.target_pct}% "
-                    f"({s.allocated_mb:,}MB held). Release it first.")
+            return (
+                False,
+                0,
+                f"GPU {gpu_idx} already has active occupation at {s.target_pct}% "
+                f"({s.allocated_mb:,}MB held). Release it first.",
+            )
 
     gpus = get_gpu_stats()
-    gpu  = next((g for g in gpus if g["index"] == gpu_idx), None)
+    gpu = next((g for g in gpus if g["index"] == gpu_idx), None)
     if gpu is None:
         return False, 0, f"GPU {gpu_idx} not found."
 
-    total_mb    = gpu["total_mb"]
-    used_mb     = gpu["used_mb"]
-    target_mb   = int(total_mb * target_pct / 100)
-    to_alloc_mb = target_mb - used_mb - 300   # 300MB safety margin
+    total_mb = gpu["total_mb"]
+    used_mb = gpu["used_mb"]
+    target_mb = int(total_mb * target_pct / 100)
+    to_alloc_mb = target_mb - used_mb - 300  # 300MB safety margin
 
     if to_alloc_mb < 128:
         pct_now = int(used_mb / total_mb * 100)
-        return (False, 0,
-                f"GPU {gpu_idx} already at {used_mb:,}MB/{total_mb:,}MB ({pct_now}%). "
-                f"Target {target_pct}% leaves no room to bloat.")
+        return (
+            False,
+            0,
+            f"GPU {gpu_idx} already at {used_mb:,}MB/{total_mb:,}MB ({pct_now}%). "
+            f"Target {target_pct}% leaves no room to bloat.",
+        )
 
     ctx, ptr, allocated_mb = _alloc_cuda_vram(gpu_idx, to_alloc_mb)
     if ctx is None or allocated_mb == 0:
-        return (False, 0,
-                f"CUDA allocation failed on GPU {gpu_idx}. "
-                f"Insufficient VRAM or driver error.")
+        return (
+            False,
+            0,
+            f"CUDA allocation failed on GPU {gpu_idx}. "
+            f"Insufficient VRAM or driver error.",
+        )
 
     session = BloatSession(
         gpu_idx=gpu_idx,
@@ -205,8 +227,11 @@ def bloat_gpu(gpu_idx: int, target_pct: int) -> tuple[bool, int, str]:
         _sessions[gpu_idx] = session
 
     achieved_pct = int((used_mb + allocated_mb) / total_mb * 100)
-    return (True, allocated_mb,
-            f"GPU {gpu_idx}: {allocated_mb:,}MB allocated — ~{achieved_pct}% occupied.")
+    return (
+        True,
+        allocated_mb,
+        f"GPU {gpu_idx}: {allocated_mb:,}MB allocated — ~{achieved_pct}% occupied.",
+    )
 
 
 def release_gpu(gpu_idx: int) -> tuple[bool, int, str]:
@@ -216,7 +241,11 @@ def release_gpu(gpu_idx: int) -> tuple[bool, int, str]:
     if session is None:
         return False, 0, f"GPU {gpu_idx} has no active occupation."
     _free_session(session)
-    return True, session.allocated_mb, f"GPU {gpu_idx}: {session.allocated_mb:,}MB freed."
+    return (
+        True,
+        session.allocated_mb,
+        f"GPU {gpu_idx}: {session.allocated_mb:,}MB freed.",
+    )
 
 
 def release_all() -> list[tuple[int, int]]:
@@ -233,18 +262,26 @@ def release_all() -> list[tuple[int, int]]:
 
 # ── Killer mode management ────────────────────────────────────────────────────
 
+
 def killer_arm(gpu_idx: int, threshold_pct: int) -> tuple[bool, str]:
     """Arm killer mode on a GPU. Returns (success, message)."""
     with _killer_lock:
         if gpu_idx in _killer_sessions:
             existing = _killer_sessions[gpu_idx]
-            _killer_sessions[gpu_idx] = KillerSession(gpu_idx=gpu_idx, threshold_pct=threshold_pct)
+            _killer_sessions[gpu_idx] = KillerSession(
+                gpu_idx=gpu_idx, threshold_pct=threshold_pct
+            )
             return True, (
                 f"GPU {gpu_idx}: killer mode re-armed at {threshold_pct}% threshold "
                 f"(was {existing.threshold_pct}%)."
             )
-        _killer_sessions[gpu_idx] = KillerSession(gpu_idx=gpu_idx, threshold_pct=threshold_pct)
-    return True, f"GPU {gpu_idx}: killer mode armed — auto-bloat fires when free VRAM < {threshold_pct}%."
+        _killer_sessions[gpu_idx] = KillerSession(
+            gpu_idx=gpu_idx, threshold_pct=threshold_pct
+        )
+    return (
+        True,
+        f"GPU {gpu_idx}: killer mode armed — auto-bloat fires when free VRAM < {threshold_pct}%.",
+    )
 
 
 def killer_disarm(gpu_idx: int) -> tuple[bool, str]:
@@ -266,6 +303,7 @@ def killer_disarm_all() -> list[int]:
 
 # ── GPU stats ────────────────────────────────────────────────────────────────
 
+
 def get_gpu_stats() -> list[dict]:
     """
     Query nvidia-smi for all GPU stats.
@@ -279,7 +317,9 @@ def get_gpu_stats() -> list[dict]:
                 "utilization.gpu,temperature.gpu",
                 "--format=csv,noheader,nounits",
             ],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         gpus = []
         for line in result.stdout.strip().splitlines():
@@ -287,19 +327,21 @@ def get_gpu_stats() -> list[dict]:
             if len(parts) < 7:
                 continue
             total = int(parts[2])
-            used  = int(parts[3])
-            free  = int(parts[4])
-            gpus.append({
-                "index":    int(parts[0]),
-                "name":     parts[1],
-                "total_mb": total,
-                "used_mb":  used,
-                "free_mb":  free,
-                "util_pct": int(parts[5]),
-                "temp_c":   int(parts[6]),
-                "used_pct": int(used / total * 100) if total else 0,
-                "free_pct": int(free / total * 100) if total else 0,
-            })
+            used = int(parts[3])
+            free = int(parts[4])
+            gpus.append(
+                {
+                    "index": int(parts[0]),
+                    "name": parts[1],
+                    "total_mb": total,
+                    "used_mb": used,
+                    "free_mb": free,
+                    "util_pct": int(parts[5]),
+                    "temp_c": int(parts[6]),
+                    "used_pct": int(used / total * 100) if total else 0,
+                    "free_pct": int(free / total * 100) if total else 0,
+                }
+            )
         return gpus
     except Exception as e:
         print(f"[nvidia-smi error] {e}")
@@ -308,11 +350,12 @@ def get_gpu_stats() -> list[dict]:
 
 # ── Subscriber store ──────────────────────────────────────────────────────────
 
+
 class SubscriberStore:
     def __init__(self, path: Path, primary: str):
-        self.path    = path
+        self.path = path
         self.primary = str(primary)
-        self._lock   = threading.Lock()
+        self._lock = threading.Lock()
         self._ids: set[str] = {self.primary}
         self._load()
 
@@ -355,9 +398,9 @@ class NameStore:
     """Persists per-chat display names. Default name for the primary chat is 'Bach'."""
 
     def __init__(self, path: Path, primary_id: str):
-        self.path     = path
-        self._lock    = threading.Lock()
-        self._names: dict[str, str] = {str(primary_id): "Bach"}
+        self.path = path
+        self._lock = threading.Lock()
+        self._names: dict[str, str] = {str(primary_id): "An"}
         self._load()
 
     def _load(self):
@@ -385,13 +428,16 @@ class NameStore:
 
 # ── Telegram I/O ─────────────────────────────────────────────────────────────
 
-def _send(text: str, chat_id: str = None, thread_id: int = None,
-          reply_markup: dict = None) -> Optional[int]:
+
+def _send(
+    text: str, chat_id: str = None, thread_id: int = None, reply_markup: dict = None
+) -> Optional[int]:
     """Send a message. Returns message_id on success."""
-    url    = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     target = chat_id or CHAT_ID
     effective_thread = (
-        thread_id if thread_id is not None
+        thread_id
+        if thread_id is not None
         else (THREAD_ID if target == CHAT_ID else None)
     )
     payload = {"chat_id": target, "text": text, "parse_mode": "HTML"}
@@ -420,14 +466,15 @@ def _broadcast_named(fmt_fn, subs: SubscriberStore, names: NameStore) -> None:
         _send(fmt_fn(names.get(cid)), cid)
 
 
-def _edit_message(chat_id: str, message_id: int, text: str,
-                  reply_markup: dict = None) -> None:
+def _edit_message(
+    chat_id: str, message_id: int, text: str, reply_markup: dict = None
+) -> None:
     """Edit an existing message (used to update inline keyboard state)."""
-    url     = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {
-        "chat_id":    chat_id,
+        "chat_id": chat_id,
         "message_id": message_id,
-        "text":       text,
+        "text": text,
         "parse_mode": "HTML",
     }
     if reply_markup:
@@ -459,9 +506,11 @@ def _get_updates(offset: int) -> list[dict]:
         r = requests.get(
             url,
             params={
-                "offset":          offset,
-                "timeout":         POLL_TIMEOUT,
-                "allowed_updates": json.dumps(["message", "channel_post", "callback_query"]),
+                "offset": offset,
+                "timeout": POLL_TIMEOUT,
+                "allowed_updates": json.dumps(
+                    ["message", "channel_post", "callback_query"]
+                ),
             },
             timeout=POLL_TIMEOUT + 5,
         )
@@ -484,6 +533,7 @@ def _fetch_bot_username() -> Optional[str]:
 
 
 # ── Inline keyboard builders ──────────────────────────────────────────────────
+
 
 def _kb(rows: list[list[tuple[str, str]]]) -> dict:
     """Build an InlineKeyboardMarkup from (label, callback_data) rows."""
@@ -521,8 +571,8 @@ def kb_release_select(gpus: list[dict]) -> dict:
         return _kb([[("No active bloat", "X")]])
     rows = []
     for idx, s in sorted(active.items()):
-        g     = next((g for g in gpus if g["index"] == idx), None)
-        name  = g["name"] if g else f"GPU {idx}"
+        g = next((g for g in gpus if g["index"] == idx), None)
+        name = g["name"] if g else f"GPU {idx}"
         label = f"Release GPU {idx} — {name} ({s.allocated_mb:,}MB)"
         rows.append([(label, f"R:{idx}")])
     if len(active) > 1:
@@ -564,9 +614,248 @@ def kb_unkill_select(active: dict[int, "KillerSession"]) -> dict:
 
 # ── Formatters ────────────────────────────────────────────────────────────────
 
+
 def _bar(pct: int, width: int = 10) -> str:
     filled = max(0, min(width, int(pct / 100 * width)))
     return "█" * filled + "░" * (width - filled)
+
+
+_cpu_last_total: Optional[int] = None
+_cpu_last_idle: Optional[int] = None
+
+
+def _read_meminfo() -> dict[str, int]:
+    path = Path("/proc/meminfo")
+    if not path.exists():
+        return {}
+    data: dict[str, int] = {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                key = parts[0].rstrip(":")
+                if key in {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}:
+                    try:
+                        data[key] = int(parts[1])
+                    except ValueError:
+                        pass
+    except Exception:
+        return {}
+    return data
+
+
+def _read_cpu_model() -> Optional[str]:
+    if platform.system() == "Windows":
+        try:
+            name = platform.processor()
+            return name if name else None
+        except Exception:
+            return None
+    path = Path("/proc/cpuinfo")
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, val = [p.strip() for p in line.split(":", 1)]
+                if key in {"model name", "Hardware", "Processor"} and val:
+                    return val
+    except Exception:
+        return None
+    return None
+
+
+def _read_ram_name() -> Optional[str]:
+    if platform.system() == "Windows":
+        return None
+    base = Path("/sys/devices/system/edac/mc")
+    if not base.exists():
+        return None
+
+    entries: list[str] = []
+    for dimm in sorted(base.glob("mc*/dimm*")):
+        parts: list[str] = []
+        for fname in ("manufacturer", "part_number", "dimm_label"):
+            p = dimm / fname
+            if not p.exists():
+                continue
+            try:
+                val = p.read_text(encoding="utf-8").strip()
+            except Exception:
+                continue
+            if not val or val.upper() in {"UNKNOWN", "NO DIMM", "NOT INSTALLED"}:
+                continue
+            parts.append(val)
+        if parts:
+            entries.append(" ".join(parts))
+
+    if entries:
+        seen = set()
+        uniq = []
+        for e in entries:
+            if e not in seen:
+                seen.add(e)
+                uniq.append(e)
+        return "; ".join(uniq)
+
+    return None
+
+
+class FILETIME(ctypes.Structure):
+    _fields_ = [
+        ("dwLowDateTime", ctypes.c_uint32),
+        ("dwHighDateTime", ctypes.c_uint32),
+    ]
+
+
+def _filetime_to_int(ft: FILETIME) -> int:
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
+def _win_cpu_usage_pct() -> Optional[int]:
+    global _cpu_last_total, _cpu_last_idle
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        idle = FILETIME()
+        kernel = FILETIME()
+        user = FILETIME()
+        if not kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+        ):
+            return None
+
+        idle_t = _filetime_to_int(idle)
+        kernel_t = _filetime_to_int(kernel)
+        user_t = _filetime_to_int(user)
+        total = kernel_t + user_t
+
+        if _cpu_last_total is None or _cpu_last_idle is None:
+            _cpu_last_total = total
+            _cpu_last_idle = idle_t
+            return None
+
+        delta_total = total - _cpu_last_total
+        delta_idle = idle_t - _cpu_last_idle
+        _cpu_last_total = total
+        _cpu_last_idle = idle_t
+
+        if delta_total <= 0:
+            return None
+        usage = int((delta_total - delta_idle) / delta_total * 100)
+        return max(0, min(100, usage))
+    except Exception:
+        return None
+
+
+class MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_uint32),
+        ("dwMemoryLoad", ctypes.c_uint32),
+        ("ullTotalPhys", ctypes.c_uint64),
+        ("ullAvailPhys", ctypes.c_uint64),
+        ("ullTotalPageFile", ctypes.c_uint64),
+        ("ullAvailPageFile", ctypes.c_uint64),
+        ("ullTotalVirtual", ctypes.c_uint64),
+        ("ullAvailVirtual", ctypes.c_uint64),
+        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+    ]
+
+
+def _win_mem_status() -> dict:
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return {}
+        return {
+            "total_phys": stat.ullTotalPhys,
+            "avail_phys": stat.ullAvailPhys,
+            "total_pagefile": stat.ullTotalPageFile,
+            "avail_pagefile": stat.ullAvailPageFile,
+        }
+    except Exception:
+        return {}
+
+
+def _cpu_usage_pct() -> Optional[int]:
+    if platform.system() == "Windows":
+        return _win_cpu_usage_pct()
+    global _cpu_last_total, _cpu_last_idle
+    try:
+        with open("/proc/stat", "r", encoding="utf-8") as f:
+            line = f.readline()
+        if not line.startswith("cpu "):
+            return None
+        parts = line.split()
+        vals = [int(v) for v in parts[1:]]
+        if not vals:
+            return None
+        total = sum(vals)
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        if _cpu_last_total is None or _cpu_last_idle is None:
+            _cpu_last_total = total
+            _cpu_last_idle = idle
+            return None
+        delta_total = total - _cpu_last_total
+        delta_idle = idle - _cpu_last_idle
+        _cpu_last_total = total
+        _cpu_last_idle = idle
+        if delta_total <= 0:
+            return None
+        usage = int((delta_total - delta_idle) / delta_total * 100)
+        return max(0, min(100, usage))
+    except Exception:
+        return None
+
+
+def get_system_stats() -> dict:
+    if platform.system() == "Windows":
+        mem = _win_mem_status()
+        ram_total_kb = int(mem.get("total_phys", 0) / 1024)
+        ram_avail_kb = int(mem.get("avail_phys", 0) / 1024)
+        swap_total_kb = int(mem.get("total_pagefile", 0) / 1024)
+        swap_free_kb = int(mem.get("avail_pagefile", 0) / 1024)
+    else:
+        mem = _read_meminfo()
+        ram_total_kb = mem.get("MemTotal", 0)
+        ram_avail_kb = mem.get("MemAvailable", 0)
+        swap_total_kb = mem.get("SwapTotal", 0)
+        swap_free_kb = mem.get("SwapFree", 0)
+
+    stats: dict = {
+        "cpu_pct": _cpu_usage_pct(),
+        "cpu_name": _read_cpu_model(),
+        "ram": None,
+        "ram_name": _read_ram_name(),
+        "swap": None,
+    }
+
+    if ram_total_kb > 0:
+        ram_used_kb = max(0, ram_total_kb - ram_avail_kb)
+        stats["ram"] = {
+            "used_kb": ram_used_kb,
+            "total_kb": ram_total_kb,
+            "pct": int(ram_used_kb / ram_total_kb * 100),
+        }
+
+    if swap_total_kb > 0:
+        swap_used_kb = max(0, swap_total_kb - swap_free_kb)
+        stats["swap"] = {
+            "used_kb": swap_used_kb,
+            "total_kb": swap_total_kb,
+            "pct": int(swap_used_kb / swap_total_kb * 100),
+        }
+
+    return stats
+
+
+def _fmt_gb(kb: int) -> str:
+    return f"{kb / (1024 * 1024):.1f}"
 
 
 def fmt_gpu_status(name: str = "Bach") -> str:
@@ -579,8 +868,44 @@ def fmt_gpu_status(name: str = "Bach") -> str:
     with _sessions_lock:
         active_sessions = dict(_sessions)
 
-    ts    = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    lines = [f"🖥️ <b>GPU Status — {ts}</b>\n"]
+    ts = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    sys_stats = get_system_stats()
+    cpu_pct = sys_stats.get("cpu_pct")
+    cpu_name = sys_stats.get("cpu_name") or "Unknown CPU"
+    if cpu_pct is None:
+        cpu_line = f"CPU: {cpu_name}  \n Util[░░░░░░░░░░] N/A"
+    else:
+        cpu_line = f"CPU: {cpu_name}  \n Util{_bar(cpu_pct)} {cpu_pct}%"
+
+    ram = sys_stats.get("ram")
+    ram_name = sys_stats.get("ram_name") or "System RAM"
+    if ram:
+        ram_line = (
+            f"RAM: {ram_name}  \n Util[{_bar(ram['pct'])}] "
+            f"{_fmt_gb(ram['used_kb'])}/{_fmt_gb(ram['total_kb'])} GB "
+            f"({ram['pct']}%)"
+        )
+    else:
+        ram_line = f"RAM: {ram_name}  \n Util[░░░░░░░░░░] N/A"
+
+    swap = sys_stats.get("swap")
+    if swap:
+        swap_line = (
+            f"SWAP: \n Util[{_bar(swap['pct'])}] "
+            f"{_fmt_gb(swap['used_kb'])}/{_fmt_gb(swap['total_kb'])} GB "
+            f"({swap['pct']}%)"
+        )
+    else:
+        swap_line = "SWAP: \n Util[░░░░░░░░░░] N/A"
+
+    lines = [
+        f"🖥️ <b>GPU Status — {ts}</b>\n",
+        cpu_line,
+        ram_line,
+        swap_line,
+        "",
+    ]
 
     for g in gpus:
         bloat = active_sessions.get(g["index"])
@@ -604,7 +929,9 @@ def fmt_gpu_status(name: str = "Bach") -> str:
     return "\n".join(lines)
 
 
-def fmt_high_vram_alert(gpu: dict, bot_username: Optional[str] = None, name: str = "Bach") -> str:
+def fmt_high_vram_alert(
+    gpu: dict, bot_username: Optional[str] = None, name: str = "Bach"
+) -> str:
     mention = f"@{bot_username}" if bot_username else "@bot"
     return (
         f"🟢 <b>VRAM Available — GPU {gpu['index']}: {gpu['name']}</b>\n\n"
@@ -618,8 +945,12 @@ def fmt_high_vram_alert(gpu: dict, bot_username: Optional[str] = None, name: str
 
 def fmt_bloat_results(results: list[tuple[bool, int, str]], name: str = "Bach") -> str:
     all_ok = all(ok for ok, _, _ in results)
-    header = "🔒 <b>VRAM Occupation — Successful</b>" if all_ok else "⚠️ <b>VRAM Occupation — Partial/Failed</b>"
-    lines  = [header, ""]
+    header = (
+        "🔒 <b>VRAM Occupation — Successful</b>"
+        if all_ok
+        else "⚠️ <b>VRAM Occupation — Partial/Failed</b>"
+    )
+    lines = [header, ""]
     for ok, mb, msg in results:
         lines.append(f"{'✅' if ok else '❌'} {msg}")
     if all_ok:
@@ -635,11 +966,15 @@ def fmt_release_results(results: list[tuple[int, int]], name: str = "Bach") -> s
     lines = ["🔓 <b>VRAM Released</b>\n"]
     for idx, mb in results:
         lines.append(f"✅ GPU {idx}: {mb:,}MB freed")
-    lines.append(f"\n<i>Garrison withdrawn. Territory relinquished, Monarch {name}.</i>")
+    lines.append(
+        f"\n<i>Garrison withdrawn. Territory relinquished, Monarch {name}.</i>"
+    )
     return "\n".join(lines)
 
 
-def fmt_killer_armed(gpu_indices: list[int], threshold_pct: int, name: str = "Bach") -> str:
+def fmt_killer_armed(
+    gpu_indices: list[int], threshold_pct: int, name: str = "Bach"
+) -> str:
     gpu_list = ", ".join(f"GPU {i}" for i in sorted(gpu_indices))
     return (
         f"☠️ <b>KILLER MODE ARMED — {gpu_list}</b>\n\n"
@@ -668,8 +1003,12 @@ def fmt_killer_reminder(gpus: list[dict], name: str = "Bach") -> str:
                 f"GPU {idx}: threshold &lt; {ks.threshold_pct}% free  |  now: {state}"
             )
         else:
-            lines.append(f"GPU {idx}: threshold &lt; {ks.threshold_pct}% free  |  no data")
-    lines.append(f"\n<i>Killer mode still armed, Monarch {name}. Use <code>unkill</code> to stand down.</i>")
+            lines.append(
+                f"GPU {idx}: threshold &lt; {ks.threshold_pct}% free  |  no data"
+            )
+    lines.append(
+        f"\n<i>Killer mode still armed, Monarch {name}. Use <code>unkill</code> to stand down.</i>"
+    )
     return "\n".join(lines)
 
 
@@ -694,6 +1033,7 @@ def fmt_killer_disarmed(indices: list[int], name: str = "Bach") -> str:
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
+
 def cmd_status(name: str = "Bach") -> str:
     return fmt_gpu_status(name)
 
@@ -713,7 +1053,7 @@ def cmd_bloat(chat_id: str, thread_id: Optional[int]) -> None:
 
     if len(gpus) == 1:
         # Single GPU — skip GPU selection, go straight to percentage
-        g    = gpus[0]
+        g = gpus[0]
         text = (
             f"🔒 <b>VRAM Occupation Order — GPU {g['index']}: {g['name']}</b>\n\n"
             f"Current:  {g['used_mb']:,}MB / {g['total_mb']:,}MB  ({g['used_pct']}% used)\n"
@@ -722,10 +1062,7 @@ def cmd_bloat(chat_id: str, thread_id: Optional[int]) -> None:
         )
         _send(text, chat_id, thread_id, reply_markup=kb_bloat_pct_select("0"))
     else:
-        text = (
-            f"🔒 <b>Territorial Claim — Select Target GPU(s)</b>\n\n"
-            f"Available GPUs:"
-        )
+        text = f"🔒 <b>Territorial Claim — Select Target GPU(s)</b>\n\nAvailable GPUs:"
         _send(text, chat_id, thread_id, reply_markup=kb_bloat_gpu_select(gpus))
 
 
@@ -736,13 +1073,15 @@ def cmd_release(chat_id: str, thread_id: Optional[int]) -> None:
         _send(
             "🔓 <b>No Active Occupation</b>\n\n"
             "No VRAM garrison is currently deployed, Monarch Bach.",
-            chat_id, thread_id,
+            chat_id,
+            thread_id,
         )
         return
     gpus = get_gpu_stats()
     _send(
         "🔓 <b>Release VRAM Garrison</b>\n\nSelect what to release:",
-        chat_id, thread_id,
+        chat_id,
+        thread_id,
         reply_markup=kb_release_select(gpus),
     )
 
@@ -754,7 +1093,7 @@ def cmd_killer(chat_id: str, thread_id: Optional[int]) -> None:
         return
 
     if len(gpus) == 1:
-        g    = gpus[0]
+        g = gpus[0]
         text = (
             f"☠️ <b>Killer Mode — GPU {g['index']}: {g['name']}</b>\n\n"
             f"Current: {g['used_mb']:,}MB / {g['total_mb']:,}MB  ({g['free_pct']}% free)\n\n"
@@ -764,7 +1103,8 @@ def cmd_killer(chat_id: str, thread_id: Optional[int]) -> None:
     else:
         _send(
             "☠️ <b>Killer Mode — Select Target GPU(s)</b>\n\nArm killer mode on:",
-            chat_id, thread_id,
+            chat_id,
+            thread_id,
             reply_markup=kb_killer_gpu_select(gpus),
         )
 
@@ -776,12 +1116,14 @@ def cmd_unkill(chat_id: str, thread_id: Optional[int]) -> None:
         _send(
             "🔓 <b>No Active Killer Mode</b>\n\n"
             "Autopilot is not armed on any GPU, Monarch Bach.",
-            chat_id, thread_id,
+            chat_id,
+            thread_id,
         )
         return
     _send(
         "☠️ <b>Disarm Killer Mode</b>\n\nSelect what to stand down:",
-        chat_id, thread_id,
+        chat_id,
+        thread_id,
         reply_markup=kb_unkill_select(active),
     )
 
@@ -843,24 +1185,31 @@ def cmd_help(bot_username: Optional[str], name: str = "Bach") -> str:
 
 # ── Command dispatch ──────────────────────────────────────────────────────────
 
+
 def _match_prefix(text: str, bot_username: Optional[str]) -> Optional[str]:
     if not bot_username:
         return None
     prefix = f"@{bot_username.lower()}"
-    lower  = text.strip().lower()
+    lower = text.strip().lower()
     if lower.startswith(prefix):
-        return text.strip()[len(prefix):].strip()
+        return text.strip()[len(prefix) :].strip()
     return None
 
 
-def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
-                  chat_id: str, thread_id: Optional[int], names: NameStore = None) -> None:
+def dispatch_text(
+    text: str,
+    subs: SubscriberStore,
+    bot_username: Optional[str],
+    chat_id: str,
+    thread_id: Optional[int],
+    names: NameStore = None,
+) -> None:
     rest = _match_prefix(text, bot_username)
     if rest is None:
         return
 
     parts = rest.split()
-    cmd   = parts[0].lower() if parts else "help"
+    cmd = parts[0].lower() if parts else "help"
 
     if cmd != "arise" and chat_id not in subs.all():
         return  # Not subscribed — ignore all commands except arise
@@ -883,7 +1232,13 @@ def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
         _send(cmd_dismiss(chat_id, subs, name), chat_id, thread_id)
     elif cmd == "setname":
         new_name = " ".join(parts[1:]) if len(parts) > 1 else ""
-        _send(cmd_setname(chat_id, new_name, names) if names else "Name store unavailable.", chat_id, thread_id)
+        _send(
+            cmd_setname(chat_id, new_name, names)
+            if names
+            else "Name store unavailable.",
+            chat_id,
+            thread_id,
+        )
     elif cmd == "help":
         _send(cmd_help(bot_username, name), chat_id, thread_id)
     else:
@@ -891,11 +1246,13 @@ def dispatch_text(text: str, subs: SubscriberStore, bot_username: Optional[str],
         _send(
             f"Unknown command: <code>{cmd}</code>. "
             f"Use <code>{mention} help</code> for the registry.",
-            chat_id, thread_id,
+            chat_id,
+            thread_id,
         )
 
 
 # ── Callback query handler ────────────────────────────────────────────────────
+
 
 def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) -> None:
     """
@@ -908,10 +1265,10 @@ def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) 
       UK:{gpu_spec}         — Disarm killer mode
       X                     — Cancel
     """
-    cbq_id     = cbq["id"]
-    data       = cbq.get("data", "")
-    msg        = cbq.get("message", {})
-    chat_id    = str(msg.get("chat", {}).get("id", ""))
+    cbq_id = cbq["id"]
+    data = cbq.get("data", "")
+    msg = cbq.get("message", {})
+    chat_id = str(msg.get("chat", {}).get("id", ""))
     message_id = msg.get("message_id")
 
     if chat_id not in subs.all():
@@ -929,20 +1286,21 @@ def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) 
     # ── GPU selection: G:{gpu_spec} ───────────────────────────────────────────
     if data.startswith("G:"):
         gpu_spec = data[2:]
-        gpus     = get_gpu_stats()
+        gpus = get_gpu_stats()
         if gpu_spec == "all":
             label = "All GPUs"
         else:
-            idx   = int(gpu_spec)
-            g     = next((g for g in gpus if g["index"] == idx), None)
+            idx = int(gpu_spec)
+            g = next((g for g in gpus if g["index"] == idx), None)
             label = f"GPU {idx}: {g['name']}" if g else f"GPU {idx}"
 
         text = (
-            f"🔒 <b>VRAM Occupation — Target: {label}</b>\n\n"
-            f"Choose occupation level:"
+            f"🔒 <b>VRAM Occupation — Target: {label}</b>\n\nChoose occupation level:"
         )
         _answer_callback(cbq_id)
-        _edit_message(chat_id, message_id, text, reply_markup=kb_bloat_pct_select(gpu_spec))
+        _edit_message(
+            chat_id, message_id, text, reply_markup=kb_bloat_pct_select(gpu_spec)
+        )
         return
 
     # ── Percentage / bloat: P:{pct}:{gpu_spec} ───────────────────────────────
@@ -952,11 +1310,12 @@ def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) 
 
         _answer_callback(cbq_id, f"Executing {pct}% occupation...")
         _edit_message(
-            chat_id, message_id,
+            chat_id,
+            message_id,
             f"🔒 <b>VRAM Occupation — {pct}% — In progress...</b>\n<i>Allocating...</i>",
         )
 
-        gpus    = get_gpu_stats()
+        gpus = get_gpu_stats()
         targets = [g["index"] for g in gpus] if gpu_spec == "all" else [int(gpu_spec)]
         results = []
         for idx in targets:
@@ -972,14 +1331,13 @@ def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) 
         _answer_callback(cbq_id, "Releasing...")
 
         if gpu_spec == "all":
-            freed       = release_all()
+            freed = release_all()
             result_text = fmt_release_results(freed, name)
         else:
-            idx  = int(gpu_spec)
+            idx = int(gpu_spec)
             ok, mb, msg_txt = release_gpu(idx)
             result_text = (
-                fmt_release_results([(idx, mb)], name)
-                if ok else f"⚠️ {msg_txt}"
+                fmt_release_results([(idx, mb)], name) if ok else f"⚠️ {msg_txt}"
             )
 
         _edit_message(chat_id, message_id, result_text)
@@ -990,7 +1348,8 @@ def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) 
         gpu_spec = data[2:]
         _answer_callback(cbq_id)
         _edit_message(
-            chat_id, message_id,
+            chat_id,
+            message_id,
             f"☠️ <b>Killer Mode — Target: {'All GPUs' if gpu_spec == 'all' else f'GPU {gpu_spec}'}</b>\n\n"
             f"Set trigger threshold — auto-bloat fires when free VRAM drops below:",
             reply_markup=kb_killer_threshold_select(gpu_spec),
@@ -1004,11 +1363,12 @@ def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) 
 
         _answer_callback(cbq_id, f"Arming killer mode at < {threshold}% free...")
         _edit_message(
-            chat_id, message_id,
+            chat_id,
+            message_id,
             f"☠️ <b>Killer Mode — Arming...</b>\n<i>Setting autopilot...</i>",
         )
 
-        gpus    = get_gpu_stats()
+        gpus = get_gpu_stats()
         targets = [g["index"] for g in gpus] if gpu_spec == "all" else [int(gpu_spec)]
         for idx in targets:
             killer_arm(idx, threshold)
@@ -1036,7 +1396,10 @@ def _handle_callback(cbq: dict, subs: SubscriberStore, names: NameStore = None) 
 
 # ── Telegram poll thread ──────────────────────────────────────────────────────
 
-def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str], names: NameStore = None) -> None:
+
+def telegram_poll_loop(
+    subs: SubscriberStore, bot_username: Optional[str], names: NameStore = None
+) -> None:
     offset = 0
     while True:
         updates = _get_updates(offset)
@@ -1051,14 +1414,16 @@ def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str], names
 
                 # Text message
                 msg = (
-                    upd.get("message") or upd.get("edited_message")
-                    or upd.get("channel_post") or upd.get("edited_channel_post")
+                    upd.get("message")
+                    or upd.get("edited_message")
+                    or upd.get("channel_post")
+                    or upd.get("edited_channel_post")
                 )
                 if not msg:
                     continue
-                chat_id   = str(msg.get("chat", {}).get("id", ""))
+                chat_id = str(msg.get("chat", {}).get("id", ""))
                 thread_id = msg.get("message_thread_id")
-                text      = msg.get("text", "") or msg.get("caption", "")
+                text = msg.get("text", "") or msg.get("caption", "")
                 if not text:
                     continue
                 print(f"[update] chat={chat_id} thread={thread_id} text={text[:60]!r}")
@@ -1069,7 +1434,10 @@ def telegram_poll_loop(subs: SubscriberStore, bot_username: Optional[str], names
 
 # ── GPU monitor thread ────────────────────────────────────────────────────────
 
-def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None, names: NameStore = None) -> None:
+
+def gpu_monitor_loop(
+    subs: SubscriberStore, bot_username: Optional[str] = None, names: NameStore = None
+) -> None:
     """
     Poll GPU stats every POLL_INTERVAL seconds.
     Alert if free VRAM >= HIGH_THRESHOLD% on any GPU that is not actively bloated.
@@ -1093,11 +1461,19 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None, 
                 if idx in killer_gpus and idx not in bloated_gpus:
                     ks = killer_gpus[idx]
                     if g["free_pct"] < ks.threshold_pct:
-                        print(f"[killer] GPU {idx}: {g['free_pct']}% free < {ks.threshold_pct}% — striking")
+                        print(
+                            f"[killer] GPU {idx}: {g['free_pct']}% free < {ks.threshold_pct}% — striking"
+                        )
                         ok, allocated_mb, _ = bloat_gpu(idx, 100)
                         if ok:
                             if names:
-                                _broadcast_named(lambda n, _g=g, _mb=allocated_mb: fmt_killer_strike(_g, _mb, n), subs, names)
+                                _broadcast_named(
+                                    lambda n, _g=g, _mb=allocated_mb: fmt_killer_strike(
+                                        _g, _mb, n
+                                    ),
+                                    subs,
+                                    names,
+                                )
                             else:
                                 _send_all(fmt_killer_strike(g, allocated_mb), subs)
                         continue  # skip high-VRAM alert for this GPU this cycle
@@ -1106,15 +1482,23 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None, 
                 if idx in bloated_gpus:
                     continue
                 if g["free_pct"] >= HIGH_THRESHOLD:
-                    now     = time.time()
+                    now = time.time()
                     last_ts = last_alert.get(idx, 0)
                     if now - last_ts > HIGH_COOLDOWN:
                         last_alert[idx] = now
                         if names:
-                            _broadcast_named(lambda n, _g=g: fmt_high_vram_alert(_g, bot_username, n), subs, names)
+                            _broadcast_named(
+                                lambda n, _g=g: fmt_high_vram_alert(
+                                    _g, bot_username, n
+                                ),
+                                subs,
+                                names,
+                            )
                         else:
                             _send_all(fmt_high_vram_alert(g, bot_username), subs)
-                        print(f"[monitor] High VRAM alert — GPU {idx}: {g['free_pct']}% free")
+                        print(
+                            f"[monitor] High VRAM alert — GPU {idx}: {g['free_pct']}% free"
+                        )
 
             summary = "  ".join(
                 f"GPU{g['index']}:{g['used_mb']}MB/{g['total_mb']}MB({g['used_pct']}%)"
@@ -1130,6 +1514,7 @@ def gpu_monitor_loop(subs: SubscriberStore, bot_username: Optional[str] = None, 
 
 # ── Killer reminder thread ────────────────────────────────────────────────────
 
+
 def killer_reminder_loop(subs: SubscriberStore, names: NameStore = None) -> None:
     """Send a reminder every KILLER_REMINDER_SECS while any killer session is armed."""
     while True:
@@ -1141,7 +1526,9 @@ def killer_reminder_loop(subs: SubscriberStore, names: NameStore = None) -> None
                 continue
             gpus = get_gpu_stats()
             if names:
-                _broadcast_named(lambda n, g=gpus: fmt_killer_reminder(g, n), subs, names)
+                _broadcast_named(
+                    lambda n, g=gpus: fmt_killer_reminder(g, n), subs, names
+                )
             else:
                 _send_all(fmt_killer_reminder(gpus), subs)
             print(f"[killer] Reminder sent — {len(active)} GPU(s) armed")
@@ -1151,6 +1538,7 @@ def killer_reminder_loop(subs: SubscriberStore, names: NameStore = None) -> None
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+
 def main() -> None:
     if not BOT_TOKEN or not CHAT_ID:
         raise RuntimeError(
@@ -1159,23 +1547,29 @@ def main() -> None:
         )
 
     BOT_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    subs  = SubscriberStore(SUBS_PATH, CHAT_ID)
+    subs = SubscriberStore(SUBS_PATH, CHAT_ID)
     names = NameStore(NAMES_PATH, CHAT_ID)
 
     bot_username = _fetch_bot_username()
     if bot_username:
         print(f"[bot] @{bot_username} ready")
     else:
-        print("[bot] WARNING: Could not resolve username — @mention commands will not work")
+        print(
+            "[bot] WARNING: Could not resolve username — @mention commands will not work"
+        )
 
     cuda_ok = _cuda_init()
-    print(f"[bot] CUDA driver: {'available ✓' if cuda_ok else 'NOT available — bloat disabled'}")
+    print(
+        f"[bot] CUDA driver: {'available ✓' if cuda_ok else 'NOT available — bloat disabled'}"
+    )
 
     gpus = get_gpu_stats()
     if gpus:
         for g in gpus:
-            print(f"[bot] GPU {g['index']}: {g['name']}  "
-                  f"{g['used_mb']}MB/{g['total_mb']}MB ({g['used_pct']}%)")
+            print(
+                f"[bot] GPU {g['index']}: {g['name']}  "
+                f"{g['used_mb']}MB/{g['total_mb']}MB ({g['used_pct']}%)"
+            )
     else:
         print("[bot] WARNING: No GPUs detected")
 
