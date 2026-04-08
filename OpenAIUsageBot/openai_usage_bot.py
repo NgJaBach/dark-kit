@@ -1283,7 +1283,13 @@ def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
 # ── Usage poll thread ──────────────────────────────────────────────────────
 
 def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
-    last_date = today_str()
+    # Reset on startup if persisted state is from a previous day
+    persisted_date = usage.get().get("date")
+    last_date      = today_str()
+    if persisted_date and persisted_date != last_date:
+        usage.reset_day()
+        print(f"[poll] Stale state from {persisted_date} — daily state reset on startup")
+
     while True:
         try:
             current_date = today_str()
