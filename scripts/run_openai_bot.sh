@@ -5,8 +5,8 @@
 # ─────────────────────────────────────────────────────────────
 
 # Conda setup (optional)
-source ~/miniconda3/etc/profile.d/conda.sh
-conda activate base
+# source ~/miniconda3/etc/profile.d/conda.sh
+# conda activate base
 
 set -euo pipefail
 
@@ -32,7 +32,7 @@ if [ -f "$VENV_DIR/bin/pip" ]; then
 elif [ -f "$VENV_DIR/Scripts/pip" ]; then
     VENV_PIP="$VENV_DIR/Scripts/pip"
     source "$VENV_DIR/Scripts/activate"
-    PYTHON="$VENV_DIR/Scripts/python3"
+    PYTHON="$VENV_DIR/Scripts/python"
 fi
 
 # ── 2. Dependencies ───────────────────────────────────────────
