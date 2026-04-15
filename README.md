@@ -1,6 +1,6 @@
 # NgJaBach Shadow Army
 
-*Last updated: 27/03/2026*
+*Last updated: 16/04/2026*
 
 **Goal:** A collection of Telegram bots and automation scripts serving Bach the Monarch — monitoring AI spend, guarding GPU territory, and reporting to the council.
 
@@ -21,30 +21,32 @@ Tracks OpenAI API token and cost usage across all organization projects in real 
 
 - Reports daily token consumption and cost per project
 - Breaks down usage by model (gpt-4o, gpt-4o-mini, etc.)
-- Fires escalating drama alerts as spend climbs past $5 → $7 → $9 → $11 → $13+
-- Alerts at token milestones (1M / 4M / 7M / 8M / 9M / 10M) tied to OpenAI's free-tier limits
+- Fires escalating drama alerts starting at $5/day, then every $2 above that
+- Alerts at token milestones for **mini/nano models** (1M / 4M / 7M / 8M / 9M / 10M — 10M free-tier cap)
+- Alerts at token milestones for **premium models** (200K / 500K / 800K / 1M — 1M free-tier cap for gpt-4o, gpt-4.1, o1, o3, etc.)
 - Detects when ≥ 3 projects are hitting the API concurrently (concurrency alert)
+- Applies a 10-minute ingestion delay buffer on the Costs API (documented OpenAI lag)
 - Responds to pull commands from any subscribed chat
 
 #### Personality
 
-**Marshal-Rank Shadow Commander.** Speaks with imperial weight. Every alert is a battlefield dispatch. Spending reports read like war-chest ledgers. Free-tier exhaustion is a strategic crisis. Crossing $13/day triggers the LEDGER IS BLEEDING declaration. No small talk — every message has purpose and rank.
+**Marshal-Rank Shadow Commander.** Speaks with imperial weight. Every alert is a battlefield dispatch. Spending reports read like war-chest ledgers. Free-tier exhaustion is a strategic crisis. No small talk — every message has purpose and rank.
 
 #### Commands
 
 | Command | Description |
 |---------|-------------|
-| `@BachsSlave2Bot today` | Full token + cost report for today, all active projects |
 | `@BachsSlave2Bot tokens` | Token breakdown per project with per-model detail |
 | `@BachsSlave2Bot projects` | Project roster with token bar chart |
 | `@BachsSlave2Bot rank` | Rankings by token consumption and daily spend |
-| `@BachsSlave2Bot week` | 7-day rolling trend — tokens + spend per day |
+| `@BachsSlave2Bot recent` | Last 31 days — per-project cost, total tokens & requests |
 | `@BachsSlave2Bot models` | Aggregate model usage across all projects today |
 | `@BachsSlave2Bot spending` | Monthly bill — current + previous month |
 | `@BachsSlave2Bot active` | Projects with API activity in the last 5 min |
 | `@BachsSlave2Bot refresh` | Force-poll OpenAI immediately |
 | `@BachsSlave2Bot arise` | Subscribe this chat to automatic alerts |
 | `@BachsSlave2Bot dismiss` | Unsubscribe (primary chat cannot be dismissed) |
+| `@BachsSlave2Bot setname Name` | Set the name the bot uses to address you |
 | `@BachsSlave2Bot help` | Full command registry |
 
 #### `.env` file — `OpenAIUsageBot/.env`
@@ -63,11 +65,11 @@ TELEGRAM_CHAT_ID=PUT_ID_HERE
 # Optional: topic thread ID for supergroups with topics enabled
 TELEGRAM_THREAD_ID=
 
-# How often to poll OpenAI usage API (minutes). Default: 60
-POLL_INTERVAL_MINS=60
+# How often to poll OpenAI usage API (minutes). Default: 5
+POLL_INTERVAL_MINS=5
 ```
 
-> **Note:** `DAILY_SPEND_LIMIT` is hardcoded to `$5.00` in the bot source — not configurable via `.env`.
+> **Note:** `DAILY_SPEND_LIMIT` is hardcoded to `$5.00` in the bot source — alerts fire at $5, then every $2 above.
 
 ---
 
@@ -78,12 +80,13 @@ POLL_INTERVAL_MINS=60
 
 #### What it does
 
-Monitors VRAM usage across all detected GPUs on the host machine. Sends automatic alerts when free VRAM drops below a threshold, and allows on-command VRAM bloating — pre-reserving GPU memory via the CUDA Driver API so lightweight jobs cannot claim it before heavy model workloads start.
+Monitors VRAM usage across all detected GPUs on the host machine. Sends automatic alerts when **free VRAM rises above** the configured threshold (i.e., the GPU is available and ripe for claiming), and allows on-command VRAM bloating — pre-reserving GPU memory via the CUDA Driver API so lightweight jobs cannot claim it before heavy model workloads start.
 
 - Polls `nvidia-smi` every N seconds across all GPUs
-- Fires low-VRAM alerts with per-GPU cooldown (10 min) to prevent spam
+- Fires high-VRAM alerts with per-GPU cooldown (10 min) to prevent spam
 - Bloat: allocates a CUDA memory block to occupy 20 / 50 / 70 / 90% of a GPU's VRAM
 - Release: frees the allocation on demand (per GPU or all at once)
+- **Killer Mode:** arms autopilot — when free VRAM drops below a trigger threshold (10% / 50% / 70%), the bot auto-bloats to full and sends reminders every 60s
 - Uses the CUDA Driver API (`libcuda.so.1`) directly via `ctypes` — no PyTorch required
 
 > **Linux vs Windows:** On Linux (this machine), CUDA allocations are physically committed to VRAM immediately — `nvidia-smi` will show the full reservation. On Windows WDDM, the OS may page GPU memory, making pre-reservation unreliable. **Linux is the intended deployment target.**
@@ -99,13 +102,20 @@ Monitors VRAM usage across all detected GPUs on the host machine. Sends automati
 | `@GruVramBot status` | VRAM snapshot for all GPUs — used/free/total, utilization, temperature |
 | `@GruVramBot bloat` | Interactive keyboard: select GPU(s), then occupation % target |
 | `@GruVramBot release` | Interactive keyboard: release specific GPU or all |
-| `@GruVramBot arise` | Subscribe chat to automatic low-VRAM alerts |
+| `@GruVramBot killer` | Arm autopilot: auto-bloat when free VRAM drops below a trigger threshold |
+| `@GruVramBot unkill` | Disarm killer mode (interactive buttons) |
+| `@GruVramBot arise` | Subscribe chat to automatic high-VRAM alerts |
 | `@GruVramBot dismiss` | Unsubscribe chat |
+| `@GruVramBot setname Name` | Set the name the bot uses to address you |
 | `@GruVramBot help` | Command registry |
 
 #### Bloat levels
 
 `20%` · `50%` · `70%` · `90%` of total VRAM on the selected GPU.
+
+#### Killer Mode trigger thresholds
+
+`10%` · `50%` · `70%` free VRAM — auto-bloat fires when free VRAM drops below the chosen level. Reminders fire every 60 seconds while armed.
 
 #### `.env` file — `GpuVramService/.env`
 
@@ -119,11 +129,11 @@ TELEGRAM_CHAT_ID=PUT_ID_HERE
 # Optional: topic thread ID for supergroups with topics enabled
 TELEGRAM_THREAD_ID=
 
-# How often to poll GPU stats and check thresholds (seconds). Default: 60
+# How often to poll GPU stats (seconds). Default: 60
 GPU_POLL_INTERVAL_SECS=60
 
-# Alert when free VRAM drops below this percentage on any unoccupied GPU. Default: 10
-VRAM_LOW_THRESHOLD_PCT=10
+# Alert when free VRAM rises ABOVE this percentage on any unoccupied GPU. Default: 50
+VRAM_HIGH_THRESHOLD_PCT=50
 ```
 
 ---
@@ -144,7 +154,8 @@ NgJaBach-Shadow-Army/
 │   │   └── bot_blueprint.md   # Full spec
 │   └── bot_data/              # Auto-created on first run — gitignored
 │       ├── usage_state.json   # Today's usage snapshot
-│       └── subscribers.json   # Subscribed chat IDs
+│       ├── subscribers.json   # Subscribed chat IDs
+│       └── names.json         # Per-chat display names
 │
 └── GpuVramService/
     ├── just_training.py       # Bot source (single file)
@@ -153,7 +164,8 @@ NgJaBach-Shadow-Army/
     ├── docs/
     │   └── bot_blueprint.md   # Full spec
     └── bot_data/              # Auto-created on first run — gitignored
-        └── subscribers.json   # Subscribed chat IDs
+        ├── subscribers.json   # Subscribed chat IDs
+        └── names.json         # Per-chat display names
 ```
 
 A shared `.venv/` is created at the repo root by either run script.
@@ -172,7 +184,7 @@ cp OpenAIUsageBot/.env.example OpenAIUsageBot/.env   # or create manually
 # Fill in: OPENAI_ADMIN_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # Configure GPU VRAM bot
-cp GpuVramBot/.env.example GpuVramBot/.env           # or create manually
+cp GpuVramService/.env.example GpuVramService/.env   # or create manually
 # Fill in: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
 # Run (each in its own terminal or tmux pane)
