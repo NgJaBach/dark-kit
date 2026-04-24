@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────
 # OpenAI Shadow Ledger — @BachsSlave2Bot startup script
-# Usage: bash scripts/run_openai_bot.sh
+#
+# ── QUICK START (run once, survives reboot & crashes) ────────
+#   tmux new-session -d -s bot 'bash /home/ngjabach/Documents/Research/BAILAB/NgJaBach-Shadow-Army/scripts/run_openai_bot.sh'
+#   tmux attach -t bot
+#
+# ── REBOOT SURVIVAL (paste into crontab -e) ──────────────────
+#   @reboot sleep 15 && tmux new-session -d -s bot 'bash /home/ngjabach/Documents/Research/BAILAB/NgJaBach-Shadow-Army/scripts/run_openai_bot.sh'
+#
+# ── TMUX CHEATSHEET ──────────────────────────────────────────
+#   tmux attach -t bot          — reattach to running session
+#   Ctrl+B, D                   — detach (leave bot running)
+#   tmux kill-session -t bot    — stop bot permanently
+#   tmux ls                     — list sessions
 # ─────────────────────────────────────────────────────────────
 
 # Conda setup (optional)
@@ -60,7 +72,7 @@ if grep -q "PUT_TOKEN_HERE\|PUT_KEY_HERE" "$ENV_FILE"; then
     exit 1
 fi
 
-# ── 4. Launch ─────────────────────────────────────────────────
+# ── 4. Launch (watchdog loop — restarts on crash) ─────────────
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  OpenAI Shadow Ledger — @BachsSlave2Bot"
@@ -69,4 +81,8 @@ echo "  Poll    : ${POLL_INTERVAL_MINS:-60} min  |  Limit: \$${DAILY_SPEND_LIMIT
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-exec "$PYTHON" "$BOT_DIR/openai_usage_bot.py"
+while true; do
+    "$PYTHON" "$BOT_DIR/openai_usage_bot.py"
+    echo "[watchdog] Bot exited. Restarting in 5 seconds... (tmux kill-session -t bot to stop)"
+    sleep 5
+done
