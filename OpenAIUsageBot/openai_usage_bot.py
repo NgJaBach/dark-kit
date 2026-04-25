@@ -1414,8 +1414,8 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 fail_count = 0
             else:
                 fail_count += 1
-                wait = min(POLL_INTERVAL * (2 ** min(fail_count - 1, 4)), 1800)
-                print(f"[poll] Fetch failed ({fail_count}) — retry in {wait // 60:.0f}min")
+                wait = min(POLL_INTERVAL * (2 ** min(fail_count - 1, 6)), 3600)
+                print(f"[poll] Fetch failed ({fail_count}) — retry in {wait // 60:.0f}min (backoff)")
                 time.sleep(wait)
                 continue
 
