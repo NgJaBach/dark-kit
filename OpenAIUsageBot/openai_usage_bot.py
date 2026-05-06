@@ -77,15 +77,18 @@ CONCURRENCY_COOLDOWN    = 900  # seconds between concurrency alerts (15 min)
 
 # ── Known projects (IDs from exported CSV — case-sensitive) ─────────────────
 KNOWN_PROJECTS: dict[str, str] = {
-    "proj_Gkm7qFbBFgmW11VFtO13Uw3F": "Default project", 
-    "proj_9su0tGI8NsaLE7LHqikCw8VE": "cngvng-project", 
+    "proj_Gkm7qFbBFgmW11VFtO13Uw3F": "Default project",
+    "proj_9su0tGI8NsaLE7LHqikCw8VE": "cngvng-project",
     "proj_4VPu8UTHzBpZiHFQVaYG923d": "hoangha-project",
     "proj_fvkY21dJ0ripiOIA2jCC86f3": "namvuong-project",
     "proj_fEboQnaVm4tQCk8kFy0h8s08": "khonlanh-project",
-    "proj_zRWDq4YWIDEkxbgMAjX0xy79": "phongnguyen-project", 
+    "proj_zRWDq4YWIDEkxbgMAjX0xy79": "phongnguyen-project",
     "proj_J4rNEXilII2l889OotmE7YNW": "ngjabach-project",
     "proj_OWrxxJaWk5MXHBi3HIdPxBDh": "oduong-project",
     "proj_C51oeo4LjmiQefinVfoI8Rs0": "duyanh-project",
+    "proj_cEHeqXeLfsJ6jrQhOXDlt9wH": "minhphung-project",
+    "proj_wmeni3BelwvPUahovs5wQy3i": "kong-project",
+    "proj_E8F4KEaZSMfBuaPhE3Y69BzM": "ngocvo-project",
 }
 
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
