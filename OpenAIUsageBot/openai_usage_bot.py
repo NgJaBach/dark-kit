@@ -87,6 +87,12 @@ CONCURRENCY_COOLDOWN    = 900  # seconds between concurrency alerts (15 min)
 # Use a wider window for overcap checks so recent-but-delayed data is caught.
 OVERCAP_WINDOW_MINS = 20
 
+# ── Project sealing (rate-limit throttle) ────────────────────────────────────
+# When sealing, every rate-limit field present on a row is POSTed back as 0.
+# Empirically the Admin API accepts 0 for max_requests_per_1_minute,
+# max_tokens_per_1_minute, and the other per-model maxima — guaranteeing the
+# project cannot make a single successful token-burning call. See _seal_payload.
+
 # ── Known projects (IDs from exported CSV — case-sensitive) ─────────────────
 KNOWN_PROJECTS: dict[str, str] = {
     "proj_Gkm7qFbBFgmW11VFtO13Uw3F": "Default project",
@@ -101,6 +107,7 @@ KNOWN_PROJECTS: dict[str, str] = {
     "proj_cEHeqXeLfsJ6jrQhOXDlt9wH": "minhphung-project",
     "proj_wmeni3BelwvPUahovs5wQy3i": "kong-project",
     "proj_E8F4KEaZSMfBuaPhE3Y69BzM": "ngocvo-project",
+    "proj_MIieWaC8hSsgAp4rSaN86BEp": "tubel-project",
 }
 
 OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
@@ -435,6 +442,79 @@ def _filter_to_exceeded_band(banded: dict[str, dict[str, int]],
     return out
 
 
+# ── OpenAI Admin: project rate-limit API ───────────────────────────────────
+OPENAI_RATE_LIMITS_URL_TMPL = "https://api.openai.com/v1/organization/projects/{pid}/rate_limits"
+
+
+def _fetch_project_rate_limits(pid: str) -> Optional[list[dict]]:
+    """Return every rate-limit row for a project (one per model). None on API failure."""
+    out: list[dict] = []
+    params = [("limit", 100)]
+    page = None
+    url  = OPENAI_RATE_LIMITS_URL_TMPL.format(pid=pid)
+    while True:
+        p = list(params)
+        if page:
+            p.append(("after", page))
+        try:
+            r = requests.get(url, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            print(f"[openai rate-limits GET error] {pid}: {e}")
+            return None
+        if not r.ok:
+            print(f"[openai rate-limits GET {r.status_code}] {pid}: {r.text[:300]}")
+            return None
+        data = r.json()
+        out.extend(data.get("data", []))
+        if not data.get("has_more"):
+            break
+        page = data.get("last_id")
+        if not page:
+            break
+    return out
+
+
+# Rate-limit POSTs that fail with these codes are no-ops for sealing purposes:
+#   - rate_limit_does_not_exist_for_org_and_model: org has no access to that model
+#   - rate_limit_not_updatable:                    fine-tune / batch-only rows; not settable
+#   - invalid_rate_limit_type:                     model doesn't support this RL field
+#     (e.g. sora-2 rejects max_tokens_per_1_minute even though GET returns it)
+# In all cases, the model isn't usable in a way that bypasses our throttle, so we
+# treat the failure as a successful no-op rather than aborting the seal.
+_SKIPPABLE_RATE_LIMIT_ERR_CODES = frozenset({
+    "rate_limit_does_not_exist_for_org_and_model",
+    "rate_limit_not_updatable",
+    "invalid_rate_limit_type",
+})
+
+
+def _update_project_rate_limit(pid: str, rate_limit_id: str, payload: dict) -> bool:
+    """POST a partial update to a single rate-limit row.
+    Returns True on 2xx and on the soft-skip codes above. False on any other failure."""
+    url = f"{OPENAI_RATE_LIMITS_URL_TMPL.format(pid=pid)}/{rate_limit_id}"
+    try:
+        r = requests.post(
+            url,
+            headers={**_openai_headers(), "Content-Type": "application/json"},
+            json=payload,
+            timeout=REQUEST_TIMEOUT,
+        )
+    except Exception as e:
+        print(f"[openai rate-limits POST error] {pid}/{rate_limit_id}: {e}")
+        return False
+    if r.ok:
+        return True
+    err_code = ""
+    try:
+        err_code = r.json().get("error", {}).get("code", "") or ""
+    except Exception:
+        pass
+    if err_code in _SKIPPABLE_RATE_LIMIT_ERR_CODES:
+        return True   # soft skip — non-updatable / no org access
+    print(f"[openai rate-limits POST {r.status_code}] {pid}/{rate_limit_id}: {r.text[:300]}")
+    return False
+
+
 def _fetch_recent_data(days: int = 31) -> dict:
     """Aggregated data for the last `days` calendar days.
     Returns per-project costs, org-level cost, total tokens, total requests."""
@@ -602,6 +682,10 @@ class UsageStore:
         "last_illegal_seen_ts",
         "urgent_poll_step",
         "milestones_seeded",
+        # project sealing
+        "sealed_projects",
+        "pending_unseal",
+        "manually_unsealed_today",
     )
 
     def __init__(self, path: Path):
@@ -635,7 +719,12 @@ class UsageStore:
             json.dump(self._data, f, indent=2)
 
     def _reset_daily_state_locked(self):
-        """Reset all daily alert/mode state. Caller must hold self._lock."""
+        """Reset all daily alert/mode state. Caller must hold self._lock.
+        Sealed projects move into pending_unseal so the API restore happens
+        on the next poll/refresh — keeps the lock acquisition cheap."""
+        sealed  = self._data.get("sealed_projects", {})
+        pending = self._data.get("pending_unseal", {})
+        pending.update(sealed)
         self._data["alert_sent"]                  = False
         self._data["token_milestones_notified"]   = []
         self._data["premium_milestones_notified"] = []
@@ -646,6 +735,9 @@ class UsageStore:
         self._data["last_illegal_seen_ts"]        = None
         self._data["urgent_poll_step"]            = 0
         self._data["milestones_seeded"]           = False
+        self._data["sealed_projects"]             = {}
+        self._data["manually_unsealed_today"]     = []
+        self._data["pending_unseal"]              = pending
         self._data.pop("costs_cache", None)
 
     def update(self, snapshot: dict):
@@ -828,6 +920,65 @@ class UsageStore:
         becomes a no-op."""
         with self._lock:
             return self._data.get("milestones_seeded", False)
+
+    # ── Project sealing ────────────────────────────────────────────────────
+    def get_sealed_projects(self) -> dict:
+        with self._lock:
+            return {pid: dict(info) for pid, info in self._data.get("sealed_projects", {}).items()}
+
+    def is_sealed(self, pid: str) -> bool:
+        with self._lock:
+            return pid in self._data.get("sealed_projects", {})
+
+    def get_sealed_info(self, pid: str) -> Optional[dict]:
+        with self._lock:
+            info = self._data.get("sealed_projects", {}).get(pid)
+            return dict(info) if info else None
+
+    def mark_sealed(self, pid: str, reason: str, original_limits: list, auto_sealed: bool) -> None:
+        with self._lock:
+            sealed = self._data.setdefault("sealed_projects", {})
+            sealed[pid] = {
+                "sealed_at":       time.time(),
+                "reason":          reason,
+                "original_limits": original_limits,
+                "auto_sealed":     auto_sealed,
+            }
+            self._save()
+
+    def mark_unsealed(self, pid: str) -> Optional[dict]:
+        """Remove pid from sealed_projects. Returns the removed entry, or None."""
+        with self._lock:
+            sealed = self._data.setdefault("sealed_projects", {})
+            entry  = sealed.pop(pid, None)
+            self._save()
+            return entry
+
+    def is_manually_unsealed(self, pid: str) -> bool:
+        """True if the user manually unsealed pid today — auto-seal must skip it."""
+        with self._lock:
+            return pid in self._data.get("manually_unsealed_today", [])
+
+    def get_manually_unsealed(self) -> set:
+        with self._lock:
+            return set(self._data.get("manually_unsealed_today", []))
+
+    def mark_manually_unsealed(self, pid: str) -> None:
+        with self._lock:
+            lst = self._data.setdefault("manually_unsealed_today", [])
+            if pid not in lst:
+                lst.append(pid)
+            self._save()
+
+    def get_pending_unseal(self) -> dict:
+        with self._lock:
+            return {pid: dict(info) for pid, info in self._data.get("pending_unseal", {}).items()}
+
+    def clear_pending_unseal(self, pid: str) -> None:
+        with self._lock:
+            pending = self._data.setdefault("pending_unseal", {})
+            pending.pop(pid, None)
+            self._save()
 
 
 # ── Subscriber store ───────────────────────────────────────────────────────
@@ -1118,7 +1269,12 @@ def _handle_overcap(snap: dict, usage: UsageStore, subs: SubscriberStore,
     """Fetch banded recent activity and broadcast only for projects burning the EXCEEDED band.
     A project using premium models does not trigger the normal-cap alarm and vice versa.
     Uses OVERCAP_WINDOW_MINS to absorb the 5–15 min OpenAI ingestion lag.
-    Reverts to passive after AGGRESSIVE_REVERT_SECS quiet on the exceeded band."""
+    Reverts to passive after AGGRESSIVE_REVERT_SECS quiet on the exceeded band.
+
+    Also drives auto-seal: any project burning the exceeded band that isn't already
+    sealed and isn't on today's manual-unseal exemption gets sealed via rate-limit
+    throttle. The alarm broadcast still fires regardless — sealing reduces future
+    spend, the alarm reports what already happened."""
     banded = _fetch_recent_activity_by_band(minutes=OVERCAP_WINDOW_MINS)
     if banded is None:
         # API failure — keep current mode, don't broadcast or revert based on bad data.
@@ -1140,11 +1296,218 @@ def _handle_overcap(snap: dict, usage: UsageStore, subs: SubscriberStore,
             )
         else:
             _send_all(fmt_overcap_active_alert(illegal, normal_exceeded, premium_exceeded), subs)
+
+        # Auto-seal each illegal project that isn't already sealed and wasn't manually
+        # unsealed today. Sequential — many rate-limit POSTs per project.
+        for pid, bands in illegal.items():
+            if usage.is_sealed(pid) or usage.is_manually_unsealed(pid):
+                continue
+            reason = _build_seal_reason(bands, normal_exceeded, premium_exceeded)
+            _seal_project(usage, subs, names, pid, reason, auto_sealed=True)
     elif mode == "aggressive":
         last_ts = usage.get_last_illegal_seen_ts()
         if last_ts and time.time() - last_ts > AGGRESSIVE_REVERT_SECS:
             usage.set_mode("passive")
             print("[mode] → PASSIVE (1 h since last illegal-band activity — standing down)")
+
+
+# ── Project sealing core ───────────────────────────────────────────────────
+
+def _build_seal_reason(bands: dict, normal_exceeded: bool, premium_exceeded: bool) -> str:
+    """Compact human-readable reason string for an auto-seal."""
+    parts = []
+    if normal_exceeded  and bands.get("normal",  0) > 0:
+        parts.append(f"{bands['normal']:,} normal-band req(s) after the 10M cap")
+    if premium_exceeded and bands.get("premium", 0) > 0:
+        parts.append(f"{bands['premium']:,} premium-band req(s) after the 1M cap")
+    return " + ".join(parts) if parts else "post-cap activity"
+
+
+def _capture_originals(rate_limits: list[dict]) -> list[dict]:
+    """Take the API's rate_limit rows and shrink to the fields we need to restore.
+    Only includes fields that were actually present in the original response — avoids
+    sending `null` for irrelevant per-model fields on restore."""
+    fields = (
+        "max_requests_per_1_minute",
+        "max_tokens_per_1_minute",
+        "max_images_per_1_minute",
+        "max_audio_megabytes_per_1_minute",
+        "max_requests_per_1_day",
+        "batch_1_day_max_input_tokens",
+    )
+    captured = []
+    for rl in rate_limits:
+        entry = {"id": rl["id"], "model": rl.get("model", "")}
+        for f in fields:
+            if f in rl and rl[f] is not None:
+                entry[f] = rl[f]
+        captured.append(entry)
+    return captured
+
+
+def _restore_payload(original: dict) -> dict:
+    """Build a POST payload from a captured original — drops 'id' and 'model'."""
+    return {k: v for k, v in original.items() if k not in ("id", "model")}
+
+
+# Fields the API accepts on a rate-limit POST — must match what GET can return.
+_RATE_LIMIT_FLOOR_FIELDS = (
+    "max_requests_per_1_minute",
+    "max_tokens_per_1_minute",
+    "max_images_per_1_minute",
+    "max_audio_megabytes_per_1_minute",
+    "max_requests_per_1_day",
+    "batch_1_day_max_input_tokens",
+)
+
+
+def _seal_payload(rate_limit: dict) -> dict:
+    """Build the POST payload to throttle a single rate-limit row to 0.
+    Only includes fields the row actually exposes — sora-2, for example, rejects
+    max_tokens_per_1_minute as 'invalid_rate_limit_type' for that model."""
+    payload = {}
+    for f in _RATE_LIMIT_FLOOR_FIELDS:
+        if rate_limit.get(f) is not None:
+            payload[f] = 0
+    return payload
+
+
+def _seal_project(usage: UsageStore, subs: SubscriberStore, names: NameStore,
+                  pid: str, reason: str, auto_sealed: bool) -> bool:
+    """Throttle every rate-limit row on `pid` down to 0/0. Idempotent: returns False
+    if the project is already sealed. On partial API failure rolls back so the
+    project is either fully sealed or fully untouched."""
+    if usage.is_sealed(pid):
+        return False
+    proj_name   = KNOWN_PROJECTS.get(pid, pid)
+    rate_limits = _fetch_project_rate_limits(pid)
+    if rate_limits is None:
+        print(f"[seal] {proj_name}: rate-limits fetch failed — aborting")
+        return False
+    if not rate_limits:
+        print(f"[seal] {proj_name}: no rate-limit rows — nothing to throttle")
+        return False
+
+    originals = _capture_originals(rate_limits)
+
+    sealed_ids: list[str] = []
+    for rl in rate_limits:
+        if _update_project_rate_limit(pid, rl["id"], _seal_payload(rl)):
+            sealed_ids.append(rl["id"])
+            time.sleep(0.05)   # space writes; bulk POSTs without spacing
+                               # occasionally don't persist on the API side
+        else:
+            # Partial failure — roll back whatever we throttled so far.
+            print(f"[seal] {proj_name}: throttle failed at {rl['id']} — rolling back")
+            for orig in originals:
+                if orig["id"] in sealed_ids:
+                    _update_project_rate_limit(pid, orig["id"], _restore_payload(orig))
+                    time.sleep(0.05)
+            if names:
+                _broadcast_named(
+                    lambda n, p=proj_name: f"⚠️ Seal attempt for <b>{p}</b> failed mid-way — rolled back, manual check advised, Monarch {n}.",
+                    subs, names,
+                )
+            return False
+
+    usage.mark_sealed(pid, reason, originals, auto_sealed)
+    if names:
+        _broadcast_named(
+            lambda n, p=proj_name, r=reason, c=len(rate_limits), a=auto_sealed:
+                fmt_seal_alert(p, r, c, a, n),
+            subs, names,
+        )
+    else:
+        _send_all(fmt_seal_alert(proj_name, reason, len(rate_limits), auto_sealed), subs)
+    print(f"[seal] {proj_name}: throttled {len(rate_limits)} rate-limit row(s)")
+    return True
+
+
+def _unseal_project(usage: UsageStore, subs: SubscriberStore, names: NameStore,
+                    pid: str, info: dict, reason: str, manual: bool,
+                    broadcast: bool = True) -> bool:
+    """Restore originals captured at seal time. `info` is the entry from sealed_projects
+    or pending_unseal — both share the same shape."""
+    proj_name = KNOWN_PROJECTS.get(pid, pid)
+    originals = info.get("original_limits", [])
+    if not originals:
+        # Nothing to restore (shouldn't happen but be defensive)
+        return True
+
+    failed = 0
+    for orig in originals:
+        if _update_project_rate_limit(pid, orig["id"], _restore_payload(orig)):
+            time.sleep(0.05)   # space writes; see _seal_project for rationale
+        else:
+            failed += 1
+
+    if failed > 0:
+        print(f"[unseal] {proj_name}: {failed}/{len(originals)} restore POSTs failed")
+        # Leave the project marked as sealed so the next attempt can retry.
+        if broadcast and names:
+            _broadcast_named(
+                lambda n, p=proj_name, f=failed, t=len(originals):
+                    f"⚠️ Unseal of <b>{p}</b> failed on {f}/{t} rate-limit(s) — will retry, Monarch {n}.",
+                subs, names,
+            )
+        return False
+
+    if manual:
+        usage.mark_manually_unsealed(pid)
+    print(f"[unseal] {proj_name}: restored {len(originals)} rate-limit row(s) ({reason})")
+    if broadcast:
+        if names:
+            _broadcast_named(
+                lambda n, p=proj_name, r=reason, m=manual: fmt_unseal_alert(p, r, m, n),
+                subs, names,
+            )
+        else:
+            _send_all(fmt_unseal_alert(proj_name, reason, manual), subs)
+    return True
+
+
+def _process_pending_unseals(usage: UsageStore, subs: SubscriberStore, names: NameStore) -> None:
+    """Restore any projects queued for unseal (typically by the day-rollover reset).
+    Run at the start of every poll iteration so the restore happens within minutes
+    of UTC midnight. Failures stay in the queue and retry on the next call."""
+    pending = usage.get_pending_unseal()
+    if not pending:
+        return
+    print(f"[pending-unseal] {len(pending)} project(s) to restore")
+    for pid, info in pending.items():
+        if _unseal_project(usage, subs, names, pid, info,
+                           reason="day rollover", manual=False, broadcast=True):
+            usage.clear_pending_unseal(pid)
+
+
+# ── Formatters — seal/unseal alerts ────────────────────────────────────────
+
+def fmt_seal_alert(proj_name: str, reason: str, num_limits: int, auto_sealed: bool,
+                   name: str = "Bach") -> str:
+    trigger = "auto-sealed by the bot" if auto_sealed else "sealed by your command"
+    return (
+        f"🔒 <b>PROJECT SEALED — {proj_name}</b>\n\n"
+        f"Reason: {reason}\n"
+        f"This project has been <b>{trigger}</b>. All {num_limits} rate-limit row(s) "
+        f"were throttled to 0 — no further token-burning calls are possible.\n\n"
+        f"Auto-restore at the next UTC midnight.\n"
+        f"To restore now: <code>@bot archive unseal {proj_name}</code>\n"
+        f"<i>Monarch {name}, the breach has been contained.</i>"
+    )
+
+
+def fmt_unseal_alert(proj_name: str, reason: str, manual: bool,
+                     name: str = "Bach") -> str:
+    tail = ("This project is now exempt from auto-seal until midnight UTC — the "
+            "alarm will still fire if it keeps burning the exhausted band, but the "
+            "bot will not seal it again today.") if manual else \
+           "Rate limits were restored to their pre-seal values."
+    return (
+        f"🔓 <b>PROJECT UNSEALED — {proj_name}</b>\n\n"
+        f"Reason: {reason}\n"
+        f"{tail}\n"
+        f"<i>Monarch {name}, the seal has been lifted.</i>"
+    )
 
 
 # ── Formatters — command responses ─────────────────────────────────────────
@@ -1405,6 +1768,140 @@ def cmd_active(usage: UsageStore, name: str = "Bach") -> str:
     return "\n".join(lines)
 
 
+# ── Archive (seal/unseal) command ──────────────────────────────────────────
+
+def _resolve_project(token: str) -> Optional[str]:
+    """Map a human-typed token (project name or proj_ ID) to a known project ID."""
+    if not token:
+        return None
+    token = token.strip()
+    if token in KNOWN_PROJECTS:
+        return token
+    needle = token.lower()
+    for pid, pname in KNOWN_PROJECTS.items():
+        if pname.lower() == needle:
+            return pid
+    return None
+
+
+def cmd_archive(args: list, usage: UsageStore, subs: SubscriberStore,
+                names: NameStore = None, name: str = "Bach") -> str:
+    """Sub-command driven archive controller.
+
+    Forms:
+      archive                       → list status of every known project
+      archive list                  → same
+      archive seal   <name|id>      → seal one project
+      archive unseal <name|id>      → unseal one project (exempts from auto-seal today)
+      archive unseal all            → unseal every currently sealed project
+    """
+    sub = args[0].lower() if args else "list"
+
+    if sub == "list":
+        return _fmt_archive_status(usage, name)
+
+    if sub == "seal":
+        if len(args) < 2:
+            return (f"Usage: <code>@bot archive seal &lt;project&gt;</code>\n"
+                    f"Try <code>@bot archive</code> for the project list, Monarch {name}.")
+        target = " ".join(args[1:])
+        pid    = _resolve_project(target)
+        if not pid:
+            return f"Unknown project <code>{target}</code>, Monarch {name}. Try <code>@bot archive</code>."
+        if usage.is_sealed(pid):
+            return f"<b>{KNOWN_PROJECTS.get(pid, pid)}</b> is already sealed."
+        proj_name = KNOWN_PROJECTS.get(pid, pid)
+        reason    = f"manual seal by Monarch {name}"
+        ok        = _seal_project(usage, subs, names, pid, reason, auto_sealed=False)
+        if ok:
+            return f"🔒 <b>{proj_name}</b> sealed.\n<i>Order carried out, My Liege {name}.</i>"
+        return f"⚠️ Failed to seal <b>{proj_name}</b> — check logs, Monarch {name}."
+
+    if sub == "unseal":
+        if len(args) < 2:
+            return (f"Usage: <code>@bot archive unseal &lt;project|all&gt;</code>\n"
+                    f"Try <code>@bot archive</code> for the project list, Monarch {name}.")
+        target = " ".join(args[1:]).strip()
+        if target.lower() == "all":
+            sealed = usage.get_sealed_projects()
+            if not sealed:
+                return f"No projects are currently sealed, Monarch {name}."
+            restored = 0
+            for pid, info in sealed.items():
+                if _unseal_project(usage, subs, names, pid, info,
+                                   reason=f"manual unseal-all by Monarch {name}",
+                                   manual=True):
+                    usage.mark_unsealed(pid)
+                    restored += 1
+            return f"🔓 Restored <b>{restored}/{len(sealed)}</b> sealed project(s)."
+
+        pid = _resolve_project(target)
+        if not pid:
+            return f"Unknown project <code>{target}</code>, Monarch {name}. Try <code>@bot archive</code>."
+        info = usage.get_sealed_info(pid)
+        if not info:
+            return f"<b>{KNOWN_PROJECTS.get(pid, pid)}</b> is not sealed."
+        ok = _unseal_project(usage, subs, names, pid, info,
+                             reason=f"manual unseal by Monarch {name}", manual=True)
+        if ok:
+            usage.mark_unsealed(pid)
+            return f"🔓 <b>{KNOWN_PROJECTS.get(pid, pid)}</b> unsealed and exempt from auto-seal until midnight UTC."
+        return f"⚠️ Failed to unseal <b>{KNOWN_PROJECTS.get(pid, pid)}</b> — check logs."
+
+    return (f"Unknown <code>archive</code> sub-command <code>{sub}</code>, Monarch {name}. "
+            f"Use <code>list</code>, <code>seal &lt;p&gt;</code>, "
+            f"or <code>unseal &lt;p|all&gt;</code>.")
+
+
+def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
+    sealed        = usage.get_sealed_projects()
+    manual_exempt = usage.get_manually_unsealed()
+    pending       = usage.get_pending_unseal()
+
+    lines = [f"🗃️ <b>Project Archive Status</b>\n"]
+    if sealed:
+        lines.append("<b>Sealed</b>")
+        for pid, info in sorted(sealed.items(), key=lambda kv: kv[1].get("sealed_at", 0)):
+            proj_name = KNOWN_PROJECTS.get(pid, pid)
+            trigger   = "auto" if info.get("auto_sealed") else "manual"
+            sealed_at = _fmt_ts(info.get("sealed_at"))
+            reason    = info.get("reason", "—")
+            lines.append(f"🔒 <b>{proj_name}</b> · {trigger} · {sealed_at} · {reason}")
+        lines.append("")
+
+    if manual_exempt:
+        lines.append("<b>Unsealed today (exempt from auto-seal)</b>")
+        for pid in sorted(manual_exempt):
+            if pid in sealed:
+                continue
+            proj_name = KNOWN_PROJECTS.get(pid, pid)
+            lines.append(f"🔓 <b>{proj_name}</b>")
+        lines.append("")
+
+    if pending:
+        lines.append("<b>Pending restore (will retry next poll)</b>")
+        for pid in sorted(pending):
+            proj_name = KNOWN_PROJECTS.get(pid, pid)
+            lines.append(f"⏳ <b>{proj_name}</b>")
+        lines.append("")
+
+    active_pids = set(sealed) | set(pending)
+    lines.append("<b>All projects</b>")
+    for pid, proj_name in sorted(KNOWN_PROJECTS.items(), key=lambda kv: kv[1]):
+        status = "🔒 sealed" if pid in sealed else (
+                  "⏳ pending" if pid in pending else (
+                  "🔓 exempt"  if pid in manual_exempt else "✅ active"))
+        lines.append(f"• <b>{proj_name}</b>  —  {status}")
+
+    lines.append("")
+    lines.append(f"<i>Monarch {name}, the archive registry is presented.</i>")
+    lines.append(
+        "Commands: <code>seal &lt;project&gt;</code>, "
+        "<code>unseal &lt;project|all&gt;</code>"
+    )
+    return "\n".join(lines)
+
+
 def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = None, name: str = "Bach") -> str:
     snap = fetch_today_usage()
     if snap:
@@ -1602,6 +2099,11 @@ def cmd_help(bot_username: Optional[str], name: str = "Bach") -> str:
         f"<code>{m} spending</code>   — Monthly bill (current + previous month)\n\n"
         f"<b>Concurrency</b>\n"
         f"<code>{m} active</code>     — Projects active in last {CONCURRENCY_WINDOW_MINS} min\n\n"
+        f"<b>Archive (rate-limit seal)</b>\n"
+        f"<code>{m} archive</code>                  — List all projects with seal status\n"
+        f"<code>{m} archive seal &lt;name&gt;</code>      — Throttle a project to 0 rate-limit\n"
+        f"<code>{m} archive unseal &lt;name&gt;</code>    — Restore rate-limits; exempts from auto-seal until midnight UTC\n"
+        f"<code>{m} archive unseal all</code>       — Restore every currently sealed project\n\n"
         f"<b>Notifications</b>\n"
         f"<code>{m} arise</code>      — Subscribe this chat to all alerts\n"
         f"<code>{m} dismiss</code>    — Unsubscribe this chat\n"
@@ -1638,6 +2140,9 @@ def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
     if cmd == "setname":
         new_name = " ".join(parts[1:]) if len(parts) > 1 else ""
         return cmd_setname(chat_id, new_name, names) if names else "Name store unavailable."
+
+    if cmd == "archive":
+        return cmd_archive(parts[1:], usage, subs, names, name)
 
     routes = {
         "tokens":   lambda: cmd_tokens(usage, name),
@@ -1722,6 +2227,11 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 usage.update(snap)   # auto-resets daily state on day rollover
                 if costs:
                     usage.update_costs(costs, snap["total_cost"], org_cost)
+
+                # If yesterday's sealed projects were just moved to pending_unseal by
+                # the daily reset, restore them via the API now. Failures stay in the
+                # queue and are retried on the next iteration.
+                _process_pending_unseals(usage, subs, names)
 
                 normal_tok  = snap.get("total_normal_tokens",  0)
                 premium_tok = snap.get("total_premium_tokens", 0)

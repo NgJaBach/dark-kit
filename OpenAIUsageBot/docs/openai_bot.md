@@ -288,6 +288,50 @@ is available for implementing this in the future if needed.
 **Frequency:** At most once per 15 minutes (`CONCURRENCY_COOLDOWN`).
 **Source:** `concurrency_check_loop` thread, runs every 5 min independent of poll mode.
 
+### 7.7 Project Sealing (auto + manual)
+The bot can **seal** a project — throttle every rate-limit row to 0/0 so no
+token-burning call can succeed — and **unseal** it (restore the originals).
+Sealing uses `POST /v1/organization/projects/{pid}/rate_limits/{rate_limit_id}`
+because the project archive endpoint is one-way and cannot be reversed via API.
+
+**Auto-seal trigger.** Inside `_handle_overcap`, after the red-tone alarm fires,
+every project in the `illegal` set (i.e. burning the exhausted band) gets sealed,
+**unless**:
+- it's already sealed (`usage.is_sealed`), or
+- a user manually unsealed it earlier today (`usage.is_manually_unsealed`).
+
+**What a seal does.** `_seal_project()` GETs every rate-limit row, captures the
+originals into `usage_state.json → sealed_projects[pid].original_limits`, then POSTs
+`max_requests_per_1_minute=0` and `max_tokens_per_1_minute=0` to each. If any POST
+fails (other than the soft-skip codes — see below), all successfully-throttled rows
+are rolled back so the project ends up either fully sealed or fully untouched.
+
+**Soft-skip error codes.** Some rate-limit rows returned by GET aren't actually
+updatable. The bot treats these as successful no-ops:
+- `rate_limit_does_not_exist_for_org_and_model` — org has no access to that model.
+- `rate_limit_not_updatable` — fine-tune / batch-only rows.
+
+In both cases the project can't use the model in a way that bypasses our throttle.
+
+**Manual seal/unseal.** The `@bot archive` command:
+- `archive` → list every project with seal status, plus the manual-unseal exempt list.
+- `archive seal <name|id>` → seal the named project.
+- `archive unseal <name|id>` → restore originals **and** add the project to
+  `manually_unsealed_today`. Once exempt for the day, auto-seal will skip it even
+  if it keeps burning the exhausted band (the alarm still fires).
+- `archive unseal all` → restore every currently sealed project, each marked exempt.
+
+**Auto-unseal at UTC midnight.** When `UsageStore.update()` (or `__init__`) detects
+a day change, every entry in `sealed_projects` moves into `pending_unseal` and
+`manually_unsealed_today` is cleared. The next poll iteration calls
+`_process_pending_unseals()` which POSTs the saved originals back via API.
+Failures stay in `pending_unseal` and retry on subsequent polls — the queue drains
+even if OpenAI was unreachable at midnight.
+
+**Latency.** Detection → seal latency is bounded by the aggressive-mode poll
+interval (3–10 min). Each seal/unseal is ~150 sequential POSTs (one per
+rate-limit row) so a single project takes ~30–60 s to fully throttle.
+
 ---
 
 ## 8. Command Reference
@@ -306,6 +350,10 @@ Non-subscribed chats can only use `arise`. All other commands are silently ignor
 | `recent` | Last 31 days: per-project cost, total tokens & requests. |
 | `spending` | Monthly bill — current + previous month (live fetch). |
 | `active` | Projects with API activity in the last 5 min + concurrency status. |
+| `archive` | List archive status of every known project. |
+| `archive seal <name>` | Seal one project (throttle rate-limits to 0/0). |
+| `archive unseal <name>` | Restore one project; mark exempt from auto-seal until UTC midnight. |
+| `archive unseal all` | Restore every currently sealed project. |
 | `arise` | Subscribe this chat to all alerts. Plays the Beru GIF on first subscribe. |
 | `dismiss` | Unsubscribe this chat (primary chat cannot be dismissed). |
 | `setname Name` | Set the name the bot uses to address you in this chat. |
@@ -355,6 +403,9 @@ Fields preserved across snapshot updates (not overwritten by each poll):
 | `last_illegal_seen_ts` | float | Timestamp of last poll with active illegal projects |
 | `urgent_poll_step` | int | Current step in 3→10 min interval progression |
 | `milestones_seeded` | bool | True after first-poll seed runs; guards the /refresh race condition |
+| `sealed_projects` | dict | pid → {sealed_at, reason, original_limits, auto_sealed} for every currently sealed project |
+| `pending_unseal` | dict | pid → entry to restore via API on next poll. Populated by day rollover from `sealed_projects` |
+| `manually_unsealed_today` | list[str] | pids exempt from auto-seal for the rest of the UTC day |
 
 All fields reset at UTC midnight. Two reset paths, both internal:
 
