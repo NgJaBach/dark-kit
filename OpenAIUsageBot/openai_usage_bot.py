@@ -93,6 +93,24 @@ OVERCAP_WINDOW_MINS = 20
 # max_tokens_per_1_minute, and the other per-model maxima — guaranteeing the
 # project cannot make a single successful token-burning call. See _seal_payload.
 
+# ── Track-level mass-seal trigger ──────────────────────────────────────────
+# When a track's remaining quota drops to this fraction (or below — including
+# negative remaining if the cap has been overshot), the bot mass-throttles every
+# project's rate-limit rows for that track's models. 0.05 = 5% remaining =
+# 9.5M of the 10M normal cap, 950k of the 1M premium cap.
+TRACK_SEAL_REMAINING_PCT       = 0.05
+NORMAL_TRACK_SEAL_THRESHOLD    = int(TOKEN_HARD_CAP         * (1 - TRACK_SEAL_REMAINING_PCT))
+PREMIUM_TRACK_SEAL_THRESHOLD   = int(PREMIUM_TOKEN_HARD_CAP * (1 - TRACK_SEAL_REMAINING_PCT))
+
+
+def _matches_track(model: str, track: str) -> bool:
+    """True if `model` belongs to the named track ('normal' or 'premium')."""
+    if track == "premium":
+        return _is_premium_model(model)
+    if track == "normal":
+        return not _is_premium_model(model)
+    raise ValueError(f"unknown track: {track!r}")
+
 # ── Known projects (IDs from exported CSV — case-sensitive) ─────────────────
 KNOWN_PROJECTS: dict[str, str] = {
     "proj_Gkm7qFbBFgmW11VFtO13Uw3F": "Default project",
@@ -682,10 +700,17 @@ class UsageStore:
         "last_illegal_seen_ts",
         "urgent_poll_step",
         "milestones_seeded",
-        # project sealing
+        # project sealing — sealed_projects is for the manual full-seal command;
+        # pending_unseal holds entries to be restored on day rollover or after
+        # a legacy migration. sealed_tracks holds the mass per-track throttle
+        # state. track_exemptions records projects that have been manually
+        # unsealed for one or both tracks and should be skipped by future
+        # auto-seals of those tracks this day.
         "sealed_projects",
         "pending_unseal",
-        "manually_unsealed_today",
+        "sealed_tracks",
+        "pending_track_unseal",
+        "track_exemptions",
     )
 
     def __init__(self, path: Path):
@@ -720,11 +745,25 @@ class UsageStore:
 
     def _reset_daily_state_locked(self):
         """Reset all daily alert/mode state. Caller must hold self._lock.
-        Sealed projects move into pending_unseal so the API restore happens
-        on the next poll/refresh — keeps the lock acquisition cheap."""
+        Sealed state (per-project full + per-track mass) moves into the matching
+        pending_* queue so the API restore happens on the next poll/refresh —
+        keeps the lock acquisition cheap."""
+        # Move sealed_projects → pending_unseal
         sealed  = self._data.get("sealed_projects", {})
         pending = self._data.get("pending_unseal", {})
         pending.update(sealed)
+        # Move sealed_tracks → pending_track_unseal (merge originals_by_project
+        # if the queue already has an entry for the same track)
+        s_tracks = self._data.get("sealed_tracks", {})
+        p_tracks = self._data.get("pending_track_unseal", {})
+        for track, info in s_tracks.items():
+            if track in p_tracks:
+                p_tracks[track].setdefault("originals_by_project", {}).update(
+                    info.get("originals_by_project", {})
+                )
+            else:
+                p_tracks[track] = info
+
         self._data["alert_sent"]                  = False
         self._data["token_milestones_notified"]   = []
         self._data["premium_milestones_notified"] = []
@@ -736,8 +775,12 @@ class UsageStore:
         self._data["urgent_poll_step"]            = 0
         self._data["milestones_seeded"]           = False
         self._data["sealed_projects"]             = {}
-        self._data["manually_unsealed_today"]     = []
+        self._data["sealed_tracks"]               = {}
+        self._data["track_exemptions"]            = {}
         self._data["pending_unseal"]              = pending
+        self._data["pending_track_unseal"]        = p_tracks
+        # Drop legacy field carried over from older bot versions
+        self._data.pop("manually_unsealed_today", None)
         self._data.pop("costs_cache", None)
 
     def update(self, snapshot: dict):
@@ -946,30 +989,6 @@ class UsageStore:
             }
             self._save()
 
-    def mark_unsealed(self, pid: str) -> Optional[dict]:
-        """Remove pid from sealed_projects. Returns the removed entry, or None."""
-        with self._lock:
-            sealed = self._data.setdefault("sealed_projects", {})
-            entry  = sealed.pop(pid, None)
-            self._save()
-            return entry
-
-    def is_manually_unsealed(self, pid: str) -> bool:
-        """True if the user manually unsealed pid today — auto-seal must skip it."""
-        with self._lock:
-            return pid in self._data.get("manually_unsealed_today", [])
-
-    def get_manually_unsealed(self) -> set:
-        with self._lock:
-            return set(self._data.get("manually_unsealed_today", []))
-
-    def mark_manually_unsealed(self, pid: str) -> None:
-        with self._lock:
-            lst = self._data.setdefault("manually_unsealed_today", [])
-            if pid not in lst:
-                lst.append(pid)
-            self._save()
-
     def get_pending_unseal(self) -> dict:
         with self._lock:
             return {pid: dict(info) for pid, info in self._data.get("pending_unseal", {}).items()}
@@ -978,6 +997,110 @@ class UsageStore:
         with self._lock:
             pending = self._data.setdefault("pending_unseal", {})
             pending.pop(pid, None)
+            self._save()
+
+    # ── Track-level seals ──────────────────────────────────────────────────
+    def is_track_sealed(self, track: str) -> bool:
+        with self._lock:
+            return track in self._data.get("sealed_tracks", {})
+
+    def get_sealed_tracks(self) -> dict:
+        with self._lock:
+            return {t: dict(info) for t, info in self._data.get("sealed_tracks", {}).items()}
+
+    def mark_track_seal_started(self, track: str, threshold: int) -> None:
+        """Create the sealed_tracks[track] entry early so concurrent triggers see it."""
+        with self._lock:
+            tracks = self._data.setdefault("sealed_tracks", {})
+            if track in tracks:
+                return
+            tracks[track] = {
+                "sealed_at":           time.time(),
+                "threshold":           threshold,
+                "originals_by_project": {},
+            }
+            self._save()
+
+    def add_track_originals(self, track: str, pid: str, originals: list) -> None:
+        with self._lock:
+            tracks = self._data.setdefault("sealed_tracks", {})
+            entry  = tracks.setdefault(track, {
+                "sealed_at": time.time(),
+                "originals_by_project": {},
+            })
+            entry.setdefault("originals_by_project", {})[pid] = originals
+            self._save()
+
+    def pop_track_originals(self, track: str, pid: str) -> Optional[list]:
+        """Remove and return one project's saved originals for a track. Clears
+        sealed_tracks[track] if no projects remain under it."""
+        with self._lock:
+            tracks = self._data.setdefault("sealed_tracks", {})
+            if track not in tracks:
+                return None
+            originals = tracks[track].get("originals_by_project", {}).pop(pid, None)
+            if not tracks[track].get("originals_by_project"):
+                tracks.pop(track, None)
+            self._save()
+            return originals
+
+    # ── Per-track manual exemption ─────────────────────────────────────────
+    def get_track_exemptions(self) -> dict:
+        with self._lock:
+            return {pid: list(tracks)
+                    for pid, tracks in self._data.get("track_exemptions", {}).items()}
+
+    def is_exempt(self, pid: str, track: str) -> bool:
+        with self._lock:
+            return track in self._data.get("track_exemptions", {}).get(pid, [])
+
+    def add_track_exemption(self, pid: str, track: str) -> None:
+        with self._lock:
+            exemptions = self._data.setdefault("track_exemptions", {})
+            tracks     = exemptions.setdefault(pid, [])
+            if track not in tracks:
+                tracks.append(track)
+            self._save()
+
+    def remove_track_exemption(self, pid: str, track: str) -> None:
+        with self._lock:
+            exemptions = self._data.setdefault("track_exemptions", {})
+            if pid in exemptions:
+                exemptions[pid] = [t for t in exemptions[pid] if t != track]
+                if not exemptions[pid]:
+                    exemptions.pop(pid, None)
+            self._save()
+
+    # ── Pending track unseal queue (day-rollover restore) ──────────────────
+    def get_pending_track_unseal(self) -> dict:
+        with self._lock:
+            return {t: dict(info) for t, info in self._data.get("pending_track_unseal", {}).items()}
+
+    def pop_pending_track_project(self, track: str, pid: str) -> None:
+        """Remove one project from a pending-track-unseal entry. Clears the
+        track-level entry once empty."""
+        with self._lock:
+            pending = self._data.setdefault("pending_track_unseal", {})
+            if track not in pending:
+                return
+            pending[track].get("originals_by_project", {}).pop(pid, None)
+            if not pending[track].get("originals_by_project"):
+                pending.pop(track, None)
+            self._save()
+
+    def remove_sealed_project_rate_limits(self, pid: str, rl_ids: set) -> None:
+        """Drop specific rate-limit-id entries from sealed_projects[pid].original_limits,
+        used after a partial unseal of one track. Clears the project entry if empty."""
+        with self._lock:
+            sealed = self._data.setdefault("sealed_projects", {})
+            entry  = sealed.get(pid)
+            if not entry:
+                return
+            entry["original_limits"] = [
+                o for o in entry.get("original_limits", []) if o.get("id") not in rl_ids
+            ]
+            if not entry["original_limits"]:
+                sealed.pop(pid, None)
             self._save()
 
 
@@ -1264,17 +1387,17 @@ def fmt_overcap_active_alert(banded_active: dict, normal_exceeded: bool, premium
 
 # ── Overcap handler ────────────────────────────────────────────────────────
 
-def _handle_overcap(snap: dict, usage: UsageStore, subs: SubscriberStore,
-                    names: NameStore, normal_exceeded: bool, premium_exceeded: bool) -> None:
-    """Fetch banded recent activity and broadcast only for projects burning the EXCEEDED band.
+def _handle_overcap(usage: UsageStore, subs: SubscriberStore, names: NameStore,
+                    normal_exceeded: bool, premium_exceeded: bool) -> None:
+    """Alarm-only handler for cap breaches. The mass-throttle that prevents the breach
+    in the first place lives in _handle_track_seal (fired at 95% utilisation, well
+    before the cap is reached). When a cap is breached anyway — which now only
+    happens for projects that were manually unsealed via the exemption command —
+    this handler keeps shouting at them.
+
     A project using premium models does not trigger the normal-cap alarm and vice versa.
     Uses OVERCAP_WINDOW_MINS to absorb the 5–15 min OpenAI ingestion lag.
-    Reverts to passive after AGGRESSIVE_REVERT_SECS quiet on the exceeded band.
-
-    Also drives auto-seal: any project burning the exceeded band that isn't already
-    sealed and isn't on today's manual-unseal exemption gets sealed via rate-limit
-    throttle. The alarm broadcast still fires regardless — sealing reduces future
-    spend, the alarm reports what already happened."""
+    Reverts to passive after AGGRESSIVE_REVERT_SECS quiet on the exceeded band."""
     banded = _fetch_recent_activity_by_band(minutes=OVERCAP_WINDOW_MINS)
     if banded is None:
         # API failure — keep current mode, don't broadcast or revert based on bad data.
@@ -1296,14 +1419,6 @@ def _handle_overcap(snap: dict, usage: UsageStore, subs: SubscriberStore,
             )
         else:
             _send_all(fmt_overcap_active_alert(illegal, normal_exceeded, premium_exceeded), subs)
-
-        # Auto-seal each illegal project that isn't already sealed and wasn't manually
-        # unsealed today. Sequential — many rate-limit POSTs per project.
-        for pid, bands in illegal.items():
-            if usage.is_sealed(pid) or usage.is_manually_unsealed(pid):
-                continue
-            reason = _build_seal_reason(bands, normal_exceeded, premium_exceeded)
-            _seal_project(usage, subs, names, pid, reason, auto_sealed=True)
     elif mode == "aggressive":
         last_ts = usage.get_last_illegal_seen_ts()
         if last_ts and time.time() - last_ts > AGGRESSIVE_REVERT_SECS:
@@ -1311,17 +1426,7 @@ def _handle_overcap(snap: dict, usage: UsageStore, subs: SubscriberStore,
             print("[mode] → PASSIVE (1 h since last illegal-band activity — standing down)")
 
 
-# ── Project sealing core ───────────────────────────────────────────────────
-
-def _build_seal_reason(bands: dict, normal_exceeded: bool, premium_exceeded: bool) -> str:
-    """Compact human-readable reason string for an auto-seal."""
-    parts = []
-    if normal_exceeded  and bands.get("normal",  0) > 0:
-        parts.append(f"{bands['normal']:,} normal-band req(s) after the 10M cap")
-    if premium_exceeded and bands.get("premium", 0) > 0:
-        parts.append(f"{bands['premium']:,} premium-band req(s) after the 1M cap")
-    return " + ".join(parts) if parts else "post-cap activity"
-
+# ── Rate-limit capture / payload helpers (shared by all seal/unseal paths) ──
 
 def _capture_originals(rate_limits: list[dict]) -> list[dict]:
     """Take the API's rate_limit rows and shrink to the fields we need to restore.
@@ -1372,11 +1477,27 @@ def _seal_payload(rate_limit: dict) -> dict:
     return payload
 
 
+def _restore_rate_limits(pid: str, originals: list[dict]) -> int:
+    """POST originals back to the API one at a time with inter-write spacing.
+    Returns the count of failed POSTs (0 on full success)."""
+    failed = 0
+    for orig in originals:
+        if _update_project_rate_limit(pid, orig["id"], _restore_payload(orig)):
+            time.sleep(0.05)
+        else:
+            failed += 1
+    return failed
+
+
+# ── Manual full-project seal (cmd_archive seal <project>) ──────────────────
+
 def _seal_project(usage: UsageStore, subs: SubscriberStore, names: NameStore,
-                  pid: str, reason: str, auto_sealed: bool) -> bool:
-    """Throttle every rate-limit row on `pid` down to 0/0. Idempotent: returns False
-    if the project is already sealed. On partial API failure rolls back so the
-    project is either fully sealed or fully untouched."""
+                  pid: str, reason: str) -> bool:
+    """Throttle every rate-limit row on `pid` to 0. If the project already has
+    track-level seals from the mass throttle, those are folded in: we use the
+    saved per-track originals for the throttled bands and capture live values
+    for the rest. Returns False if the project is already fully sealed or the
+    initial API fetch fails."""
     if usage.is_sealed(pid):
         return False
     proj_name   = KNOWN_PROJECTS.get(pid, pid)
@@ -1388,21 +1509,33 @@ def _seal_project(usage: UsageStore, subs: SubscriberStore, names: NameStore,
         print(f"[seal] {proj_name}: no rate-limit rows — nothing to throttle")
         return False
 
-    originals = _capture_originals(rate_limits)
+    # If any track-level seal already touched this project, the live rate-limit
+    # values for that track are now 0 — use the saved track originals instead so
+    # the eventual unseal restores the right values.
+    live_originals  = _capture_originals(rate_limits)
+    track_overrides = {}
+    for track, info in usage.get_sealed_tracks().items():
+        for o in info.get("originals_by_project", {}).get(pid, []):
+            track_overrides[o["id"]] = o
+    merged_originals = []
+    for o in live_originals:
+        merged_originals.append(track_overrides.get(o["id"], o))
 
-    sealed_ids: list[str] = []
+    # POST 0 to every row we haven't already throttled this day. Skip ones the
+    # track-level seal already throttled — they're at 0 already.
+    track_sealed_ids = set(track_overrides.keys())
+    sealed_now: list[str] = []
     for rl in rate_limits:
+        if rl["id"] in track_sealed_ids:
+            continue   # already at 0 from the mass throttle, no-op
         if _update_project_rate_limit(pid, rl["id"], _seal_payload(rl)):
-            sealed_ids.append(rl["id"])
-            time.sleep(0.05)   # space writes; bulk POSTs without spacing
-                               # occasionally don't persist on the API side
+            sealed_now.append(rl["id"])
+            time.sleep(0.05)
         else:
-            # Partial failure — roll back whatever we throttled so far.
-            print(f"[seal] {proj_name}: throttle failed at {rl['id']} — rolling back")
-            for orig in originals:
-                if orig["id"] in sealed_ids:
-                    _update_project_rate_limit(pid, orig["id"], _restore_payload(orig))
-                    time.sleep(0.05)
+            # Partial failure — restore only the rows we threw down in this call.
+            print(f"[seal] {proj_name}: throttle failed at {rl['id']} — rolling back this call")
+            rollback = [o for o in live_originals if o["id"] in sealed_now]
+            _restore_rate_limits(pid, rollback)
             if names:
                 _broadcast_named(
                     lambda n, p=proj_name: f"⚠️ Seal attempt for <b>{p}</b> failed mid-way — rolled back, manual check advised, Monarch {n}.",
@@ -1410,103 +1543,346 @@ def _seal_project(usage: UsageStore, subs: SubscriberStore, names: NameStore,
                 )
             return False
 
-    usage.mark_sealed(pid, reason, originals, auto_sealed)
+    usage.mark_sealed(pid, reason, merged_originals, auto_sealed=False)
     if names:
         _broadcast_named(
-            lambda n, p=proj_name, r=reason, c=len(rate_limits), a=auto_sealed:
-                fmt_seal_alert(p, r, c, a, n),
+            lambda n, p=proj_name, r=reason, c=len(merged_originals):
+                fmt_seal_alert(p, r, c, n),
             subs, names,
         )
     else:
-        _send_all(fmt_seal_alert(proj_name, reason, len(rate_limits), auto_sealed), subs)
+        _send_all(fmt_seal_alert(proj_name, reason, len(merged_originals)), subs)
     print(f"[seal] {proj_name}: throttled {len(rate_limits)} rate-limit row(s)")
     return True
 
 
 def _unseal_project(usage: UsageStore, subs: SubscriberStore, names: NameStore,
-                    pid: str, info: dict, reason: str, manual: bool,
+                    pid: str, track: Optional[str], reason: str,
                     broadcast: bool = True) -> bool:
-    """Restore originals captured at seal time. `info` is the entry from sealed_projects
-    or pending_unseal — both share the same shape."""
+    """Manual unseal entry point. If `track` is None → unseal both tracks (full).
+    If `track` in {"normal","premium"} → restore only that track's rows.
+
+    The function consults both sealed_projects (full manual seal) AND sealed_tracks
+    (mass per-track seal) and restores from whichever holds the originals. The
+    project is added to track_exemptions for every track that was unsealed, so
+    today's automatic re-seal of the same track will skip it."""
     proj_name = KNOWN_PROJECTS.get(pid, pid)
-    originals = info.get("original_limits", [])
-    if not originals:
-        # Nothing to restore (shouldn't happen but be defensive)
+    targets   = ("normal", "premium") if track is None else (track,)
+
+    # Collect rate-limit rows to restore from BOTH sources, filtered to targets.
+    full_entry      = usage.get_sealed_info(pid)
+    full_originals  = full_entry.get("original_limits", []) if full_entry else []
+    sealed_tracks   = usage.get_sealed_tracks()
+
+    to_restore: list[dict] = []
+    rl_ids_restored_per_track: dict[str, set[str]] = {t: set() for t in targets}
+
+    # Pull from sealed_projects[pid] originals matching target tracks
+    for o in full_originals:
+        for t in targets:
+            if _matches_track(o.get("model", ""), t):
+                to_restore.append(o)
+                rl_ids_restored_per_track[t].add(o["id"])
+                break
+
+    # Pull from sealed_tracks[t].originals_by_project[pid]
+    for t in targets:
+        info = sealed_tracks.get(t)
+        if not info:
+            continue
+        for o in info.get("originals_by_project", {}).get(pid, []):
+            # Avoid double-add if the same row was captured in full_originals
+            if o["id"] in rl_ids_restored_per_track[t]:
+                continue
+            to_restore.append(o)
+            rl_ids_restored_per_track[t].add(o["id"])
+
+    if not to_restore:
+        # Nothing to do — project isn't sealed for the requested track(s)
         return True
 
-    failed = 0
-    for orig in originals:
-        if _update_project_rate_limit(pid, orig["id"], _restore_payload(orig)):
-            time.sleep(0.05)   # space writes; see _seal_project for rationale
-        else:
-            failed += 1
-
-    if failed > 0:
-        print(f"[unseal] {proj_name}: {failed}/{len(originals)} restore POSTs failed")
-        # Leave the project marked as sealed so the next attempt can retry.
+    failed = _restore_rate_limits(pid, to_restore)
+    if failed:
+        print(f"[unseal] {proj_name}: {failed}/{len(to_restore)} restore POSTs failed")
         if broadcast and names:
             _broadcast_named(
-                lambda n, p=proj_name, f=failed, t=len(originals):
+                lambda n, p=proj_name, f=failed, t=len(to_restore):
                     f"⚠️ Unseal of <b>{p}</b> failed on {f}/{t} rate-limit(s) — will retry, Monarch {n}.",
                 subs, names,
             )
         return False
 
-    if manual:
-        usage.mark_manually_unsealed(pid)
-    print(f"[unseal] {proj_name}: restored {len(originals)} rate-limit row(s) ({reason})")
+    # Update state: drop restored rows from sealed_projects, drop project from
+    # the sealed_tracks entry, and mark exemption.
+    for t in targets:
+        rl_ids = rl_ids_restored_per_track[t]
+        if rl_ids:
+            usage.remove_sealed_project_rate_limits(pid, rl_ids)
+            usage.pop_track_originals(t, pid)
+        usage.add_track_exemption(pid, t)
+
+    print(f"[unseal] {proj_name}: restored {len(to_restore)} row(s) "
+          f"for {','.join(targets)} ({reason})")
     if broadcast:
         if names:
             _broadcast_named(
-                lambda n, p=proj_name, r=reason, m=manual: fmt_unseal_alert(p, r, m, n),
+                lambda n, p=proj_name, r=reason, ts=targets:
+                    fmt_unseal_alert(p, r, ts, n),
                 subs, names,
             )
         else:
-            _send_all(fmt_unseal_alert(proj_name, reason, manual), subs)
+            _send_all(fmt_unseal_alert(proj_name, reason, targets), subs)
     return True
 
 
 def _process_pending_unseals(usage: UsageStore, subs: SubscriberStore, names: NameStore) -> None:
-    """Restore any projects queued for unseal (typically by the day-rollover reset).
-    Run at the start of every poll iteration so the restore happens within minutes
-    of UTC midnight. Failures stay in the queue and retry on the next call."""
+    """Drain the legacy pending_unseal queue — full-restore each project. Used
+    for the day-rollover restore of yesterday's manual full seals AND for the
+    one-shot migration of state files written by older bot versions."""
     pending = usage.get_pending_unseal()
     if not pending:
         return
     print(f"[pending-unseal] {len(pending)} project(s) to restore")
     for pid, info in pending.items():
-        if _unseal_project(usage, subs, names, pid, info,
-                           reason="day rollover", manual=False, broadcast=True):
+        originals = info.get("original_limits", [])
+        if not originals:
             usage.clear_pending_unseal(pid)
+            continue
+        proj_name = KNOWN_PROJECTS.get(pid, pid)
+        failed    = _restore_rate_limits(pid, originals)
+        if failed:
+            print(f"[pending-unseal] {proj_name}: {failed}/{len(originals)} failed — will retry next poll")
+            continue
+        usage.clear_pending_unseal(pid)
+        if names:
+            _broadcast_named(
+                lambda n, p=proj_name: fmt_unseal_alert(p, "day rollover", ("normal", "premium"), n),
+                subs, names,
+            )
+        else:
+            _send_all(fmt_unseal_alert(proj_name, "day rollover", ("normal", "premium")), subs)
+
+
+# ── Track-level mass throttle / restore ────────────────────────────────────
+
+def _ordered_projects_for_track_seal(track: str) -> list[str]:
+    """Return KNOWN_PROJECTS ordered with the projects currently most active on
+    `track` first, so the mass throttle hits the heaviest spenders first."""
+    activity = _fetch_recent_activity_by_band(minutes=OVERCAP_WINDOW_MINS) or {}
+    return sorted(
+        KNOWN_PROJECTS.keys(),
+        key=lambda p: activity.get(p, {}).get(track, 0),
+        reverse=True,
+    )
+
+
+def _throttle_track_for_project(pid: str, track: str, usage: UsageStore) -> str:
+    """Throttle all of `pid`'s rate-limit rows that belong to `track` down to 0.
+    Returns one of: 'throttled' / 'noop' / 'failed'.
+    On partial failure rolls back its own rows so the project is left untouched."""
+    rate_limits = _fetch_project_rate_limits(pid)
+    if rate_limits is None:
+        return "failed"
+    track_rls = [rl for rl in rate_limits if _matches_track(rl.get("model", ""), track)]
+    if not track_rls:
+        return "noop"
+
+    originals = _capture_originals(track_rls)
+    throttled_ids: list[str] = []
+    for rl in track_rls:
+        if _update_project_rate_limit(pid, rl["id"], _seal_payload(rl)):
+            throttled_ids.append(rl["id"])
+            time.sleep(0.05)
+        else:
+            # Roll back this project's rows; let the caller continue with others.
+            rollback = [o for o in originals if o["id"] in throttled_ids]
+            _restore_rate_limits(pid, rollback)
+            return "failed"
+
+    usage.add_track_originals(track, pid, originals)
+    return "throttled"
+
+
+def _handle_track_seal(track: str, snap: dict, usage: UsageStore,
+                       subs: SubscriberStore, names: NameStore) -> None:
+    """Mass-throttle every non-exempt, non-manually-sealed project for `track`.
+    Idempotent: if sealed_tracks already contains an entry for this track, returns
+    immediately. Broadcasts a 'sealing now…' message before starting and a summary
+    when done. Projects ordered active-first so heavy spenders are throttled
+    sooner during the (sequential, ~30–50s) operation."""
+    if usage.is_track_sealed(track):
+        return
+
+    cap          = TOKEN_HARD_CAP if track == "normal" else PREMIUM_TOKEN_HARD_CAP
+    threshold    = NORMAL_TRACK_SEAL_THRESHOLD if track == "normal" else PREMIUM_TRACK_SEAL_THRESHOLD
+    consumed_key = "total_normal_tokens"     if track == "normal" else "total_premium_tokens"
+    consumed     = snap.get(consumed_key, 0)
+
+    # Reserve the seal slot so a concurrent trigger doesn't double-throttle.
+    usage.mark_track_seal_started(track, threshold)
+
+    print(f"[track-seal] {track} → starting (consumed={consumed:,}, cap={cap:,})")
+    if names:
+        _broadcast_named(
+            lambda n, t=track, c=consumed, cap=cap:
+                fmt_track_seal_starting(t, c, cap, n),
+            subs, names,
+        )
+    else:
+        _send_all(fmt_track_seal_starting(track, consumed, cap), subs)
+
+    project_order = _ordered_projects_for_track_seal(track)
+
+    throttled: list[str] = []
+    skipped_exempt: list[str] = []
+    skipped_manual: list[str] = []
+    noop: list[str] = []
+    failed: list[str] = []
+
+    for pid in project_order:
+        if usage.is_exempt(pid, track):
+            skipped_exempt.append(pid)
+            continue
+        if usage.is_sealed(pid):
+            skipped_manual.append(pid)
+            continue
+        result = _throttle_track_for_project(pid, track, usage)
+        if result == "throttled":
+            throttled.append(pid)
+        elif result == "noop":
+            noop.append(pid)
+        else:
+            failed.append(pid)
+
+    print(f"[track-seal] {track} → done. throttled={len(throttled)} "
+          f"exempt={len(skipped_exempt)} manual-sealed={len(skipped_manual)} "
+          f"noop={len(noop)} failed={len(failed)}")
+
+    if names:
+        _broadcast_named(
+            lambda n, t=track, th=throttled, se=skipped_exempt,
+                   sm=skipped_manual, f=failed:
+                fmt_track_seal_complete(t, th, se, sm, f, n),
+            subs, names,
+        )
+    else:
+        _send_all(fmt_track_seal_complete(track, throttled, skipped_exempt,
+                                          skipped_manual, failed), subs)
+
+
+def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
+                                   names: NameStore) -> None:
+    """At day rollover, sealed_tracks moves into pending_track_unseal. This drains
+    it: each project under each track gets its originals POSTed back. Failures
+    stay in the queue and retry on subsequent calls."""
+    pending = usage.get_pending_track_unseal()
+    if not pending:
+        return
+    for track, info in pending.items():
+        originals_by_project = info.get("originals_by_project", {})
+        if not originals_by_project:
+            continue
+        print(f"[pending-track-unseal] {track} → {len(originals_by_project)} project(s)")
+        for pid, originals in list(originals_by_project.items()):
+            if not originals:
+                usage.pop_pending_track_project(track, pid)
+                continue
+            proj_name = KNOWN_PROJECTS.get(pid, pid)
+            failed    = _restore_rate_limits(pid, originals)
+            if failed:
+                print(f"[pending-track-unseal] {proj_name}/{track}: "
+                      f"{failed}/{len(originals)} failed — will retry next poll")
+                continue
+            usage.pop_pending_track_project(track, pid)
+            if names:
+                _broadcast_named(
+                    lambda n, p=proj_name, t=track:
+                        fmt_track_unseal_for_project(p, t, "day rollover", n),
+                    subs, names,
+                )
+            else:
+                _send_all(fmt_track_unseal_for_project(proj_name, track,
+                                                      "day rollover"), subs)
 
 
 # ── Formatters — seal/unseal alerts ────────────────────────────────────────
 
-def fmt_seal_alert(proj_name: str, reason: str, num_limits: int, auto_sealed: bool,
+def fmt_seal_alert(proj_name: str, reason: str, num_limits: int,
                    name: str = "Bach") -> str:
-    trigger = "auto-sealed by the bot" if auto_sealed else "sealed by your command"
     return (
         f"🔒 <b>PROJECT SEALED — {proj_name}</b>\n\n"
         f"Reason: {reason}\n"
-        f"This project has been <b>{trigger}</b>. All {num_limits} rate-limit row(s) "
-        f"were throttled to 0 — no further token-burning calls are possible.\n\n"
+        f"This project has been <b>fully sealed by command</b>. All {num_limits} "
+        f"rate-limit row(s) are throttled to 0 — no token-burning call can succeed.\n\n"
         f"Auto-restore at the next UTC midnight.\n"
-        f"To restore now: <code>@bot archive unseal {proj_name}</code>\n"
-        f"<i>Monarch {name}, the breach has been contained.</i>"
+        f"To restore one track now: <code>@bot archive unseal {proj_name} normal</code> "
+        f"or <code>… premium</code>.\n"
+        f"To restore everything: <code>@bot archive unseal {proj_name}</code>.\n"
+        f"<i>Monarch {name}, the seal has been laid.</i>"
     )
 
 
-def fmt_unseal_alert(proj_name: str, reason: str, manual: bool,
-                     name: str = "Bach") -> str:
-    tail = ("This project is now exempt from auto-seal until midnight UTC — the "
-            "alarm will still fire if it keeps burning the exhausted band, but the "
-            "bot will not seal it again today.") if manual else \
-           "Rate limits were restored to their pre-seal values."
+def fmt_unseal_alert(proj_name: str, reason: str, tracks, name: str = "Bach") -> str:
+    """`tracks` is an iterable of restored track names ('normal', 'premium')."""
+    tracks_list  = list(tracks)
+    track_str    = " + ".join(tracks_list) if len(tracks_list) < 2 else "both tracks"
+    exempt_tail  = (
+        f"This project is now exempt from auto track-seals on <b>{track_str}</b> for "
+        f"the rest of the UTC day. The overcap alarm still fires if it burns past a cap."
+    )
     return (
-        f"🔓 <b>PROJECT UNSEALED — {proj_name}</b>\n\n"
+        f"🔓 <b>PROJECT UNSEALED — {proj_name} ({track_str})</b>\n\n"
         f"Reason: {reason}\n"
-        f"{tail}\n"
-        f"<i>Monarch {name}, the seal has been lifted.</i>"
+        f"{exempt_tail}\n"
+        f"<i>Monarch {name}, the seal on {track_str} has been lifted.</i>"
+    )
+
+
+def fmt_track_seal_starting(track: str, consumed: int, cap: int,
+                            name: str = "Bach") -> str:
+    pct       = consumed / cap * 100 if cap else 100
+    remaining = cap - consumed
+    band      = "Normal (10M)" if track == "normal" else "Premium (1M)"
+    return (
+        f"🛑 <b>{band} TRACK NEAR CAP — MASS THROTTLE STARTING</b>\n\n"
+        f"Consumed: <b>{_fmt_tokens(consumed)}</b> / {_fmt_tokens(cap)} ({pct:.1f}%)\n"
+        f"Remaining: <b>{_fmt_tokens(remaining)}</b> ({100 - pct:.1f}%)\n\n"
+        f"Throttling every project's <b>{track}</b>-band rate-limit rows to 0 "
+        f"to prevent the daily cap from being breached. This takes ~30–60 s.\n"
+        f"<i>Monarch {name}, the throttle is going down.</i>"
+    )
+
+
+def fmt_track_seal_complete(track: str, throttled: list, skipped_exempt: list,
+                            skipped_manual: list, failed: list,
+                            name: str = "Bach") -> str:
+    band  = "Normal (10M)" if track == "normal" else "Premium (1M)"
+    lines = [
+        f"🔒 <b>{band} TRACK SEALED — mass throttle complete</b>\n",
+        f"Projects throttled: <b>{len(throttled)}</b>",
+    ]
+    if skipped_exempt:
+        lines.append(f"Skipped (manually exempt): {len(skipped_exempt)} — "
+                     + ", ".join(KNOWN_PROJECTS.get(p, p) for p in skipped_exempt))
+    if skipped_manual:
+        lines.append(f"Skipped (manually sealed): {len(skipped_manual)} — "
+                     + ", ".join(KNOWN_PROJECTS.get(p, p) for p in skipped_manual))
+    if failed:
+        lines.append(f"⚠️ Failed: {len(failed)} — "
+                     + ", ".join(KNOWN_PROJECTS.get(p, p) for p in failed))
+    lines.append("")
+    lines.append(f"Auto-restore at the next UTC midnight.")
+    lines.append(f"To exempt a project from this seal: <code>@bot archive unseal &lt;project&gt; {track}</code>")
+    lines.append(f"<i>Monarch {name}, the {track} treasury is guarded.</i>")
+    return "\n".join(lines)
+
+
+def fmt_track_unseal_for_project(proj_name: str, track: str, reason: str,
+                                 name: str = "Bach") -> str:
+    return (
+        f"🔓 <b>{proj_name}</b> · {track}-track restored\n"
+        f"Reason: {reason}\n"
+        f"<i>Monarch {name}, the project resumes normal operation on {track}.</i>"
     )
 
 
@@ -1789,12 +2165,14 @@ def cmd_archive(args: list, usage: UsageStore, subs: SubscriberStore,
     """Sub-command driven archive controller.
 
     Forms:
-      archive                       → list status of every known project
-      archive list                  → same
-      archive seal   <name|id>      → seal one project
-      archive unseal <name|id>      → unseal one project (exempts from auto-seal today)
-      archive unseal all            → unseal every currently sealed project
-    """
+      archive                                → status: track seals + per-project state
+      archive seal <name|id>                 → manually FULL-seal a project (both tracks)
+      archive unseal <name|id>               → manually unseal both tracks for a project
+      archive unseal <name|id> <track>       → manually unseal only that track ('normal' or 'premium')
+
+    Note: the bot also mass-throttles every project's rate limits for a track
+    whenever that track passes 95% of its daily cap. Manual `unseal` for a track
+    marks the project as exempt from that day's mass throttle on that track."""
     sub = args[0].lower() if args else "list"
 
     if sub == "list":
@@ -1809,96 +2187,119 @@ def cmd_archive(args: list, usage: UsageStore, subs: SubscriberStore,
         if not pid:
             return f"Unknown project <code>{target}</code>, Monarch {name}. Try <code>@bot archive</code>."
         if usage.is_sealed(pid):
-            return f"<b>{KNOWN_PROJECTS.get(pid, pid)}</b> is already sealed."
+            return f"<b>{KNOWN_PROJECTS.get(pid, pid)}</b> is already fully sealed."
         proj_name = KNOWN_PROJECTS.get(pid, pid)
-        reason    = f"manual seal by Monarch {name}"
-        ok        = _seal_project(usage, subs, names, pid, reason, auto_sealed=False)
+        reason    = f"manual full seal by Monarch {name}"
+        ok        = _seal_project(usage, subs, names, pid, reason)
         if ok:
-            return f"🔒 <b>{proj_name}</b> sealed.\n<i>Order carried out, My Liege {name}.</i>"
+            return f"🔒 <b>{proj_name}</b> fully sealed.\n<i>Order carried out, My Liege {name}.</i>"
         return f"⚠️ Failed to seal <b>{proj_name}</b> — check logs, Monarch {name}."
 
     if sub == "unseal":
         if len(args) < 2:
-            return (f"Usage: <code>@bot archive unseal &lt;project|all&gt;</code>\n"
+            return (f"Usage: <code>@bot archive unseal &lt;project&gt; [normal|premium]</code>\n"
                     f"Try <code>@bot archive</code> for the project list, Monarch {name}.")
-        target = " ".join(args[1:]).strip()
-        if target.lower() == "all":
-            sealed = usage.get_sealed_projects()
-            if not sealed:
-                return f"No projects are currently sealed, Monarch {name}."
-            restored = 0
-            for pid, info in sealed.items():
-                if _unseal_project(usage, subs, names, pid, info,
-                                   reason=f"manual unseal-all by Monarch {name}",
-                                   manual=True):
-                    usage.mark_unsealed(pid)
-                    restored += 1
-            return f"🔓 Restored <b>{restored}/{len(sealed)}</b> sealed project(s)."
+        # Detect an optional trailing track keyword.
+        tail = args[-1].lower()
+        if tail in ("normal", "premium"):
+            target = " ".join(args[1:-1])
+            track  = tail
+        else:
+            target = " ".join(args[1:])
+            track  = None   # full unseal (both tracks)
 
         pid = _resolve_project(target)
         if not pid:
             return f"Unknown project <code>{target}</code>, Monarch {name}. Try <code>@bot archive</code>."
-        info = usage.get_sealed_info(pid)
-        if not info:
-            return f"<b>{KNOWN_PROJECTS.get(pid, pid)}</b> is not sealed."
-        ok = _unseal_project(usage, subs, names, pid, info,
-                             reason=f"manual unseal by Monarch {name}", manual=True)
+
+        # Was the project actually sealed for the requested track(s)?
+        sealed_full  = usage.get_sealed_info(pid)
+        sealed_tks   = usage.get_sealed_tracks()
+        affected = []
+        for t in (("normal", "premium") if track is None else (track,)):
+            in_track_seal = pid in sealed_tks.get(t, {}).get("originals_by_project", {})
+            in_full_seal  = bool(sealed_full and any(
+                _matches_track(o.get("model", ""), t)
+                for o in sealed_full.get("original_limits", [])
+            ))
+            if in_track_seal or in_full_seal:
+                affected.append(t)
+
+        if not affected:
+            scope = "any track" if track is None else f"the {track} track"
+            return f"<b>{KNOWN_PROJECTS.get(pid, pid)}</b> is not sealed on {scope}, Monarch {name}."
+
+        reason = (f"manual {'full' if track is None else track + '-track'} "
+                  f"unseal by Monarch {name}")
+        ok = _unseal_project(usage, subs, names, pid, track, reason)
+        proj_name = KNOWN_PROJECTS.get(pid, pid)
         if ok:
-            usage.mark_unsealed(pid)
-            return f"🔓 <b>{KNOWN_PROJECTS.get(pid, pid)}</b> unsealed and exempt from auto-seal until midnight UTC."
-        return f"⚠️ Failed to unseal <b>{KNOWN_PROJECTS.get(pid, pid)}</b> — check logs."
+            scope = "both tracks" if track is None else f"the {track} track"
+            return (f"🔓 <b>{proj_name}</b> restored on {scope} and exempt from auto-seal "
+                    f"until UTC midnight.")
+        return f"⚠️ Failed to unseal <b>{proj_name}</b> — check logs."
 
     return (f"Unknown <code>archive</code> sub-command <code>{sub}</code>, Monarch {name}. "
             f"Use <code>list</code>, <code>seal &lt;p&gt;</code>, "
-            f"or <code>unseal &lt;p|all&gt;</code>.")
+            f"or <code>unseal &lt;p&gt; [normal|premium]</code>.")
 
 
 def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
-    sealed        = usage.get_sealed_projects()
-    manual_exempt = usage.get_manually_unsealed()
-    pending       = usage.get_pending_unseal()
+    snap          = usage.get()
+    sealed_tracks = usage.get_sealed_tracks()
+    sealed_full   = usage.get_sealed_projects()
+    exemptions    = usage.get_track_exemptions()
+    pending_full  = usage.get_pending_unseal()
+    pending_tracks= usage.get_pending_track_unseal()
 
-    lines = [f"🗃️ <b>Project Archive Status</b>\n"]
-    if sealed:
-        lines.append("<b>Sealed</b>")
-        for pid, info in sorted(sealed.items(), key=lambda kv: kv[1].get("sealed_at", 0)):
-            proj_name = KNOWN_PROJECTS.get(pid, pid)
-            trigger   = "auto" if info.get("auto_sealed") else "manual"
-            sealed_at = _fmt_ts(info.get("sealed_at"))
-            reason    = info.get("reason", "—")
-            lines.append(f"🔒 <b>{proj_name}</b> · {trigger} · {sealed_at} · {reason}")
-        lines.append("")
+    n_tok = snap.get("total_normal_tokens",  0)
+    p_tok = snap.get("total_premium_tokens", 0)
 
-    if manual_exempt:
-        lines.append("<b>Unsealed today (exempt from auto-seal)</b>")
-        for pid in sorted(manual_exempt):
-            if pid in sealed:
-                continue
-            proj_name = KNOWN_PROJECTS.get(pid, pid)
-            lines.append(f"🔓 <b>{proj_name}</b>")
-        lines.append("")
+    lines = [f"🗃️ <b>Archive Status — {snap.get('date', today_str())}</b>\n"]
 
-    if pending:
-        lines.append("<b>Pending restore (will retry next poll)</b>")
-        for pid in sorted(pending):
-            proj_name = KNOWN_PROJECTS.get(pid, pid)
-            lines.append(f"⏳ <b>{proj_name}</b>")
-        lines.append("")
-
-    active_pids = set(sealed) | set(pending)
-    lines.append("<b>All projects</b>")
-    for pid, proj_name in sorted(KNOWN_PROJECTS.items(), key=lambda kv: kv[1]):
-        status = "🔒 sealed" if pid in sealed else (
-                  "⏳ pending" if pid in pending else (
-                  "🔓 exempt"  if pid in manual_exempt else "✅ active"))
-        lines.append(f"• <b>{proj_name}</b>  —  {status}")
-
+    # ── Track usage + seal state
+    lines.append("<b>Tracks</b>")
+    for track, consumed, cap, threshold in (
+        ("normal",  n_tok, TOKEN_HARD_CAP,         NORMAL_TRACK_SEAL_THRESHOLD),
+        ("premium", p_tok, PREMIUM_TOKEN_HARD_CAP, PREMIUM_TRACK_SEAL_THRESHOLD),
+    ):
+        pct = consumed / cap * 100 if cap else 0
+        if track in sealed_tracks:
+            n_projects = len(sealed_tracks[track].get("originals_by_project", {}))
+            tag = f"🔒 <b>SEALED</b> ({n_projects} project(s) throttled)"
+        elif consumed >= threshold:
+            tag = f"⚠️ threshold crossed but not yet sealed"
+        else:
+            tag = f"✅ active"
+        lines.append(f"  • <b>{track}</b>: {_fmt_tokens(consumed)} / {_fmt_tokens(cap)} "
+                     f"({pct:.1f}%)  —  {tag}")
     lines.append("")
-    lines.append(f"<i>Monarch {name}, the archive registry is presented.</i>")
+
+    # ── Per-project breakdown
+    lines.append("<b>Projects</b>")
+    for pid, proj_name in sorted(KNOWN_PROJECTS.items(), key=lambda kv: kv[1]):
+        tags = []
+        if pid in sealed_full:
+            tags.append("🔒 full-sealed")
+        for t in ("normal", "premium"):
+            if pid in sealed_tracks.get(t, {}).get("originals_by_project", {}):
+                tags.append(f"🔒 {t}")
+        for t in exemptions.get(pid, []):
+            tags.append(f"🔓 {t}-exempt")
+        if pid in pending_full:
+            tags.append("⏳ full-restore pending")
+        for t in pending_tracks:
+            if pid in pending_tracks[t].get("originals_by_project", {}):
+                tags.append(f"⏳ {t}-restore pending")
+        status = " · ".join(tags) if tags else "✅ active"
+        lines.append(f"  • <b>{proj_name}</b> — {status}")
+    lines.append("")
+
     lines.append(
-        "Commands: <code>seal &lt;project&gt;</code>, "
-        "<code>unseal &lt;project|all&gt;</code>"
+        "Commands: <code>seal &lt;project&gt;</code> · "
+        "<code>unseal &lt;project&gt; [normal|premium]</code>"
     )
+    lines.append(f"<i>Monarch {name}, the archive registry is presented.</i>")
     return "\n".join(lines)
 
 
@@ -1924,6 +2325,15 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
         normal_exceeded  = total_normal  >= TOKEN_HARD_CAP
         premium_exceeded = total_premium >= PREMIUM_TOKEN_HARD_CAP
 
+        # Track-seal triggers — same logic as the poll loop, fired on demand
+        # so /refresh near the threshold doesn't have to wait for the next poll.
+        if total_normal >= NORMAL_TRACK_SEAL_THRESHOLD and not usage.is_track_sealed("normal"):
+            _handle_track_seal("normal", snap, usage, subs, names)
+            mode_note = "\n🛑 Normal track passed 95% — mass throttle complete."
+        if total_premium >= PREMIUM_TRACK_SEAL_THRESHOLD and not usage.is_track_sealed("premium"):
+            _handle_track_seal("premium", snap, usage, subs, names)
+            mode_note = "\n🛑 Premium track passed 95% — mass throttle complete."
+
         if normal_exceeded or premium_exceeded:
             banded = _fetch_recent_activity_by_band(minutes=OVERCAP_WINDOW_MINS)
             if banded is None:
@@ -1942,7 +2352,7 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
                         )
                     else:
                         _send_all(fmt_overcap_active_alert(illegal, normal_exceeded, premium_exceeded), subs)
-                    mode_note = "\n🔴 <b>AGGRESSIVE mode active — projects burning the exhausted band, broadcast sent.</b>"
+                    mode_note = "\n🔴 <b>AGGRESSIVE mode active — exempt projects burning the exhausted band, broadcast sent.</b>"
                 else:
                     mode_note = "\n⚠️ Budget cap exceeded — no projects active on the exhausted band right now."
         elif new_milestone and mode == "passive":
@@ -2100,10 +2510,12 @@ def cmd_help(bot_username: Optional[str], name: str = "Bach") -> str:
         f"<b>Concurrency</b>\n"
         f"<code>{m} active</code>     — Projects active in last {CONCURRENCY_WINDOW_MINS} min\n\n"
         f"<b>Archive (rate-limit seal)</b>\n"
-        f"<code>{m} archive</code>                  — List all projects with seal status\n"
-        f"<code>{m} archive seal &lt;name&gt;</code>      — Throttle a project to 0 rate-limit\n"
-        f"<code>{m} archive unseal &lt;name&gt;</code>    — Restore rate-limits; exempts from auto-seal until midnight UTC\n"
-        f"<code>{m} archive unseal all</code>       — Restore every currently sealed project\n\n"
+        f"<code>{m} archive</code>                          — Show track-seal + per-project status\n"
+        f"<code>{m} archive seal &lt;project&gt;</code>             — Manually full-seal a project (both tracks → 0)\n"
+        f"<code>{m} archive unseal &lt;project&gt;</code>           — Restore both tracks; exempt until UTC midnight\n"
+        f"<code>{m} archive unseal &lt;project&gt; normal</code>    — Restore only normal-band (mini/nano models)\n"
+        f"<code>{m} archive unseal &lt;project&gt; premium</code>   — Restore only premium-band (full-size models)\n"
+        f"<i>Bot also auto mass-throttles every project at 95% utilisation per track.</i>\n\n"
         f"<b>Notifications</b>\n"
         f"<code>{m} arise</code>      — Subscribe this chat to all alerts\n"
         f"<code>{m} dismiss</code>    — Unsubscribe this chat\n"
@@ -2232,6 +2644,7 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 # the daily reset, restore them via the API now. Failures stay in the
                 # queue and are retried on the next iteration.
                 _process_pending_unseals(usage, subs, names)
+                _process_pending_track_unseals(usage, subs, names)
 
                 normal_tok  = snap.get("total_normal_tokens",  0)
                 premium_tok = snap.get("total_premium_tokens", 0)
@@ -2255,12 +2668,21 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                             print("[mode] → URGENT (milestone crossed)")
                         usage.set_last_milestone_ts(time.time())
 
-                # ── Cap check (runs every poll regardless of mode) ─────────
+                # ── Track-level mass throttle (preventive, at 95% utilisation) ──
+                # Each track is independent and idempotent. Once sealed_tracks[track]
+                # exists for today, no re-trigger fires.
+                if normal_tok >= NORMAL_TRACK_SEAL_THRESHOLD and not usage.is_track_sealed("normal"):
+                    _handle_track_seal("normal", snap, usage, subs, names)
+                if premium_tok >= PREMIUM_TRACK_SEAL_THRESHOLD and not usage.is_track_sealed("premium"):
+                    _handle_track_seal("premium", snap, usage, subs, names)
+
+                # ── Cap check (alarm-only; mass throttle above should normally
+                #    keep this from firing except for manually-exempt projects)
                 normal_exceeded  = normal_tok  >= TOKEN_HARD_CAP
                 premium_exceeded = premium_tok >= PREMIUM_TOKEN_HARD_CAP
 
                 if normal_exceeded or premium_exceeded:
-                    _handle_overcap(snap, usage, subs, names, normal_exceeded, premium_exceeded)
+                    _handle_overcap(usage, subs, names, normal_exceeded, premium_exceeded)
                 else:
                     mode = usage.get_mode()
                     if mode == "urgent":

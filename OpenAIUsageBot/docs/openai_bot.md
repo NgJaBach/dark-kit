@@ -56,15 +56,19 @@ main()
 
 usage_poll_loop()
   └── dynamic sleep (mode-dependent):
-       ├── fetch_today_usage()           → tokens per project, classified by band
-       ├── _fetch_costs()                → cost per project
-       ├── usage.update(snap)            → auto-resets daily state on date change
-       ├── seed_milestones() if !seeded  → fires top-1 milestone per track (idempotent)
-       ├── check_milestones() otherwise  → fires on newly crossed thresholds
-       ├── _handle_overcap()             → if any cap exceeded:
-       │     ├── _fetch_recent_activity_by_band()  → per-project, per-band counts
-       │     └── _filter_to_exceeded_band()        → drop projects only using OK band
-       └── mode transition logic         → passive / urgent / aggressive
+       ├── fetch_today_usage()                       → tokens per project, classified by band
+       ├── _fetch_costs()                            → cost per project
+       ├── usage.update(snap)                        → auto-resets daily state on date change
+       ├── _process_pending_unseals()                → drain legacy per-project queue (day rollover)
+       ├── _process_pending_track_unseals()          → drain per-track queue (day rollover)
+       ├── seed_milestones() if !seeded              → fires top-1 milestone per track (idempotent)
+       ├── check_milestones() otherwise              → fires on newly crossed thresholds
+       ├── _handle_track_seal("normal")              → if ≥95% utilisation, mass-throttle every project
+       ├── _handle_track_seal("premium")             →   (track-by-track, idempotent per UTC day)
+       ├── _handle_overcap()                         → alarm-only: shouts at any project burning post-cap
+       │     ├── _fetch_recent_activity_by_band()    → per-project, per-band counts
+       │     └── _filter_to_exceeded_band()          → drop projects only using OK band
+       └── mode transition logic                     → passive / urgent / aggressive
 
 concurrency_check_loop()
   └── every CONCURRENCY_WINDOW_MINS (5 min):
@@ -120,6 +124,9 @@ POLL_INTERVAL_MINS=30              # Passive-mode baseline (default 30, minimum 
 | `CONCURRENCY_WINDOW_MINS` | 5 | "Active" window for concurrency check (narrow, real-time use) |
 | `CONCURRENCY_COOLDOWN` | 900 s | Min gap between concurrency alerts |
 | `OVERCAP_WINDOW_MINS` | 20 | Activity window for overcap detection (wider, accounts for ingestion lag) |
+| `TRACK_SEAL_REMAINING_PCT` | 0.05 | Fraction of remaining quota that triggers track-level mass throttle |
+| `NORMAL_TRACK_SEAL_THRESHOLD` | 9,500,000 | Derived: cap × (1 − remaining_pct) for the normal band |
+| `PREMIUM_TRACK_SEAL_THRESHOLD` | 950,000 | Derived: cap × (1 − remaining_pct) for the premium band |
 
 ### Admin key requirement
 Regular `sk-...` keys cannot access `/v1/organization/*` endpoints.
@@ -288,49 +295,114 @@ is available for implementing this in the future if needed.
 **Frequency:** At most once per 15 minutes (`CONCURRENCY_COOLDOWN`).
 **Source:** `concurrency_check_loop` thread, runs every 5 min independent of poll mode.
 
-### 7.7 Project Sealing (auto + manual)
-The bot can **seal** a project — throttle every rate-limit row to 0/0 so no
-token-burning call can succeed — and **unseal** it (restore the originals).
-Sealing uses `POST /v1/organization/projects/{pid}/rate_limits/{rate_limit_id}`
-because the project archive endpoint is one-way and cannot be reversed via API.
+### 7.7 Sealing — track-level mass throttle + per-project manual control
 
-**Auto-seal trigger.** Inside `_handle_overcap`, after the red-tone alarm fires,
-every project in the `illegal` set (i.e. burning the exhausted band) gets sealed,
-**unless**:
-- it's already sealed (`usage.is_sealed`), or
-- a user manually unsealed it earlier today (`usage.is_manually_unsealed`).
+The bot prevents track-cap breaches by **mass-throttling every project's rate
+limits for a track** as soon as that track passes 95% utilisation. Sealing uses
+`POST /v1/organization/projects/{pid}/rate_limits/{rate_limit_id}` because the
+project `/archive` endpoint is one-way and cannot be reversed via API.
 
-**What a seal does.** `_seal_project()` GETs every rate-limit row, captures the
-originals into `usage_state.json → sealed_projects[pid].original_limits`, then POSTs
-`max_requests_per_1_minute=0` and `max_tokens_per_1_minute=0` to each. If any POST
-fails (other than the soft-skip codes — see below), all successfully-throttled rows
-are rolled back so the project ends up either fully sealed or fully untouched.
+#### Auto trigger — track-level mass seal
 
-**Soft-skip error codes.** Some rate-limit rows returned by GET aren't actually
-updatable. The bot treats these as successful no-ops:
+Constants:
+```
+TRACK_SEAL_REMAINING_PCT      = 0.05
+NORMAL_TRACK_SEAL_THRESHOLD   = 9,500,000     (5% of 10M remaining)
+PREMIUM_TRACK_SEAL_THRESHOLD  =   950,000     (5% of 1M  remaining)
+```
+
+`usage_poll_loop()` and `cmd_refresh()` both check, after every poll:
+
+```
+if total_normal_tokens  ≥ 9.5M  and 'normal'  not in sealed_tracks → _handle_track_seal('normal')
+if total_premium_tokens ≥ 950k  and 'premium' not in sealed_tracks → _handle_track_seal('premium')
+```
+
+Each track fires at most once per UTC day. Once the `sealed_tracks[track]` entry
+exists, re-triggering is a no-op.
+
+#### What a mass throttle does
+
+`_handle_track_seal(track)` runs inline (blocks the poll thread for ~30–50 s).
+
+1. Reserves the slot by writing an empty `sealed_tracks[track] = {sealed_at, threshold, originals_by_project: {}}` entry — protects against concurrent triggers.
+2. Broadcasts the "throttle starting" banner so the chat knows what's happening.
+3. Orders `KNOWN_PROJECTS` by recent activity on that track (descending) so heavy spenders get throttled **first**. Uses `_fetch_recent_activity_by_band(OVERCAP_WINDOW_MINS)` — same window as the overcap alarm to absorb the 5–15 min OpenAI ingestion lag.
+4. For each project in order:
+   - Skips if `track in track_exemptions[pid]` (manually unsealed earlier today).
+   - Skips if `pid in sealed_projects` (already fully sealed by the manual command).
+   - Otherwise: GETs rate limits, filters to rows where `_matches_track(model, track)`, captures the originals, POSTs `0` to every present field on each row, and saves the originals under `sealed_tracks[track].originals_by_project[pid]`.
+5. Broadcasts the summary: throttled / skipped-exempt / skipped-manual-sealed / failed.
+
+Inter-POST spacing is 50 ms (same as before — bulk writes without spacing occasionally don't persist on the API side).
+
+#### Soft-skip error codes
+
+Some rate-limit rows returned by GET aren't actually updatable. The bot treats these as successful no-ops:
 - `rate_limit_does_not_exist_for_org_and_model` — org has no access to that model.
 - `rate_limit_not_updatable` — fine-tune / batch-only rows.
+- `invalid_rate_limit_type` — model doesn't expose that field (e.g. `sora-2` has no `max_tokens_per_1_minute`).
 
-In both cases the project can't use the model in a way that bypasses our throttle.
+In all three cases the project can't use the model in a way that bypasses our throttle.
 
-**Manual seal/unseal.** The `@bot archive` command:
-- `archive` → list every project with seal status, plus the manual-unseal exempt list.
-- `archive seal <name|id>` → seal the named project.
-- `archive unseal <name|id>` → restore originals **and** add the project to
-  `manually_unsealed_today`. Once exempt for the day, auto-seal will skip it even
-  if it keeps burning the exhausted band (the alarm still fires).
-- `archive unseal all` → restore every currently sealed project, each marked exempt.
+#### Manual commands — `@bot archive`
 
-**Auto-unseal at UTC midnight.** When `UsageStore.update()` (or `__init__`) detects
-a day change, every entry in `sealed_projects` moves into `pending_unseal` and
-`manually_unsealed_today` is cleared. The next poll iteration calls
-`_process_pending_unseals()` which POSTs the saved originals back via API.
-Failures stay in `pending_unseal` and retry on subsequent polls — the queue drains
-even if OpenAI was unreachable at midnight.
+| Form | Effect |
+|---|---|
+| `archive` (or `archive list`) | Show per-track usage + sealed/exempt/pending status for every known project. |
+| `archive seal <project>` | Manually full-seal one project. Throttles **every** rate-limit row to 0 (both tracks + non-classified models). Folds in any track-level seal already in place — uses saved track originals so the eventual unseal restores the right values. |
+| `archive unseal <project>` | Restore **both** tracks for one project. Adds the project to `track_exemptions` for both `normal` and `premium`, so today's auto track-seal will skip it on either track. |
+| `archive unseal <project> normal` | Restore only normal-band rate-limit rows. Adds `normal` to that project's exemptions; `premium` is unaffected (if premium was also sealed, it stays). |
+| `archive unseal <project> premium` | Symmetric to above. |
 
-**Latency.** Detection → seal latency is bounded by the aggressive-mode poll
-interval (3–10 min). Each seal/unseal is ~150 sequential POSTs (one per
-rate-limit row) so a single project takes ~30–60 s to fully throttle.
+Project resolution accepts either the friendly name (`phongnguyen-project`) or the raw `proj_…` ID, case-insensitive on the name side.
+
+**Exempt projects still get the overcap alarm.** If a user unseals a project mid-day and that project keeps burning post-cap tokens, `_handle_overcap` continues to broadcast the red-tone alarm for it — the user is responsible for the bill.
+
+#### Auto-unseal at UTC midnight
+
+`UsageStore.update()` and `UsageStore.__init__()` both detect date changes and call `_reset_daily_state_locked()`. The reset:
+- Moves `sealed_projects` → `pending_unseal`.
+- Moves `sealed_tracks` → `pending_track_unseal` (merges per-track if a stale entry was still queued).
+- Clears `track_exemptions`.
+
+The next poll iteration calls `_process_pending_unseals()` and `_process_pending_track_unseals()` to drain the queues — POSTing saved originals back via API. Failures stay in the queue and retry on subsequent polls, so a midnight outage doesn't leave anything throttled forever.
+
+#### State schema
+
+```jsonc
+{
+  // Track-level mass seal — auto-fired at 95% utilisation
+  "sealed_tracks": {
+    "normal":  { "sealed_at": 1737000000, "threshold": 9500000,
+                 "originals_by_project": {
+                   "proj_xxx": [ { "id": "rl_…", "model": "gpt-4o-mini",
+                                   "max_requests_per_1_minute": 5000,
+                                   "max_tokens_per_1_minute": 4000000 }, … ],
+                   "proj_yyy": [ … ]
+                 } },
+    "premium": { … or absent if not sealed }
+  },
+  // Per-project full seal — fired by @bot archive seal <project>
+  "sealed_projects": { "proj_zzz": { "sealed_at": …, "reason": …,
+                                     "original_limits": [ … ],
+                                     "auto_sealed": false } },
+  // Per-track manual exemption — set by @bot archive unseal
+  "track_exemptions": { "proj_yyy": ["normal"] },
+  // Day-rollover restore queues (drained by next poll)
+  "pending_unseal":       { same shape as sealed_projects },
+  "pending_track_unseal": { same shape as sealed_tracks }
+}
+```
+
+All five fields are preserved across snapshot updates (in `UsageStore._PRESERVED`).
+
+#### Latency & blast radius
+
+- **Detection latency**: up to one poll cycle. In passive mode that's 30 min, in urgent mode 3–10 min. Once normal hits ~9M (the urgent milestone), mode flips to urgent so the 95% trigger is caught quickly.
+- **Per-project throttle cost**: ~75 normal-track or ~80 premium-track rate-limit rows per project, ~50 ms spacing each. ≈ 4 s of API work per project per track.
+- **Full mass throttle**: 13 projects × ~75 rows ≈ ~50 s for a single track. Poll thread is blocked during this; Telegram thread stays responsive (it has its own thread).
+- **Inflight requests window**: there's still a brief window between threshold detection and full throttle where running requests can complete. Unavoidable, but bounded by the same 50 s wall time above.
 
 ---
 
@@ -350,10 +422,11 @@ Non-subscribed chats can only use `arise`. All other commands are silently ignor
 | `recent` | Last 31 days: per-project cost, total tokens & requests. |
 | `spending` | Monthly bill — current + previous month (live fetch). |
 | `active` | Projects with API activity in the last 5 min + concurrency status. |
-| `archive` | List archive status of every known project. |
-| `archive seal <name>` | Seal one project (throttle rate-limits to 0/0). |
-| `archive unseal <name>` | Restore one project; mark exempt from auto-seal until UTC midnight. |
-| `archive unseal all` | Restore every currently sealed project. |
+| `archive` | Show per-track usage + per-project seal/exempt/pending state. |
+| `archive seal <project>` | Manually full-seal a project (both tracks → 0). |
+| `archive unseal <project>` | Restore both tracks for one project; mark exempt on both until UTC midnight. |
+| `archive unseal <project> normal` | Restore only normal-band rate-limits; mark exempt on normal. |
+| `archive unseal <project> premium` | Restore only premium-band rate-limits; mark exempt on premium. |
 | `arise` | Subscribe this chat to all alerts. Plays the Beru GIF on first subscribe. |
 | `dismiss` | Unsubscribe this chat (primary chat cannot be dismissed). |
 | `setname Name` | Set the name the bot uses to address you in this chat. |
@@ -403,9 +476,11 @@ Fields preserved across snapshot updates (not overwritten by each poll):
 | `last_illegal_seen_ts` | float | Timestamp of last poll with active illegal projects |
 | `urgent_poll_step` | int | Current step in 3→10 min interval progression |
 | `milestones_seeded` | bool | True after first-poll seed runs; guards the /refresh race condition |
-| `sealed_projects` | dict | pid → {sealed_at, reason, original_limits, auto_sealed} for every currently sealed project |
+| `sealed_tracks` | dict | track → {sealed_at, threshold, originals_by_project: {pid: [rate-limit-rows]}} for every track currently mass-throttled |
+| `sealed_projects` | dict | pid → {sealed_at, reason, original_limits, auto_sealed} for projects under a manual full seal |
+| `track_exemptions` | dict | pid → list of tracks the project is exempt from for today's auto seal |
 | `pending_unseal` | dict | pid → entry to restore via API on next poll. Populated by day rollover from `sealed_projects` |
-| `manually_unsealed_today` | list[str] | pids exempt from auto-seal for the rest of the UTC day |
+| `pending_track_unseal` | dict | track → {originals_by_project}. Populated by day rollover from `sealed_tracks` |
 
 All fields reset at UTC midnight. Two reset paths, both internal:
 
