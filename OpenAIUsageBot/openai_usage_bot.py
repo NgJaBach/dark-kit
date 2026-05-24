@@ -104,12 +104,13 @@ PREMIUM_TRACK_SEAL_THRESHOLD   = int(PREMIUM_TOKEN_HARD_CAP * (1 - TRACK_SEAL_RE
 
 
 def _matches_track(model: str, track: str) -> bool:
-    """True if `model` belongs to the named track ('normal' or 'premium')."""
-    if track == "premium":
-        return _is_premium_model(model)
-    if track == "normal":
-        return not _is_premium_model(model)
-    raise ValueError(f"unknown track: {track!r}")
+    """True if `model` belongs to the named track ('normal' or 'premium').
+    Uses strict prefix matching via _track_for_model — unlisted models return
+    False for BOTH tracks. The bot only seals/unseals models in OpenAI's
+    explicit daily-free-quota lists; everything else is left alone."""
+    if track not in ("normal", "premium"):
+        raise ValueError(f"unknown track: {track!r}")
+    return _track_for_model(model) == track
 
 # ── Known projects (IDs from exported CSV — case-sensitive) ─────────────────
 KNOWN_PROJECTS: dict[str, str] = {
@@ -174,22 +175,28 @@ def _color(text: str, code: str) -> str:
 
 # ── Model band classifier ──────────────────────────────────────────────────
 
-def _is_premium_model(model: str) -> bool:
-    """True if the model belongs to the 1M/day premium band; False for the 10M normal band.
+def _track_for_model(model: str) -> Optional[str]:
+    """Return the free-tier track a model belongs to, or None if it's not on
+    either of OpenAI's two daily-free-quota lists.
 
-    Classification order (mini/nano always wins, even if the listed premium prefix matches):
-      1. Explicit normal prefixes (listed mini/nano variants)        → normal.
-      2. 'mini' or 'nano' substring anywhere                          → normal.
-         (covers unlisted future variants like 'gpt-5.5-mini' that would otherwise be
-         caught by the broader 'gpt-5' premium prefix.)
-      3. Anything else (listed premium + unknown full-size)           → premium.
-    Premium-by-default is the conservative choice for free-tier alerting."""
+    Strict match: a model `m` is in the track of prefix `p` iff `m == p` or
+    `m.startswith(p + "-")`. The trailing-hyphen guard stops the broad `gpt-5`
+    premium prefix from swallowing unrelated future models like `gpt-5.5-mini`
+    (which starts with `gpt-5.` not `gpt-5-`).
+
+    Normal is checked first because its prefixes are more specific (e.g.
+    `gpt-5.4-mini` is a longer prefix than `gpt-5.4`). No heuristic fallback —
+    unlisted models (sora-2, babbage-002, chatgpt-image-latest, gpt-3.5-turbo, etc.)
+    return None and are NOT touched by seal/unseal and NOT counted toward the
+    1M / 10M track buckets. They're billed at standard rates anyway."""
     m = model.lower()
-    if any(m.startswith(p) for p in NORMAL_MODEL_PREFIXES):
-        return False
-    if "mini" in m or "nano" in m:
-        return False
-    return True
+    for p in NORMAL_MODEL_PREFIXES:
+        if m == p or m.startswith(p + "-"):
+            return "normal"
+    for p in PREMIUM_MODEL_PREFIXES:
+        if m == p or m.startswith(p + "-"):
+            return "premium"
+    return None
 
 
 # ── Time helpers ───────────────────────────────────────────────────────────
@@ -327,10 +334,14 @@ def _fetch_tokens() -> dict[str, dict]:
                 tokens[pid]["output_tokens"] += out
                 tokens[pid]["total_tokens"]  += inp + out
                 tokens[pid]["num_requests"]  += reqs
-                if _is_premium_model(model):
+                track = _track_for_model(model)
+                if track == "premium":
                     tokens[pid]["premium_tokens"] += inp + out
-                else:
+                elif track == "normal":
                     tokens[pid]["normal_tokens"]  += inp + out
+                # else: unlisted model (paid-rate from token 1) — counts in
+                # total_tokens but not toward either free-tier bucket. Won't push
+                # the track-seal threshold and won't be touched by mass throttle.
                 m = tokens[pid]["models"].setdefault(model, {"input": 0, "output": 0, "requests": 0})
                 m["input"] += inp; m["output"] += out; m["requests"] += reqs
         if not data.get("has_more"):
@@ -442,8 +453,10 @@ def _fetch_recent_activity_by_band(minutes: int) -> Optional[dict[str, dict[str,
             reqs  = result.get("num_model_requests", 0)
             if not pid or reqs <= 0:
                 continue
-            band  = "premium" if _is_premium_model(model) else "normal"
-            slot  = out.setdefault(pid, {"normal": 0, "premium": 0})
+            band = _track_for_model(model)
+            if band is None:
+                continue   # unlisted model — paid-rate, not part of any track
+            slot = out.setdefault(pid, {"normal": 0, "premium": 0})
             slot[band] += reqs
     return out
 
