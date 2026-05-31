@@ -2,8 +2,9 @@
 Telegram Usage Bot — OpenAI Shadow Ledger
 
 Polls OpenAI organization usage API and reports token/cost stats per project.
-Receives @commands from the configured Telegram chat.
-Monitors token milestones, concurrent project activity, and daily expenditure.
+Receives @commands from the configured Telegram chat (with inline-button menu).
+Monitors token milestones, concurrent project activity, and the per-track 95%
+rate-limit seal that prevents cap breaches.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BOT IDENTITY: Marshal-Rank Shadow Commander
@@ -29,8 +30,9 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-05-29"
+BOT_UPDATED = "2026-05-30"
 BOT_CHANGES = (
+    "Codebase cleanup: removed dead helpers, unified broadcast plumbing",
     "Interactive archive menu (buttons for seal/unseal)",
     "Per-track seal/unseal; only OpenAI free-tier models touched",
     "Uniform rate-limit restore + race-safe sealing",
@@ -1208,15 +1210,14 @@ def _answer_callback(callback_id: str, text: str = None) -> None:
         print(f"[telegram answerCallback error] {e}")
 
 
-def _send_all(text: str, subs: SubscriberStore) -> None:
-    for chat_id in subs.all():
-        _send(text, chat_id)
-
-
-def _broadcast_named(fmt_fn, subs: SubscriberStore, names: NameStore) -> None:
-    """Send a personalized message to each subscriber using their registered name."""
+def _broadcast(fmt_fn, subs: SubscriberStore, names: NameStore = None) -> None:
+    """Send a personalised message to every subscriber.
+    `fmt_fn` is a one-arg function: it receives the chat's registered display name
+    (or "Bach" when no NameStore is wired) and returns the rendered HTML to send.
+    Replaces the older `if names: per-name else: shared-text` pattern."""
     for cid in subs.all():
-        _send(fmt_fn(names.get(cid)), cid)
+        name = names.get(cid) if names is not None else "Bach"
+        _send(fmt_fn(name), cid)
 
 
 def _get_updates(offset: int) -> list[dict]:
@@ -1406,14 +1407,8 @@ def _handle_overcap(usage: UsageStore, subs: SubscriberStore, names: NameStore,
         if mode != "aggressive":
             usage.set_mode("aggressive")
             print(f"[mode] → AGGRESSIVE ({len(illegal)} project(s) burning the exhausted band)")
-        if names:
-            _broadcast_named(
-                lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded:
-                    fmt_overcap_active_alert(r, ne, pe, n),
-                subs, names,
-            )
-        else:
-            _send_all(fmt_overcap_active_alert(illegal, normal_exceeded, premium_exceeded), subs)
+        _broadcast(lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded:
+            fmt_overcap_active_alert(r, ne, pe, n), subs, names)
     elif mode == "aggressive":
         last_ts = usage.get_last_illegal_seen_ts()
         if last_ts and time.time() - last_ts > AGGRESSIVE_REVERT_SECS:
@@ -1628,11 +1623,8 @@ def _mass_seal_track(track: str, usage: UsageStore, subs: SubscriberStore,
         try:
             usage.mark_mass_sealed(track)
             print(f"[mass-seal] {track} → starting (consumed={consumed:,}, cap={cap:,})")
-            if names:
-                _broadcast_named(lambda n, t=track, c=consumed, cp=cap:
-                                 fmt_seal_batch_begin(t, c, cp, n), subs, names)
-            else:
-                _send_all(fmt_seal_batch_begin(track, consumed, cap), subs)
+            _broadcast(lambda n, t=track, c=consumed, cp=cap:
+                fmt_seal_batch_begin(t, c, cp, n), subs, names)
 
             throttled, exempt, noop, failed = [], [], [], []
             for pid in _ordered_projects_for_track_seal(track):
@@ -1646,12 +1638,8 @@ def _mass_seal_track(track: str, usage: UsageStore, subs: SubscriberStore,
 
             print(f"[mass-seal] {track} → done. throttled={len(throttled)} "
                   f"exempt={len(exempt)} noop={len(noop)} failed={len(failed)}")
-            if names:
-                _broadcast_named(lambda n, t=track, th=len(throttled), ex=len(exempt),
-                                 f=len(failed): fmt_seal_batch_done(t, th, ex, f, n), subs, names)
-            else:
-                _send_all(fmt_seal_batch_done(track, len(throttled), len(exempt),
-                                              len(failed)), subs)
+            _broadcast(lambda n, t=track, th=len(throttled), ex=len(exempt),
+                f=len(failed): fmt_seal_batch_done(t, th, ex, f, n), subs, names)
         finally:
             _SEAL_BUSY = False
 
@@ -1669,10 +1657,7 @@ def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
             pids   = list(sealed.keys())
             if not pids:
                 return
-            if names:
-                _broadcast_named(lambda n, t=track: fmt_unseal_batch_begin(t, n), subs, names)
-            else:
-                _send_all(fmt_unseal_batch_begin(track), subs)
+            _broadcast(lambda n, t=track: fmt_unseal_batch_begin(t, n), subs, names)
 
             baseline = _compute_canonical_baseline(usage)
             restored, failed = 0, 0
@@ -1684,11 +1669,8 @@ def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
                 elif result == "failed":
                     failed += 1
             print(f"[mass-unseal] {track} → restored={restored} failed={failed} ({reason})")
-            if names:
-                _broadcast_named(lambda n, t=track, r=restored, f=failed:
-                                 fmt_unseal_batch_done(t, r, f, n), subs, names)
-            else:
-                _send_all(fmt_unseal_batch_done(track, restored, failed), subs)
+            _broadcast(lambda n, t=track, r=restored, f=failed:
+                fmt_unseal_batch_done(t, r, f, n), subs, names)
         finally:
             _SEAL_BUSY = False
 
@@ -1710,10 +1692,7 @@ def _manual_seal_project(track: str, pid: str, usage: UsageStore,
             proj   = KNOWN_PROJECTS.get(pid, pid)
             if result == "throttled":
                 print(f"[manual-seal] {proj}/{track}: sealed")
-                if names:
-                    _broadcast_named(lambda n, p=proj, t=track: fmt_manual_seal(p, t, n), subs, names)
-                else:
-                    _send_all(fmt_manual_seal(proj, track), subs)
+                _broadcast(lambda n, p=proj, t=track: fmt_manual_seal(p, t, n), subs, names)
                 return "sealed"
             if result == "noop":
                 return "noop"
@@ -1739,10 +1718,7 @@ def _manual_unseal_project(track: str, pid: str, usage: UsageStore,
             if result == "restored":
                 usage.add_track_exemption(pid, track)
                 print(f"[manual-unseal] {proj}/{track}: restored + exempt")
-                if names:
-                    _broadcast_named(lambda n, p=proj, t=track: fmt_manual_unseal(p, t, n), subs, names)
-                else:
-                    _send_all(fmt_manual_unseal(proj, track), subs)
+                _broadcast(lambda n, p=proj, t=track: fmt_manual_unseal(p, t, n), subs, names)
                 return "unsealed"
             if result == "noop":
                 return "noop"
@@ -1781,10 +1757,7 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
         _SEAL_BUSY = True
         try:
             tracks_str = " & ".join(sorted(pending.keys()))
-            if names:
-                _broadcast_named(lambda n, t=tracks_str: fmt_unseal_batch_begin(t, n), subs, names)
-            else:
-                _send_all(fmt_unseal_batch_begin(tracks_str), subs)
+            _broadcast(lambda n, t=tracks_str: fmt_unseal_batch_begin(t, n), subs, names)
 
             baseline = _compute_canonical_baseline(usage)
             restored, failed_p = 0, 0
@@ -1803,11 +1776,8 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
                     usage.pop_pending_track_project(track, pid)
                     restored += 1
 
-            if names:
-                _broadcast_named(lambda n, r=restored, f=failed_p, t=tracks_str:
-                                 fmt_unseal_batch_done(t, r, f, n), subs, names)
-            else:
-                _send_all(fmt_unseal_batch_done(tracks_str, restored, failed_p), subs)
+            _broadcast(lambda n, r=restored, f=failed_p, t=tracks_str:
+                fmt_unseal_batch_done(t, r, f, n), subs, names)
         finally:
             _SEAL_BUSY = False
 
@@ -1936,23 +1906,11 @@ def seed_milestones(snap: dict, usage: UsageStore,
 
     if normal_crossed and subs:
         t, l = normal_crossed[-1]   # highest crossed
-        if names:
-            _broadcast_named(
-                lambda n, t=t, c=total_normal, l=l: fmt_token_milestone(t, c, l, n),
-                subs, names,
-            )
-        else:
-            _send_all(fmt_token_milestone(t, total_normal, l), subs)
+        _broadcast(lambda n, t=t, c=total_normal, l=l: fmt_token_milestone(t, c, l, n), subs, names)
 
     if premium_crossed and subs:
         t, l = premium_crossed[-1]
-        if names:
-            _broadcast_named(
-                lambda n, t=t, c=total_premium, l=l: fmt_premium_token_milestone(t, c, l, n),
-                subs, names,
-            )
-        else:
-            _send_all(fmt_premium_token_milestone(t, total_premium, l), subs)
+        _broadcast(lambda n, t=t, c=total_premium, l=l: fmt_premium_token_milestone(t, c, l, n), subs, names)
 
 
 def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> bool:
@@ -1967,10 +1925,7 @@ def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names
         if total_tok >= threshold and threshold not in notified:
             hit = True
             usage.add_milestone_notified(threshold)
-            if names:
-                _broadcast_named(lambda n, t=threshold, c=total_tok, l=level: fmt_token_milestone(t, c, l, n), subs, names)
-            else:
-                _send_all(fmt_token_milestone(threshold, total_tok, level), subs)
+            _broadcast(lambda n, t=threshold, c=total_tok, l=level: fmt_token_milestone(t, c, l, n), subs, names)
 
     # Premium band (1M free daily)
     total_premium    = snap.get("total_premium_tokens", 0)
@@ -1979,10 +1934,7 @@ def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names
         if total_premium >= threshold and threshold not in notified_premium:
             hit = True
             usage.add_premium_milestone_notified(threshold)
-            if names:
-                _broadcast_named(lambda n, t=threshold, c=total_premium, l=level: fmt_premium_token_milestone(t, c, l, n), subs, names)
-            else:
-                _send_all(fmt_premium_token_milestone(threshold, total_premium, level), subs)
+            _broadcast(lambda n, t=threshold, c=total_premium, l=level: fmt_premium_token_milestone(t, c, l, n), subs, names)
 
     return hit
 
@@ -2363,14 +2315,8 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
                     usage.update_last_illegal_seen()
                     if mode != "aggressive":
                         usage.set_mode("aggressive")
-                    if names:
-                        _broadcast_named(
-                            lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded:
-                                fmt_overcap_active_alert(r, ne, pe, n),
-                            subs, names,
-                        )
-                    else:
-                        _send_all(fmt_overcap_active_alert(illegal, normal_exceeded, premium_exceeded), subs)
+                    _broadcast(lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded:
+                        fmt_overcap_active_alert(r, ne, pe, n), subs, names)
                     mode_note = "\n🔴 <b>AGGRESSIVE mode active — exempt projects burning the exhausted band, broadcast sent.</b>"
                 else:
                     mode_note = "\n⚠️ Budget cap exceeded — no projects active on the exhausted band right now."
@@ -2790,10 +2736,7 @@ def concurrency_check_loop(usage: UsageStore, subs: SubscriberStore, names: Name
                     last_ts = usage.get_last_concurrent_alert_ts()
                     if last_ts is None or time.time() - last_ts > CONCURRENCY_COOLDOWN:
                         usage.set_last_concurrent_alert_ts(time.time())
-                        if names:
-                            _broadcast_named(lambda n, a=active: fmt_concurrency_alert(a, n), subs, names)
-                        else:
-                            _send_all(fmt_concurrency_alert(active), subs)
+                        _broadcast(lambda n, a=active: fmt_concurrency_alert(a, n), subs, names)
                         print(f"[concurrency] Alert fired — {len(active)} projects active")
         except Exception as e:
             print(f"[concurrency check error] {e}")
