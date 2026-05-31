@@ -15,6 +15,7 @@ No humor. No filler. Precision in all things.
 """
 
 import calendar
+import html
 import json
 import os
 import threading
@@ -26,16 +27,30 @@ from typing import Optional
 import dotenv
 import requests
 
+
+def _atomic_write_json(path: Path, data) -> None:
+    """Write JSON to disk atomically — temp file + rename. Prevents partial-write
+    corruption on crash/power-loss/SIGKILL mid-`json.dump`. The temp lives in the
+    same directory so `os.replace` stays on one filesystem (rename is atomic only
+    within the same FS)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
 dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-05-30"
+BOT_UPDATED = "2026-05-31"
 BOT_CHANGES = (
-    "Codebase cleanup: removed dead helpers, unified broadcast plumbing",
-    "Interactive archive menu (buttons for seal/unseal)",
-    "Per-track seal/unseal; only OpenAI free-tier models touched",
-    "Uniform rate-limit restore + race-safe sealing",
+    "Security pass: atomic busy-claim closes the seal/unseal TOCTOU race",
+    "Manual seal/unseal now runs in a background worker — Telegram never freezes",
+    "HTML-escape display names; atomic state writes; corrupt-state quarantine",
+    "Discard pending Telegram updates on startup (no stale button replay)",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -104,13 +119,42 @@ OVERCAP_WINDOW_MINS = 20
 # max_tokens_per_1_minute, and the other per-model maxima — guaranteeing the
 # project cannot make a single successful token-burning call. See _seal_payload.
 #
-# All seal/unseal operations (mass sweep, manual, day-rollover restore) acquire
-# this lock so only one rate-limit-mutating operation runs at a time. Prevents the
-# race where a manual seal and the auto mass-sweep both POST to the same project,
-# or a user fires a command mid-sweep. Manual commands check _SEAL_BUSY first and
-# refuse rather than block, so the Telegram thread never hangs.
-_SEAL_LOCK = threading.Lock()
-_SEAL_BUSY = False   # human-readable "an operation is in progress" flag for commands
+# Concurrency model: a single atomic "busy" claim serialises ALL rate-limit work
+# (auto 95% sweep, day-rollover restore, manual button ops). Callers ASK to claim
+# the flag — if another op is in progress they bail immediately instead of blocking.
+# Manual ops dispatched from the Telegram callback handler run in a background
+# worker thread, so the poll loop is never frozen by a 30-50 s sweep.
+#
+# Previous design used a `threading.Lock` held for the entire operation. Two bugs:
+#   1. The TOCTOU race — callbacks read `_SEAL_BUSY` without holding the lock,
+#      then `with _SEAL_LOCK:` would block the Telegram thread until the running
+#      op finished, freezing every command for 30-50 s.
+#   2. No worker thread — even the "successful" callback path ran inline, so the
+#      Telegram poll loop couldn't fetch new updates while a seal/unseal ran.
+_BUSY_LOCK = threading.Lock()
+_BUSY      = False
+
+
+def _try_claim_busy() -> bool:
+    """Atomic check-and-set. Returns True iff this caller now holds the seal-busy
+    claim — caller MUST `_release_busy()` in a `finally` once done."""
+    global _BUSY
+    with _BUSY_LOCK:
+        if _BUSY:
+            return False
+        _BUSY = True
+        return True
+
+
+def _release_busy() -> None:
+    global _BUSY
+    with _BUSY_LOCK:
+        _BUSY = False
+
+
+def _is_busy() -> bool:
+    with _BUSY_LOCK:
+        return _BUSY
 
 # ── Track-level mass-seal trigger ──────────────────────────────────────────
 # When a track's remaining quota drops to this fraction (or below — including
@@ -768,12 +812,19 @@ class UsageStore:
             try:
                 with self.path.open("r", encoding="utf-8") as f:
                     self._data = json.load(f)
-            except Exception:
+            except Exception as e:
+                # Loud warning — silent reset wipes sealed-project state.
+                # Quarantine the bad file so it can be inspected after restart.
+                quarantine = self.path.with_suffix(self.path.suffix + f".corrupt-{int(time.time())}")
+                try:
+                    os.replace(self.path, quarantine)
+                    print(f"[store] CORRUPT state file at {self.path} ({e}) → moved to {quarantine}")
+                except Exception as move_err:
+                    print(f"[store] CORRUPT state file at {self.path} ({e}) — could not quarantine: {move_err}")
                 self._data = {}
 
     def _save(self):
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(self._data, f, indent=2)
+        _atomic_write_json(self.path, self._data)
 
     def _reset_daily_state_locked(self):
         """Reset all daily alert/mode state. Caller must hold self._lock.
@@ -825,10 +876,15 @@ class UsageStore:
             self._data.update(preserved)
             self._save()
 
-    def seed_state(self, normal_thresholds: list, premium_thresholds: list) -> None:
-        """Bulk-mark seeded milestones in one disk write. Always sets milestones_seeded=True,
-        even when both lists are empty (so unseeded fresh days still flip the flag)."""
+    def seed_state(self, normal_thresholds: list, premium_thresholds: list) -> bool:
+        """Atomic check-and-mark. Returns True if THIS caller is the one that seeded
+        the day (and therefore should broadcast), False if seeding was already done
+        and this call is a no-op. Closes the race where the poll loop and a /refresh
+        from the Telegram thread both pass `has_seeded()==False` and then both
+        broadcast the same milestone."""
         with self._lock:
+            if self._data.get("milestones_seeded", False):
+                return False
             if normal_thresholds:
                 ms = self._data.setdefault("token_milestones_notified", [])
                 for t in normal_thresholds:
@@ -841,6 +897,7 @@ class UsageStore:
                         ms.append(t)
             self._data["milestones_seeded"] = True
             self._save()
+            return True
 
     def get(self) -> dict:
         with self._lock:
@@ -1078,13 +1135,12 @@ class SubscriberStore:
             try:
                 with self.path.open("r", encoding="utf-8") as f:
                     self._ids = set(json.load(f))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[subs] CORRUPT subscriber file at {self.path} ({e}) — resetting to primary only")
         self._ids.add(self.primary)
 
     def _save(self):
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(sorted(self._ids), f, indent=2)
+        _atomic_write_json(self.path, sorted(self._ids))
 
     def add(self, chat_id: str) -> bool:
         with self._lock:
@@ -1122,21 +1178,26 @@ class NameStore:
             try:
                 with self.path.open("r", encoding="utf-8") as f:
                     self._names.update(json.load(f))
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[names] CORRUPT names file at {self.path} ({e}) — resetting to defaults")
 
     def _save(self):
-        with self.path.open("w", encoding="utf-8") as f:
-            json.dump(self._names, f, indent=2)
+        _atomic_write_json(self.path, self._names)
 
     def set(self, chat_id: str, name: str) -> None:
+        """Store a sanitised display name.
+        Escapes HTML and caps to 48 chars — names flow into many Telegram-HTML
+        messages (`<b>{name}</b>`), so unescaped angle brackets can break parsing
+        or be abused. Strips control chars + collapses whitespace."""
+        cleaned = " ".join(name.split())[:48]
+        safe    = html.escape(cleaned, quote=True)
         with self._lock:
-            self._names[str(chat_id)] = name
+            self._names[str(chat_id)] = safe
             self._save()
 
     def get(self, chat_id: str) -> str:
         with self._lock:
-            return self._names.get(str(chat_id), "Commander")
+            return self._names.get(str(chat_id), "Bach")
 
 
 # ── Telegram I/O ───────────────────────────────────────────────────────────
@@ -1238,6 +1299,34 @@ def _get_updates(offset: int) -> list[dict]:
         print(f"[poll error] {e}")
         time.sleep(5)   # avoid a tight reconnect loop on persistent failure
         return []
+
+
+def _discard_pending_updates() -> int:
+    """Discard any Telegram updates that piled up while the bot was offline.
+    Returns the next safe offset to use. Without this, on restart the bot would
+    replay up to 24 h of queued updates — including stale `arch:seal:both:all`
+    button clicks that could fire a real mass-seal from a UI a user has long
+    forgotten about. We grab the latest update_id and ACK it; Telegram drops
+    everything ≤ that id from the queue."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    try:
+        r = requests.get(url, params={"offset": -1, "timeout": 0,
+                                       "allowed_updates": json.dumps([])},
+                          timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        updates = r.json().get("result", [])
+        if not updates:
+            return 0
+        next_offset = updates[-1]["update_id"] + 1
+        # ACK so Telegram drops these from the queue.
+        requests.get(url, params={"offset": next_offset, "timeout": 0,
+                                   "allowed_updates": json.dumps([])},
+                      timeout=REQUEST_TIMEOUT)
+        print(f"[telegram] Discarded {len(updates)} stale update(s); next offset={next_offset}")
+        return next_offset
+    except Exception as e:
+        print(f"[telegram offset discard error] {e}")
+        return 0
 
 
 def _fetch_bot_username(retries: int = 5, delay: int = 10) -> Optional[str]:
@@ -1554,7 +1643,7 @@ def _throttle_track_for_project(pid: str, track: str, usage: UsageStore) -> str:
     """Throttle every rate-limit row of `pid` that belongs to `track` down to 0,
     saving the pre-throttle originals into sealed_tracks. Returns 'throttled' /
     'noop' (no rows for this track) / 'failed'. On partial failure rolls back its
-    own rows so the project is left untouched. Caller must hold _SEAL_LOCK."""
+    own rows so the project is left untouched. Caller must hold the busy claim."""
     rate_limits = _fetch_project_rate_limits(pid)
     if rate_limits is None:
         return "failed"
@@ -1585,7 +1674,7 @@ def _restore_track_for_project(pid: str, track: str, usage: UsageStore,
                                baseline: dict) -> str:
     """Restore `pid`'s rows for `track` to the canonical baseline, then drop the
     project from sealed_tracks[track]. Returns 'restored' / 'noop' / 'failed'.
-    Caller must hold _SEAL_LOCK."""
+    Caller must hold the busy claim."""
     info      = usage.get_sealed_tracks().get(track, {})
     originals = info.get("originals_by_project", {}).get(pid, [])
     if not originals:
@@ -1611,68 +1700,56 @@ def _mass_seal_track(track: str, usage: UsageStore, subs: SubscriberStore,
                      names: NameStore, *, consumed: int = None,
                      respect_exemptions: bool = True) -> None:
     """Throttle `track` to 0 across every project (skipping exemptions when
-    respect_exemptions). Concise begin/done broadcast. Acquires _SEAL_LOCK so it
-    can't interleave with a manual op. Marks the track mass-sealed for the day."""
-    global _SEAL_BUSY
+    respect_exemptions). Concise begin/done broadcast. Marks the track mass-sealed.
+    REQUIRES: caller already holds the busy claim (`_try_claim_busy`)."""
     cap = TOKEN_HARD_CAP if track == "normal" else PREMIUM_TOKEN_HARD_CAP
     if consumed is None:
         consumed = cap   # manual trigger: report at/over cap
 
-    with _SEAL_LOCK:
-        _SEAL_BUSY = True
-        try:
-            usage.mark_mass_sealed(track)
-            print(f"[mass-seal] {track} → starting (consumed={consumed:,}, cap={cap:,})")
-            _broadcast(lambda n, t=track, c=consumed, cp=cap:
-                fmt_seal_batch_begin(t, c, cp, n), subs, names)
+    usage.mark_mass_sealed(track)
+    print(f"[mass-seal] {track} → starting (consumed={consumed:,}, cap={cap:,})")
+    _broadcast(lambda n, t=track, c=consumed, cp=cap:
+        fmt_seal_batch_begin(t, c, cp, n), subs, names)
 
-            throttled, exempt, noop, failed = [], [], [], []
-            for pid in _ordered_projects_for_track_seal(track):
-                if respect_exemptions and usage.is_exempt(pid, track):
-                    exempt.append(pid); continue
-                if usage.is_project_track_sealed(pid, track):
-                    noop.append(pid); continue
-                result = _throttle_track_for_project(pid, track, usage)
-                {"throttled": throttled, "noop": noop, "failed": failed}.get(
-                    result, failed).append(pid)
+    throttled, exempt, noop, failed = [], [], [], []
+    for pid in _ordered_projects_for_track_seal(track):
+        if respect_exemptions and usage.is_exempt(pid, track):
+            exempt.append(pid); continue
+        if usage.is_project_track_sealed(pid, track):
+            noop.append(pid); continue
+        result = _throttle_track_for_project(pid, track, usage)
+        {"throttled": throttled, "noop": noop, "failed": failed}.get(
+            result, failed).append(pid)
 
-            print(f"[mass-seal] {track} → done. throttled={len(throttled)} "
-                  f"exempt={len(exempt)} noop={len(noop)} failed={len(failed)}")
-            _broadcast(lambda n, t=track, th=len(throttled), ex=len(exempt),
-                f=len(failed): fmt_seal_batch_done(t, th, ex, f, n), subs, names)
-        finally:
-            _SEAL_BUSY = False
+    print(f"[mass-seal] {track} → done. throttled={len(throttled)} "
+          f"exempt={len(exempt)} noop={len(noop)} failed={len(failed)}")
+    _broadcast(lambda n, t=track, th=len(throttled), ex=len(exempt),
+        f=len(failed): fmt_seal_batch_done(t, th, ex, f, n), subs, names)
 
 
 def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
                        names: NameStore, *, reason: str = "manual") -> None:
     """Restore `track` across every currently-sealed project to the canonical
-    baseline, marking each exempt so the auto-sweep won't re-seal today. Concise
-    begin/done broadcast. Acquires _SEAL_LOCK."""
-    global _SEAL_BUSY
-    with _SEAL_LOCK:
-        _SEAL_BUSY = True
-        try:
-            sealed = usage.get_sealed_tracks().get(track, {}).get("originals_by_project", {})
-            pids   = list(sealed.keys())
-            if not pids:
-                return
-            _broadcast(lambda n, t=track: fmt_unseal_batch_begin(t, n), subs, names)
+    baseline, marking each exempt so the auto-sweep won't re-seal today.
+    REQUIRES: caller already holds the busy claim (`_try_claim_busy`)."""
+    sealed = usage.get_sealed_tracks().get(track, {}).get("originals_by_project", {})
+    pids   = list(sealed.keys())
+    if not pids:
+        return
+    _broadcast(lambda n, t=track: fmt_unseal_batch_begin(t, n), subs, names)
 
-            baseline = _compute_canonical_baseline(usage)
-            restored, failed = 0, 0
-            for pid in pids:
-                result = _restore_track_for_project(pid, track, usage, baseline)
-                if result == "restored":
-                    usage.add_track_exemption(pid, track)
-                    restored += 1
-                elif result == "failed":
-                    failed += 1
-            print(f"[mass-unseal] {track} → restored={restored} failed={failed} ({reason})")
-            _broadcast(lambda n, t=track, r=restored, f=failed:
-                fmt_unseal_batch_done(t, r, f, n), subs, names)
-        finally:
-            _SEAL_BUSY = False
+    baseline = _compute_canonical_baseline(usage)
+    restored, failed = 0, 0
+    for pid in pids:
+        result = _restore_track_for_project(pid, track, usage, baseline)
+        if result == "restored":
+            usage.add_track_exemption(pid, track)
+            restored += 1
+        elif result == "failed":
+            failed += 1
+    print(f"[mass-unseal] {track} → restored={restored} failed={failed} ({reason})")
+    _broadcast(lambda n, t=track, r=restored, f=failed:
+        fmt_unseal_batch_done(t, r, f, n), subs, names)
 
 
 # ── Single-project manual seal / unseal (button-driven) ────────────────────
@@ -1680,51 +1757,41 @@ def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
 def _manual_seal_project(track: str, pid: str, usage: UsageStore,
                          subs: SubscriberStore, names: NameStore) -> str:
     """Throttle one project's `track` band to 0. Clears any exemption so the row
-    stays sealed. Returns 'sealed' / 'noop' / 'failed'. Acquires _SEAL_LOCK."""
-    global _SEAL_BUSY
-    with _SEAL_LOCK:
-        _SEAL_BUSY = True
-        try:
-            usage.remove_track_exemption(pid, track)
-            if usage.is_project_track_sealed(pid, track):
-                return "noop"
-            result = _throttle_track_for_project(pid, track, usage)
-            proj   = KNOWN_PROJECTS.get(pid, pid)
-            if result == "throttled":
-                print(f"[manual-seal] {proj}/{track}: sealed")
-                _broadcast(lambda n, p=proj, t=track: fmt_manual_seal(p, t, n), subs, names)
-                return "sealed"
-            if result == "noop":
-                return "noop"
-            return "failed"
-        finally:
-            _SEAL_BUSY = False
+    stays sealed. Returns 'sealed' / 'noop' / 'failed'.
+    REQUIRES: caller already holds the busy claim (`_try_claim_busy`)."""
+    usage.remove_track_exemption(pid, track)
+    if usage.is_project_track_sealed(pid, track):
+        return "noop"
+    result = _throttle_track_for_project(pid, track, usage)
+    proj   = KNOWN_PROJECTS.get(pid, pid)
+    if result == "throttled":
+        print(f"[manual-seal] {proj}/{track}: sealed")
+        _broadcast(lambda n, p=proj, t=track: fmt_manual_seal(p, t, n), subs, names)
+        return "sealed"
+    if result == "noop":
+        return "noop"
+    return "failed"
 
 
 def _manual_unseal_project(track: str, pid: str, usage: UsageStore,
                            subs: SubscriberStore, names: NameStore) -> str:
     """Restore one project's `track` band and mark it exempt for the day.
-    Returns 'unsealed' / 'noop' / 'failed'. Acquires _SEAL_LOCK."""
-    global _SEAL_BUSY
-    with _SEAL_LOCK:
-        _SEAL_BUSY = True
-        try:
-            proj = KNOWN_PROJECTS.get(pid, pid)
-            if not usage.is_project_track_sealed(pid, track):
-                usage.add_track_exemption(pid, track)   # pre-exempt so sweep skips it
-                return "noop"
-            baseline = _compute_canonical_baseline(usage)
-            result   = _restore_track_for_project(pid, track, usage, baseline)
-            if result == "restored":
-                usage.add_track_exemption(pid, track)
-                print(f"[manual-unseal] {proj}/{track}: restored + exempt")
-                _broadcast(lambda n, p=proj, t=track: fmt_manual_unseal(p, t, n), subs, names)
-                return "unsealed"
-            if result == "noop":
-                return "noop"
-            return "failed"
-        finally:
-            _SEAL_BUSY = False
+    Returns 'unsealed' / 'noop' / 'failed'.
+    REQUIRES: caller already holds the busy claim (`_try_claim_busy`)."""
+    proj = KNOWN_PROJECTS.get(pid, pid)
+    if not usage.is_project_track_sealed(pid, track):
+        usage.add_track_exemption(pid, track)   # pre-exempt so sweep skips it
+        return "noop"
+    baseline = _compute_canonical_baseline(usage)
+    result   = _restore_track_for_project(pid, track, usage, baseline)
+    if result == "restored":
+        usage.add_track_exemption(pid, track)
+        print(f"[manual-unseal] {proj}/{track}: restored + exempt")
+        _broadcast(lambda n, p=proj, t=track: fmt_manual_unseal(p, t, n), subs, names)
+        return "unsealed"
+    if result == "noop":
+        return "noop"
+    return "failed"
 
 
 # ── Auto 95% trigger (poll loop / refresh) ─────────────────────────────────
@@ -1732,12 +1799,20 @@ def _manual_unseal_project(track: str, pid: str, usage: UsageStore,
 def _handle_track_seal(track: str, snap: dict, usage: UsageStore,
                        subs: SubscriberStore, names: NameStore) -> None:
     """Auto mass-seal entry: fired by the poll loop when a track crosses 95%.
-    Idempotent via the per-day mass_sealed flag."""
+    Idempotent via the per-day `mass_sealed_tracks` flag. Skips silently if another
+    op already holds the busy claim — the next poll re-checks the threshold and
+    retries (consumption only grows, so the trigger condition won't disappear)."""
     if usage.is_mass_sealed(track):
         return
-    consumed_key = "total_normal_tokens" if track == "normal" else "total_premium_tokens"
-    _mass_seal_track(track, usage, subs, names,
-                     consumed=snap.get(consumed_key, 0), respect_exemptions=True)
+    if not _try_claim_busy():
+        print(f"[mass-seal] {track} deferred — another seal/unseal in progress")
+        return
+    try:
+        consumed_key = "total_normal_tokens" if track == "normal" else "total_premium_tokens"
+        _mass_seal_track(track, usage, subs, names,
+                         consumed=snap.get(consumed_key, 0), respect_exemptions=True)
+    finally:
+        _release_busy()
 
 
 def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
@@ -1745,41 +1820,42 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
     """At day rollover, sealed_tracks moves into pending_track_unseal. This drains
     it: each project under each track is restored to the canonical baseline.
     Failures stay in the queue and retry next poll. Concise begin/done broadcast.
-    Acquires _SEAL_LOCK so it can't interleave with a manual op."""
-    global _SEAL_BUSY
+    Skips silently if the busy claim can't be obtained — the queue persists so the
+    next poll cycle picks up where this one left off."""
     pending = usage.get_pending_track_unseal()
     if not pending:
         return
     if sum(len(i.get("originals_by_project", {})) for i in pending.values()) == 0:
         return
 
-    with _SEAL_LOCK:
-        _SEAL_BUSY = True
-        try:
-            tracks_str = " & ".join(sorted(pending.keys()))
-            _broadcast(lambda n, t=tracks_str: fmt_unseal_batch_begin(t, n), subs, names)
+    if not _try_claim_busy():
+        print("[pending-track-unseal] deferred — another seal/unseal in progress")
+        return
+    try:
+        tracks_str = " & ".join(sorted(pending.keys()))
+        _broadcast(lambda n, t=tracks_str: fmt_unseal_batch_begin(t, n), subs, names)
 
-            baseline = _compute_canonical_baseline(usage)
-            restored, failed_p = 0, 0
-            for track, info in pending.items():
-                obp = info.get("originals_by_project", {})
-                print(f"[pending-track-unseal] {track} → {len(obp)} project(s)")
-                for pid, originals in list(obp.items()):
-                    if not originals:
-                        usage.pop_pending_track_project(track, pid); continue
-                    failed = _restore_rate_limits(pid, originals, baseline=baseline)
-                    if failed:
-                        failed_p += 1
-                        print(f"[pending-track-unseal] {KNOWN_PROJECTS.get(pid, pid)}/{track}: "
-                              f"{failed}/{len(originals)} failed — will retry next poll")
-                        continue
-                    usage.pop_pending_track_project(track, pid)
-                    restored += 1
+        baseline = _compute_canonical_baseline(usage)
+        restored, failed_p = 0, 0
+        for track, info in pending.items():
+            obp = info.get("originals_by_project", {})
+            print(f"[pending-track-unseal] {track} → {len(obp)} project(s)")
+            for pid, originals in list(obp.items()):
+                if not originals:
+                    usage.pop_pending_track_project(track, pid); continue
+                failed = _restore_rate_limits(pid, originals, baseline=baseline)
+                if failed:
+                    failed_p += 1
+                    print(f"[pending-track-unseal] {KNOWN_PROJECTS.get(pid, pid)}/{track}: "
+                          f"{failed}/{len(originals)} failed — will retry next poll")
+                    continue
+                usage.pop_pending_track_project(track, pid)
+                restored += 1
 
-            _broadcast(lambda n, r=restored, f=failed_p, t=tracks_str:
-                fmt_unseal_batch_done(t, r, f, n), subs, names)
-        finally:
-            _SEAL_BUSY = False
+        _broadcast(lambda n, r=restored, f=failed_p, t=tracks_str:
+            fmt_unseal_batch_done(t, r, f, n), subs, names)
+    finally:
+        _release_busy()
 
 
 # ── Formatters — seal/unseal alerts ────────────────────────────────────────
@@ -1887,22 +1963,21 @@ def fmt_daily_snapshot(snap: dict) -> str:
 def seed_milestones(snap: dict, usage: UsageStore,
                     subs: "SubscriberStore" = None, names: "NameStore" = None) -> None:
     """Fire only the highest already-crossed milestone per track on first poll of a day.
-    Idempotent: early-returns if already seeded — guards against double-broadcast when
-    /refresh and the poll loop race to seed first."""
-    if usage.has_seeded():
-        return
-
+    Race-safe: the atomic `seed_state` returns True only for the unique caller that
+    actually flipped the flag, so concurrent /refresh + poll-loop calls broadcast at
+    most once."""
     total_normal  = snap.get("total_normal_tokens", 0)
     total_premium = snap.get("total_premium_tokens", 0)
 
     normal_crossed  = [(t, l) for t, l in TOKEN_MILESTONES         if total_normal  >= t]
     premium_crossed = [(t, l) for t, l in PREMIUM_TOKEN_MILESTONES if total_premium >= t]
 
-    # One disk write marks every crossed threshold and flips milestones_seeded.
-    usage.seed_state(
+    # Atomic claim — only the winning caller gets True and broadcasts.
+    if not usage.seed_state(
         normal_thresholds  = [t for t, _ in normal_crossed],
         premium_thresholds = [t for t, _ in premium_crossed],
-    )
+    ):
+        return
 
     if normal_crossed and subs:
         t, l = normal_crossed[-1]   # highest crossed
@@ -2157,16 +2232,44 @@ def cmd_archive(usage: UsageStore, name: str = "Bach") -> tuple:
     return _fmt_archive_status(usage, name), _kb_archive_root()
 
 
+def _spawn_archive_worker(work_fn, after_kb_fn, chat_id: str, msg_id: int,
+                          usage: UsageStore, name: str) -> None:
+    """Run `work_fn` in a daemon thread, then edit the originating message with
+    the fresh archive status and the keyboard returned by `after_kb_fn()`. The
+    busy claim MUST already be held by the caller — this worker releases it.
+    Backgrounding lets the Telegram poll loop keep handling other commands while
+    a 30–50 s mass-seal runs."""
+    def _runner():
+        try:
+            work_fn()
+            if msg_id is not None:
+                _edit_message(_fmt_archive_status(usage, name),
+                              chat_id, msg_id, keyboard=after_kb_fn())
+        except Exception as e:
+            print(f"[archive worker error] {e}")
+        finally:
+            _release_busy()
+    threading.Thread(target=_runner, daemon=True).start()
+
+
 def handle_archive_callback(data: str, usage: UsageStore, subs: SubscriberStore,
-                            names: NameStore, name: str = "Bach") -> tuple:
-    """Process an 'arch:...' callback. Returns (text, keyboard, toast) where
-    keyboard may be None (keep current) and toast is a short answerCallbackQuery
-    string. Heavy seal/unseal work runs inline; while it runs _SEAL_BUSY guards
-    against a second concurrent op (the auto-sweep or another click)."""
+                            names: NameStore, name: str, chat_id: str,
+                            msg_id: int) -> tuple:
+    """Process an 'arch:...' callback. Returns (text, keyboard, toast).
+    Navigation paths return immediately. Heavy seal/unseal work is dispatched to
+    a background thread so the Telegram poll loop is never blocked. The toast +
+    the placeholder ("🔄 Working…") message go out immediately; the worker edits
+    the message again when the API work completes."""
     try:
         _, action, mode, pidx = data.split(":", 3)
     except ValueError:
         return None, None, "Malformed action."
+
+    # Defensive: validate enum-like fields before using them.
+    if action not in {"cancel", "menu", "seal", "unseal"}:
+        return None, None, "Unknown action."
+    if mode not in {"-", "normal", "premium", "both"}:
+        return None, None, "Unknown mode."
 
     if action == "cancel":
         return _fmt_archive_status(usage, name), None, "Cancelled."
@@ -2190,38 +2293,42 @@ def handle_archive_callback(data: str, usage: UsageStore, subs: SubscriberStore,
 
     if action in ("seal", "unseal") and mode in ("normal", "premium", "both"):
         # Project (or ALL) chosen → apply. Refuse if an op is already running.
-        if _SEAL_BUSY:
+        # Atomic claim closes the prior TOCTOU race (check + acquire were separate).
+        if not _try_claim_busy():
             return None, None, "A seal/unseal is already running — try again shortly."
         tracks = _archive_tracks_for_mode(mode)
 
         if pidx == "all":
-            for t in tracks:
-                if action == "seal":
-                    _mass_seal_track(t, usage, subs, names, respect_exemptions=False)
-                else:
-                    _mass_unseal_track(t, usage, subs, names, reason="manual all")
-            toast = f"{action.title()} ALL ({mode}) done."
-            return _fmt_archive_status(usage, name), _kb_archive_root(), toast
+            def _work():
+                for t in tracks:
+                    if action == "seal":
+                        _mass_seal_track(t, usage, subs, names, respect_exemptions=False)
+                    else:
+                        _mass_unseal_track(t, usage, subs, names, reason="manual all")
+            _spawn_archive_worker(_work, _kb_archive_root, chat_id, msg_id, usage, name)
+            placeholder = (f"{_fmt_archive_status(usage, name)}\n\n"
+                           f"🔄 <i>Working on {action} ALL ({mode}) — watch chat for progress…</i>")
+            return placeholder, [], f"Started {action} ALL ({mode})."
 
         # Single project
         try:
             pid = _PROJECT_INDEX[int(pidx)]
         except (ValueError, IndexError):
+            _release_busy()
             return None, None, "Unknown project."
         proj = KNOWN_PROJECTS.get(pid, pid)
-        results = []
-        for t in tracks:
-            if action == "seal":
-                results.append(_manual_seal_project(t, pid, usage, subs, names))
-            else:
-                results.append(_manual_unseal_project(t, pid, usage, subs, names))
-        if "failed" in results:
-            toast = f"{action.title()} {proj}: partial failure — check logs."
-        elif all(r == "noop" for r in results):
-            toast = f"{proj}: already in that state."
-        else:
-            toast = f"{action.title()} {proj} ({mode}) done."
-        return _fmt_archive_status(usage, name), _kb_archive_projects(action, mode, usage), toast
+        def _work():
+            for t in tracks:
+                if action == "seal":
+                    _manual_seal_project(t, pid, usage, subs, names)
+                else:
+                    _manual_unseal_project(t, pid, usage, subs, names)
+        _spawn_archive_worker(_work,
+                              lambda: _kb_archive_projects(action, mode, usage),
+                              chat_id, msg_id, usage, name)
+        placeholder = (f"{_fmt_archive_status(usage, name)}\n\n"
+                       f"🔄 <i>Working on {action} {proj} ({mode})…</i>")
+        return placeholder, [], f"Started {action} {proj} ({mode})."
 
     return None, None, "Unknown action."
 
@@ -2544,8 +2651,9 @@ def dispatch(text: str, usage: UsageStore, subs: SubscriberStore,
 # ── Telegram poll thread ───────────────────────────────────────────────────
 
 def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
-                       bot_username: Optional[str], names: NameStore = None) -> None:
-    offset = 0
+                       bot_username: Optional[str], names: NameStore = None,
+                       initial_offset: int = 0) -> None:
+    offset = initial_offset
     while True:
         updates = _get_updates(offset)
         for upd in updates:
@@ -2595,7 +2703,8 @@ def _handle_callback_update(cq: dict, usage: UsageStore, subs: SubscriberStore,
 
     print(f"[callback] chat={chat_id} data={data!r}")
     try:
-        text, keyboard, toast = handle_archive_callback(data, usage, subs, names, name)
+        text, keyboard, toast = handle_archive_callback(
+            data, usage, subs, names, name, chat_id, msg_id)
     except Exception as e:
         print(f"[callback handler error] {e}")
         _answer_callback(cq_id, "Error — check logs.")
@@ -2765,7 +2874,11 @@ def main() -> None:
     else:
         print("[bot] WARNING: Could not resolve username — commands will not work")
 
-    threading.Thread(target=telegram_poll_loop,     args=(usage, subs, bot_username, names), daemon=True).start()
+    # Drop any updates that piled up while the bot was offline (stale archive
+    # button clicks would otherwise re-fire seal/unseal on restart).
+    initial_offset = _discard_pending_updates()
+
+    threading.Thread(target=telegram_poll_loop,     args=(usage, subs, bot_username, names, initial_offset), daemon=True).start()
     threading.Thread(target=usage_poll_loop,        args=(usage, subs, names),               daemon=True).start()
     threading.Thread(target=concurrency_check_loop, args=(usage, subs, names),               daemon=True).start()
 

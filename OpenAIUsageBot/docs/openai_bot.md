@@ -332,8 +332,10 @@ fires at most once per UTC day.
 
 #### What a mass throttle does
 
-`_mass_seal_track(track)` runs inline (blocks the poll thread ~30–50 s) and holds
-the global `_SEAL_LOCK` for its whole duration so no other seal/unseal can interleave.
+`_mass_seal_track(track)` runs under a single global busy claim so no other
+seal/unseal can interleave. Auto-sweep & day-rollover restore run inline in the
+poll thread; manual archive ops run in a background worker thread (see "Race
+safety" below).
 
 1. Marks the track in `mass_sealed_tracks` (auto-sweep idempotency).
 2. Broadcasts a concise "begin sealing…" banner.
@@ -343,14 +345,50 @@ the global `_SEAL_LOCK` for its whole duration so no other seal/unseal can inter
 
 Inter-POST spacing is 50 ms (bulk writes without spacing occasionally don't persist on the API side).
 
-#### Race safety — the seal lock
+#### Race safety — atomic busy claim + background workers
 
-Every operation that mutates rate limits — the auto-sweep, manual button actions,
-and the midnight restore — acquires `_SEAL_LOCK`. The boolean `_SEAL_BUSY` lets the
-Telegram callback handler **refuse** a button press while an operation is running
-("A seal/unseal is already running — try again shortly.") rather than blocking the
-thread. This closes the race where a user clicks seal/unseal during the auto-sweep
-or day-rollover restore.
+Every operation that mutates rate limits — the auto 95% sweep, the day-rollover
+restore, and every manual button action — passes through one atomic check-and-set
+called `_try_claim_busy()`. Only one operation can hold the claim at a time; every
+caller MUST `_release_busy()` in a `finally`. This is intentionally **not** a
+blocking lock — callers that cannot claim the flag bail out instead of waiting:
+
+- **Manual button click** (Telegram callback) — refuses immediately with a small
+  toast: *"A seal/unseal is already running — try again shortly."* The user can
+  click again once the in-flight operation finishes.
+- **Auto 95% sweep** (poll loop) — defers silently and logs `mass-seal deferred`.
+  The next poll re-checks the threshold and retries; since consumption only
+  grows, the trigger condition won't disappear.
+- **Day-rollover restore** (poll loop) — defers silently and logs
+  `pending-track-unseal deferred`. The pending queue is persisted, so the next
+  poll picks up where this one left off.
+
+Manual button operations are additionally **dispatched to a daemon worker thread**
+so the Telegram poll loop is never blocked by a 30-50 s mass sweep. The callback
+acknowledges immediately with a placeholder ("🔄 Working — watch chat for
+progress…") and the worker edits the message again when the API work completes.
+This closes two prior bugs:
+
+1. **TOCTOU race** — the old code read `_SEAL_BUSY` *without* the lock, then
+   `with _SEAL_LOCK:` inside the heavy function. A click between check and acquire
+   would block the Telegram thread for the duration of the running sweep.
+2. **Poll-thread freeze** — the old design ran the seal inline. A mass-seal would
+   freeze every other Telegram command for 30-50 s.
+
+#### Callback input validation
+
+`handle_archive_callback` validates every field of the `arch:<action>:<mode>:<pidx>`
+payload against an enum set before using it:
+
+- `action` ∈ `{cancel, menu, seal, unseal}` — anything else returns "Unknown action."
+- `mode`   ∈ `{-, normal, premium, both}` — anything else returns "Unknown mode."
+- `pidx`   — must be `"-"`, `"all"`, or a valid index into `_PROJECT_INDEX`.
+  Out-of-bounds or non-numeric returns "Unknown project." and releases the busy
+  claim that was just taken.
+
+This is defence-in-depth: Telegram already restricts the keyboard to bot-emitted
+buttons, but a forged callback (e.g. from a compromised account) cannot trigger a
+seal on an unknown project or with an unknown mode.
 
 #### Soft-skip error codes
 
@@ -399,7 +437,7 @@ project (immune to the 0/0 cascade that bricked projects in an earlier version).
 `UsageStore.update()` and `__init__()` detect date changes and call
 `_reset_daily_state_locked()`, which moves `sealed_tracks` → `pending_track_unseal`,
 clears `mass_sealed_tracks` and `track_exemptions`. The next poll calls
-`_process_pending_track_unseals()` (under `_SEAL_LOCK`) to drain the queue —
+`_process_pending_track_unseals()` (gated by the busy claim) to drain the queue —
 restoring every project to the canonical baseline. Failures stay queued and retry
 on subsequent polls, so a midnight outage never leaves anything throttled forever.
 
@@ -434,7 +472,7 @@ The legacy per-project-full-seal fields (`sealed_projects`, `pending_unseal`,
 
 - **Detection latency**: up to one poll cycle (30 min passive, 3–10 min urgent). Normal crossing ~9M flips mode to urgent so the 95% trigger is caught quickly.
 - **Per-project throttle cost**: ~50–80 track rows × ~50 ms ≈ a few seconds per project per track.
-- **Full mass sweep**: 13 projects ≈ ~50 s for one track. Poll thread blocks; the Telegram thread stays responsive and refuses concurrent button presses via `_SEAL_BUSY`.
+- **Full mass sweep**: 13 projects ≈ ~50 s for one track. Auto-sweep & midnight restore block the **poll** thread for that duration (it has nothing else to do); manual button-driven sweeps run in a daemon worker thread so the Telegram poll thread stays free for other commands.
 - **Inflight window**: a brief gap between detection and full throttle where running requests complete. Unavoidable, bounded by the sweep wall-time.
 
 ---
@@ -574,7 +612,9 @@ On startup the bot:
 - **Usage lag** — OpenAI usage data has a ~5–15 minute ingestion delay. Not real-time.
 - **Cost API same-day 400** — If `start_time == end_time` the costs API returns 400 even when `end_ts > start_ts`. `today_window_costs()` sets `end_time` to tomorrow midnight as a workaround.
 - **Thread resilience** — All `requests` calls are wrapped in `try/except`. Network errors log a line and return empty; they do not kill the thread. `usage_poll_loop` body itself is wrapped so any unexpected exception just logs and retries after the normal sleep.
-- **Telegram offset** — `telegram_poll_loop` advances `offset` before handling each update. A crash mid-handler never causes a message to be re-processed.
+- **Telegram offset** — `telegram_poll_loop` advances `offset` before handling each update. A crash mid-handler never causes a message to be re-processed. On startup, `_discard_pending_updates()` runs once to drop any updates that piled up while the bot was offline — without this, stale archive button clicks from before the restart could re-fire a real seal/unseal.
+- **Atomic state writes** — every JSON store (`usage_state.json`, `subscribers.json`, `names.json`) writes via `_atomic_write_json`: write to a `.tmp`, `fsync`, then `os.replace`. A crash mid-write leaves either the old file intact or the new file complete — never a half-written file. If a corrupt state file is found on load it is moved to `<path>.corrupt-<ts>` (loud warning to logs) instead of silently wiped, so the operator can inspect it.
+- **HTML injection in display names** — `NameStore.set()` runs the name through `html.escape()` and caps to 48 chars. Names are interpolated into many Telegram-HTML messages; without escaping, a `setname </b><a href='...'>` would break the rendering of every subsequent broadcast.
 - **UTC alignment** — All dates use UTC. If running in Vietnam (UTC+7), "today" in UTC starts 7 hours behind local midnight. This matches OpenAI's billing day.
 - **Aggressive mode no-cooldown** — Overcap active-project broadcasts fire every poll (3–10 min) with no cooldown by design. This is intentional: the situation is a financial emergency and the team must be continuously reminded until action is taken.
 - **Concurrency loop is independent** — `concurrency_check_loop` runs every 5 minutes regardless of the current poll mode. It has its own 15-minute cooldown and is a separate concern from budget caps. On API failure it preserves the last known active-projects snapshot instead of overwriting with `{}`, so a brief network blip doesn't make the `/active` command show "no activity" misleadingly.
