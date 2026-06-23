@@ -286,12 +286,40 @@ Monarch Bach — the treasury is bleeding. Your command is required at once.
 When both caps are exceeded the entry shows a combined breakdown
 (e.g. `7 normal + 3 premium reqs`).
 
-### 7.5 Daily Spend Alerts
-**Status: Not implemented.**
+### 7.5 Daily Spend Alerts & Off-Watchlist Anomaly Detection
 
-There is no spend-alert code path. The `DAILY_LIMIT` constant ($5.00) is shown for
-reference in usage reports only. (The earlier `alert_sent` / `spend_intervals_notified`
-state fields were removed as dead code.)
+The token-milestone path (§7.2, §7.3) covers OpenAI's **two free-tier model lists** only.
+Models outside those lists — embeddings, image generation, audio, fine-tuned models,
+gpt-3.5 — bill at **standard rates from the first token** and are deliberately untouched
+by `_track_for_model()` / the seal logic. A real incident in 2026 had $6 of embedding
+spend go undetected this way (caught only when the wallet emptied). The spend-monitoring
+layer closes that gap.
+
+Three independent dimensions, all alarm-only (no auto-seal — see §7.5 note below):
+
+| Dimension | Thresholds | Dedup unit | Source |
+|---|---|---|---|
+| **Org-wide cumulative spend** | $0.10 / $0.50 / $1.00 / $1.50 / $2.00 (= `DAILY_LIMIT`) | per-threshold per-day | `_fetch_costs()` summed |
+| **Per-project spend** | $0.25 / $0.50 / $1.00 | per-(pid, threshold) per-day | `_fetch_costs()` by project |
+| **Unlisted-model first-touch** | any non-zero usage | per-(pid, model) per-day | `_fetch_tokens()` model breakdown |
+
+**Cap behaviour** — when the org total first crosses `DAILY_LIMIT` ($2/day), the bot:
+- broadcasts the cap milestone alert,
+- flips to **AGGRESSIVE** mode (3-min polling) so subsequent spend is caught fast,
+- does **NOT** auto-mass-seal. Reason: unlisted models (the likely culprit, since the
+  token-cap auto-seal already covers listed models) bypass the seal logic by design.
+  An auto-seal at the spend cap would throttle legitimate listed-model use without
+  stopping the actual leak. Manual `@bot archive seal both ALL` is one click away.
+
+**Seed-on-first-poll** — `seed_spend()` runs once per UTC day (atomic via
+`claim_spend_seed()`). On bot restart mid-day it marks every already-crossed threshold
+as notified — silent — then fires ONE catch-up broadcast for the highest crossed level.
+Same pattern as token `seed_milestones()`. Prevents the "$1.50 already? fire all five
+back-to-back" restart flood.
+
+**Cost-fetch latency** — OpenAI's `costs` endpoint has a 5–10 min ingestion lag. Spend
+alerts may arrive that delayed, but that's far better than the previous "wait until the
+wallet is empty" detection window.
 
 ### 7.6 Concurrent Project Alerts
 **Condition:** ≥ 3 projects active simultaneously in the last 5 minutes.
@@ -545,6 +573,10 @@ Fields preserved across snapshot updates (not overwritten by each poll):
 | `mass_sealed_tracks` | list | tracks whose 95% auto-sweep has fired today (auto-trigger idempotency) |
 | `track_exemptions` | dict | pid → list of tracks manually unsealed today; the auto-sweep skips these |
 | `pending_track_unseal` | dict | track → {originals_by_project}. Populated by day rollover from `sealed_tracks`, drained next poll |
+| `spend_milestones_notified` | list[float] | Org-wide $ thresholds already alerted today (§7.5) |
+| `project_spend_notified` | dict | pid → list[float]: per-project $ thresholds already alerted today |
+| `unlisted_models_alerted` | dict | pid → list[model]: (pid, model) pairs that already fired the first-touch off-watchlist alert today |
+| `spend_seeded` | bool | True after first-poll spend seed runs; same race guard as `milestones_seeded` |
 
 All fields reset at UTC midnight. Two reset paths, both internal:
 

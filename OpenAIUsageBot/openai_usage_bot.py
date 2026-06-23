@@ -45,18 +45,43 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-05-31"
+BOT_UPDATED = "2026-06-07"
 BOT_CHANGES = (
-    "Security pass: atomic busy-claim closes the seal/unseal TOCTOU race",
-    "Manual seal/unseal now runs in a background worker — Telegram never freezes",
-    "HTML-escape display names; atomic state writes; corrupt-state quarantine",
-    "Discard pending Telegram updates on startup (no stale button replay)",
+    "Spend monitoring: org milestones, per-project, unlisted-model anomaly alert",
+    "Daily spend cap tightened from $5 → $2/day",
+    "Embeddings / image / audio / fine-tune use now alerts on first request",
+    "Cap crossed → AGGRESSIVE polling (no auto-seal — unlisted models bypass it)",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
 BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID          = os.environ.get("TELEGRAM_CHAT_ID", "")
-DAILY_LIMIT      = 5.00   # reference daily-spend figure shown in reports
+DAILY_LIMIT      = 2.00   # daily-spend hard cap (USD); $0 in 2026 was the goal,
+                          # but unlisted-model usage (embeddings, audio, image, etc.)
+                          # bills from token 1 so we treat $2 as the "alarm-out-loud" line.
+
+# ── Spend monitoring (org-wide + per-project + unlisted-model anomaly) ──────
+# The bot was originally token-only. An incident — $6 of embedding usage went
+# undetected because embeddings aren't in either free-tier watchlist — exposed
+# the gap: any unlisted model spends from token 1 with no token-milestone, no
+# overcap alarm, no rate-limit seal trigger. Spend monitoring closes the gap.
+#
+# Three independent layers, all alarm-only (no auto-seal): unlisted models are
+# the likely culprits and they bypass the seal logic by design, so an auto-seal
+# would be cosmetic. The user retains manual `archive seal` to stop the bleed.
+SPEND_MILESTONES = [
+    (0.10, "casual"),   # first $0.10 — early ack
+    (0.50, "casual"),   # quarter of cap
+    (1.00, "urgent"),   # half of cap — pay attention
+    (1.50, "urgent"),   # 75% of cap — last warning
+    (2.00, "cap"),      # = DAILY_LIMIT — flip to AGGRESSIVE mode
+]
+PROJECT_SPEND_THRESHOLDS = (0.25, 0.50, 1.00)   # per-project (USD)
+
+# Unlisted-model alert: any non-zero usage of a model that isn't in either
+# free-tier watchlist fires once per (project, model) per day. Catches the
+# embedding/image/audio/fine-tune classes that the token-milestone path misses.
+UNLISTED_MODEL_MIN_REQUESTS = 1   # alert from the first request
 # ── Polling intervals ───────────────────────────────────────────────────────
 # Passive mode: long polling, exponential backoff on consecutive failures.
 # POLL_INTERVAL_MINS env var sets the passive baseline (default 30 min).
@@ -313,8 +338,9 @@ def _openai_headers() -> dict:
     return {"Authorization": f"Bearer {OPENAI_ADMIN_KEY}"}
 
 
-def _fetch_costs() -> dict[str, float]:
-    """Today's cost per project. '__org__' key holds any unattributed org-level cost."""
+def _fetch_costs() -> Optional[dict[str, float]]:
+    """Today's cost per project. '__org__' key holds any unattributed org-level cost.
+    Returns None on API failure (distinguished from {} = no spend today)."""
     start, end = today_window_costs()
     params = [
         ("start_time",   start),
@@ -325,6 +351,7 @@ def _fetch_costs() -> dict[str, float]:
     ]
     costs: dict[str, float] = {}
     page = None
+    fetched_any_page = False
     while True:
         p = list(params)
         if page:
@@ -333,10 +360,11 @@ def _fetch_costs() -> dict[str, float]:
             r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             print(f"[openai costs network error] {e}")
-            break
+            return None if not fetched_any_page else costs
         if not r.ok:
             print(f"[openai costs {r.status_code}] {r.text[:500]}")
-            break
+            return None if not fetched_any_page else costs
+        fetched_any_page = True
         data = r.json()
         for bucket in data.get("data", []):
             for result in bucket.get("results", []):
@@ -351,8 +379,11 @@ def _fetch_costs() -> dict[str, float]:
     return costs
 
 
-def _fetch_tokens() -> dict[str, dict]:
-    """Today's token usage per project, broken down by model and band."""
+def _fetch_tokens() -> Optional[dict[str, dict]]:
+    """Today's token usage per project, broken down by model and band.
+    Returns None on API failure (distinguished from {} = no usage today). The
+    distinction matters: empty-day must NOT block polling — that creates a window
+    where the first request of the day goes undetected."""
     start, end = today_window()
     params = [
         ("start_time",   start),
@@ -364,6 +395,7 @@ def _fetch_tokens() -> dict[str, dict]:
     ]
     tokens: dict[str, dict] = {}
     page = None
+    fetched_any_page = False
     while True:
         p = list(params)
         if page:
@@ -372,10 +404,11 @@ def _fetch_tokens() -> dict[str, dict]:
             r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             print(f"[openai usage network error] {e}")
-            break
+            return None if not fetched_any_page else tokens
         if not r.ok:
             print(f"[openai usage {r.status_code}] {r.text[:500]}")
-            break
+            return None if not fetched_any_page else tokens
+        fetched_any_page = True
         data = r.json()
         for bucket in data.get("data", []):
             for result in bucket.get("results", []):
@@ -698,10 +731,14 @@ def _fetch_recent_data(days: int = 31) -> dict:
 
 
 def fetch_today_usage() -> Optional[dict]:
-    """Tokens-only poll — no cost fetch (costs API is unreliable for frequent polling)."""
+    """Tokens-only poll — no cost fetch (costs API is unreliable for frequent polling).
+    Returns None only on actual API failure. An empty `tokens` dict (no usage yet today)
+    yields a valid snap with an empty `projects` map — so the bot stays in its normal
+    poll cadence and catches the first request the moment it appears, instead of
+    sitting in backoff for hours on a quiet day."""
     tokens = _fetch_tokens()
-    if not tokens:
-        return None
+    if tokens is None:
+        return None   # API genuinely failed
     projects: dict[str, dict] = {}
     for pid, tok in tokens.items():
         projects[pid] = {
@@ -728,13 +765,13 @@ def fetch_today_usage() -> Optional[dict]:
 
 
 def _enrich_costs(snap: dict, usage: "UsageStore" = None, live: bool = True) -> dict:
-    """Overlay costs onto a snapshot copy.
-    Tries a live fetch first (when live=True). On success, writes to usage cache.
-    Falls back to cached costs from usage store if live fetch fails or live=False."""
+    """Overlay costs onto a snapshot copy. costs=None means "API failure" — fall
+    back to cache. costs={} means "successful fetch, no spend yet" — overlay zeros
+    cleanly. Critical for matching the poll loop's empty-day handling."""
     import copy
     snap  = copy.deepcopy(snap)
     costs = _fetch_costs() if live else None
-    if costs:
+    if costs is not None:
         org_cost = costs.pop("__org__", 0.0)
         for pid, p in snap.get("projects", {}).items():
             p["cost_usd"] = round(costs.get(pid, 0.0), 6)
@@ -787,6 +824,16 @@ class UsageStore:
         "mass_sealed_tracks",
         "pending_track_unseal",
         "track_exemptions",
+        # spend monitoring (anomaly-detection layer that catches unlisted-model spend):
+        #   spend_milestones_notified — org-wide $ thresholds already alerted today
+        #   project_spend_notified    — {pid: [thresholds]} per-project $ thresholds
+        #   unlisted_models_alerted   — {pid: [model]} (pid, model) pairs already alerted
+        #                                today; prevents re-spam every poll
+        #   spend_seeded              — True after the first-poll spend seed runs
+        "spend_milestones_notified",
+        "project_spend_notified",
+        "unlisted_models_alerted",
+        "spend_seeded",
     )
 
     def __init__(self, path: Path):
@@ -854,6 +901,11 @@ class UsageStore:
         self._data["mass_sealed_tracks"]          = []
         self._data["track_exemptions"]            = {}
         self._data["pending_track_unseal"]        = p_tracks
+        # spend monitoring — fresh slate per UTC day
+        self._data["spend_milestones_notified"]   = []
+        self._data["project_spend_notified"]      = {}
+        self._data["unlisted_models_alerted"]     = {}
+        self._data["spend_seeded"]                = False
         # Drop fields retired in earlier versions
         for legacy in ("manually_unsealed_today", "sealed_projects", "pending_unseal",
                        "alert_sent", "spend_intervals_notified"):
@@ -1100,6 +1152,57 @@ class UsageStore:
                 if not exemptions[pid]:
                     exemptions.pop(pid, None)
             self._save()
+
+    # ── Spend monitoring (org-wide + per-project + unlisted-model dedup) ───
+    def get_spend_milestones_notified(self) -> set:
+        with self._lock:
+            return set(self._data.get("spend_milestones_notified", []))
+
+    def add_spend_milestone_notified(self, threshold: float) -> None:
+        with self._lock:
+            ms = self._data.setdefault("spend_milestones_notified", [])
+            if threshold not in ms:
+                ms.append(threshold)
+            self._save()
+
+    def get_project_spend_notified(self, pid: str) -> set:
+        with self._lock:
+            return set(self._data.get("project_spend_notified", {}).get(pid, []))
+
+    def add_project_spend_notified(self, pid: str, threshold: float) -> None:
+        with self._lock:
+            psn = self._data.setdefault("project_spend_notified", {})
+            lst = psn.setdefault(pid, [])
+            if threshold not in lst:
+                lst.append(threshold)
+            self._save()
+
+    def is_unlisted_alerted(self, pid: str, model: str) -> bool:
+        with self._lock:
+            return model in self._data.get("unlisted_models_alerted", {}).get(pid, [])
+
+    def mark_unlisted_alerted(self, pid: str, model: str) -> None:
+        with self._lock:
+            uma = self._data.setdefault("unlisted_models_alerted", {})
+            lst = uma.setdefault(pid, [])
+            if model not in lst:
+                lst.append(model)
+            self._save()
+
+    def claim_spend_seed(self) -> bool:
+        """Atomic: returns True only for the unique caller that flips spend_seeded.
+        Same pattern as `seed_state()` — closes the poll/refresh race on
+        first-of-day spend seeding."""
+        with self._lock:
+            if self._data.get("spend_seeded", False):
+                return False
+            self._data["spend_seeded"] = True
+            self._save()
+            return True
+
+    def has_spend_seeded(self) -> bool:
+        with self._lock:
+            return self._data.get("spend_seeded", False)
 
     # ── Pending track unseal queue (day-rollover restore) ──────────────────
     def get_pending_track_unseal(self) -> dict:
@@ -1988,6 +2091,160 @@ def seed_milestones(snap: dict, usage: UsageStore,
         _broadcast(lambda n, t=t, c=total_premium, l=l: fmt_premium_token_milestone(t, c, l, n), subs, names)
 
 
+def fmt_spend_milestone(threshold: float, current: float, level: str, name: str = "Bach") -> str:
+    """Org-wide cumulative spend milestone."""
+    if level == "casual":
+        return (
+            f"💰 <b>Spend Milestone — ${threshold:.2f}</b>\n\n"
+            f"Cumulative outlay today: <b>${current:.4f}</b> of ${DAILY_LIMIT:.2f}.\n"
+            f"<i>The treasury is monitored, Monarch {name}.</i>"
+        )
+    if level == "urgent":
+        return (
+            f"⚠️ <b>Significant Spend — ${threshold:.2f}</b>\n\n"
+            f"Today's expenditure stands at <b>${current:.4f}</b> of ${DAILY_LIMIT:.2f}.\n"
+            f"The daily cap is approaching. Your attention is advised, My Liege {name}."
+        )
+    # cap (DAILY_LIMIT)
+    return (
+        f"🚨 <b>Daily Spend Cap Breached — ${current:.4f}</b>\n\n"
+        f"The ${DAILY_LIMIT:.2f} daily expenditure cap has been crossed.\n"
+        f"Polling escalated to <b>AGGRESSIVE</b>. Use <code>@bot archive</code> to seal "
+        f"projects manually — note that unlisted models (embeddings, image, audio, etc.) "
+        f"bypass the seal logic and must be stopped at the source.\n\n"
+        f"Monarch {name}, the operation demands your command."
+    )
+
+
+def fmt_project_spend(pid: str, threshold: float, current: float, name: str = "Bach") -> str:
+    proj = KNOWN_PROJECTS.get(pid, pid)
+    return (
+        f"💸 <b>Project Spend — {proj}</b>\n\n"
+        f"<b>{proj}</b> has crossed <b>${threshold:.2f}</b> today (now ${current:.4f}).\n"
+        f"<i>Single-project anomaly threshold tripped. The wallet is watched, Monarch {name}.</i>"
+    )
+
+
+def fmt_unlisted_model(pid: str, model: str, requests: int, tokens: int,
+                       cost: float, name: str = "Bach") -> str:
+    """Alert for first-touch of a model not in either free-tier watchlist.
+    These bill at standard rates from token 1 and are NOT throttled by the seal
+    logic. Embeddings, image gen, audio, fine-tuned models, gpt-3.5, etc."""
+    proj = KNOWN_PROJECTS.get(pid, pid)
+    cost_str = f"  •  <b>${cost:.4f}</b>" if cost > 0 else ""
+    return (
+        f"🟠 <b>Unlisted Model Activity — Off-Watchlist Spend</b>\n\n"
+        f"Project: <b>{proj}</b>\n"
+        f"Model:   <code>{model}</code>  (not on either free-tier list)\n"
+        f"Usage:   {requests:,} req  •  {_fmt_tokens(tokens)} tok{cost_str}\n\n"
+        f"This model bills at <b>standard rates from the first token</b> and is "
+        f"<b>NOT</b> touched by the seal logic. If the request was not authorised, "
+        f"halt the source process — this bot cannot throttle off-watchlist models.\n"
+        f"<i>One alert per (project, model) per day. Monarch {name}, the off-list "
+        f"ledger has shifted.</i>"
+    )
+
+
+def check_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
+                names: NameStore = None) -> tuple[bool, bool]:
+    """Fire alerts for newly crossed org-wide spend milestones AND per-project
+    spend thresholds. Returns (any_milestone_hit, cap_crossed).
+    `cap_crossed` is True the FIRST poll that observes total ≥ DAILY_LIMIT
+    (after that, the milestone is in the notified set and won't re-fire).
+    Cost data has a 5-10 min OpenAI ingestion lag — alerts may arrive slightly
+    delayed, but that's still vastly better than the previous "never" state."""
+    total_cost = snap.get("total_cost", 0.0) or 0.0
+    hit = False
+    cap_crossed = False
+
+    # ── Org-wide spend milestones ───────────────────────────────────────────
+    notified = usage.get_spend_milestones_notified()
+    for threshold, level in SPEND_MILESTONES:
+        if total_cost >= threshold and threshold not in notified:
+            hit = True
+            usage.add_spend_milestone_notified(threshold)
+            _broadcast(lambda n, t=threshold, c=total_cost, l=level:
+                fmt_spend_milestone(t, c, l, n), subs, names)
+            if level == "cap":
+                cap_crossed = True
+
+    # ── Per-project spend thresholds ────────────────────────────────────────
+    for pid, p in snap.get("projects", {}).items():
+        cost = float(p.get("cost_usd", 0.0) or 0.0)
+        if cost <= 0:
+            continue
+        proj_notified = usage.get_project_spend_notified(pid)
+        for threshold in PROJECT_SPEND_THRESHOLDS:
+            if cost >= threshold and threshold not in proj_notified:
+                hit = True
+                usage.add_project_spend_notified(pid, threshold)
+                _broadcast(lambda n, p=pid, t=threshold, c=cost:
+                    fmt_project_spend(p, t, c, n), subs, names)
+
+    return hit, cap_crossed
+
+
+def check_unlisted_models(snap: dict, usage: UsageStore, subs: SubscriberStore,
+                          names: NameStore = None) -> bool:
+    """Fire one alert per (project, model) per day when a project uses any model
+    not on either free-tier watchlist. These bypass the token-milestone, overcap,
+    and seal logic — they're the path the $6 embedding incident took. Returns
+    True if any new alert fired."""
+    fired = False
+    for pid, p in snap.get("projects", {}).items():
+        models  = p.get("models", {})
+        p_cost  = float(p.get("cost_usd", 0.0) or 0.0)
+        # Apportion cost to unlisted models by share of total tokens (rough but
+        # better than reporting nothing). If no listed-model usage exists, the
+        # entire project cost belongs to unlisted models.
+        total_tok = sum(m.get("input", 0) + m.get("output", 0) for m in models.values()) or 1
+        for model, m in models.items():
+            if _track_for_model(model) is not None:
+                continue   # listed model — covered by token-milestone path
+            reqs = m.get("requests", 0)
+            tok  = m.get("input", 0) + m.get("output", 0)
+            if reqs < UNLISTED_MODEL_MIN_REQUESTS and tok == 0:
+                continue
+            if usage.is_unlisted_alerted(pid, model):
+                continue
+            est_cost = p_cost * (tok / total_tok) if p_cost > 0 and tok > 0 else 0.0
+            usage.mark_unlisted_alerted(pid, model)
+            _broadcast(lambda n, pi=pid, mo=model, r=reqs, t=tok, c=est_cost:
+                fmt_unlisted_model(pi, mo, r, t, c, n), subs, names)
+            fired = True
+            print(f"[unlisted-alert] {KNOWN_PROJECTS.get(pid, pid)}/{model} "
+                  f"reqs={reqs} tok={tok} est_cost=${est_cost:.4f}")
+    return fired
+
+
+def seed_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
+               names: NameStore = None) -> None:
+    """First-of-day spend seed: mark every already-crossed threshold as notified
+    so we don't flood the chat on bot restart, but fire the HIGHEST one as a
+    catch-up so the user sees today's true position. Atomic via claim_spend_seed."""
+    if not usage.claim_spend_seed():
+        return
+
+    total_cost = snap.get("total_cost", 0.0) or 0.0
+
+    # Mark every crossed org threshold as notified — silent — then fire only the
+    # highest as a catch-up broadcast (mirrors token seed_milestones pattern).
+    crossed = [(t, l) for t, l in SPEND_MILESTONES if total_cost >= t]
+    for t, _ in crossed:
+        usage.add_spend_milestone_notified(t)
+    if crossed and subs:
+        t, l = crossed[-1]
+        _broadcast(lambda n, t=t, c=total_cost, l=l: fmt_spend_milestone(t, c, l, n),
+                   subs, names)
+
+    # Per-project: mark crossed silently (no catch-up broadcast — could be many).
+    for pid, p in snap.get("projects", {}).items():
+        cost = float(p.get("cost_usd", 0.0) or 0.0)
+        for t in PROJECT_SPEND_THRESHOLDS:
+            if cost >= t:
+                usage.add_project_spend_notified(pid, t)
+
+
 def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> bool:
     """Called after every non-seed poll. Fires alerts for newly crossed thresholds.
     Returns True if at least one new milestone was hit (used to trigger urgent mode)."""
@@ -2393,9 +2650,23 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
             new_milestone = check_milestones(snap, usage, subs, names)
         enriched      = _enrich_costs(snap, usage)
         total         = enriched.get("total_cost", 0.0)
+        # Propagate the live cost back onto the snap so spend checks see fresh data
+        # (snap from fetch_today_usage() has total_cost=0.0 — costs are overlaid here).
+        snap["total_cost"] = total
+        for pid, p in enriched.get("projects", {}).items():
+            if pid in snap.get("projects", {}):
+                snap["projects"][pid]["cost_usd"] = p.get("cost_usd", 0.0)
         total_tok     = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
         total_premium = snap.get("total_premium_tokens", 0)
         total_normal  = snap.get("total_normal_tokens",  0)
+
+        # Spend monitoring on demand — same path as the poll loop.
+        if not usage.has_spend_seeded():
+            seed_spend(snap, usage, subs, names)
+            new_spend, spend_cap_crossed = False, False
+        else:
+            new_spend, spend_cap_crossed = check_spend(snap, usage, subs, names)
+        check_unlisted_models(snap, usage, subs, names)
 
         mode             = usage.get_mode()
         mode_note        = ""
@@ -2427,7 +2698,10 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
                     mode_note = "\n🔴 <b>AGGRESSIVE mode active — exempt projects burning the exhausted band, broadcast sent.</b>"
                 else:
                     mode_note = "\n⚠️ Budget cap exceeded — no projects active on the exhausted band right now."
-        elif new_milestone and mode == "passive":
+        elif spend_cap_crossed:
+            usage.set_mode("aggressive")
+            mode_note = f"\n🔴 <b>Spend cap (${DAILY_LIMIT:.2f}) crossed — AGGRESSIVE mode.</b>"
+        elif (new_milestone or new_spend) and mode == "passive":
             usage.set_mode("urgent")
             usage.set_last_milestone_ts(time.time())
             mode_note = "\n📊 Milestone crossed — switched to <b>URGENT</b> polling mode."
@@ -2725,16 +2999,22 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
     while True:
         try:
             snap = fetch_today_usage()
-            if snap:
-                # Overlay costs; fall back to cache on failure.
+            if snap is not None:
+                # Costs API may return:
+                #   None — actual failure → fall back to cached costs (don't zero them)
+                #   {}   — no spend today → real zero (DON'T fall back to cache, or
+                #          we'd never see the day's spend drop to zero at rollover)
+                # The distinction is what catches off-watchlist anomalies cleanly.
                 costs    = _fetch_costs()
                 org_cost = 0.0
-                if costs:
+                if costs is not None:
+                    # Successful fetch (may be empty)
                     org_cost = costs.pop("__org__", 0.0)
                     for pid, p in snap.get("projects", {}).items():
                         p["cost_usd"] = round(costs.get(pid, 0.0), 6)
                     snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
                 else:
+                    # API failure — preserve last known cost picture
                     cached_costs = usage.get_costs_cache()
                     if cached_costs:
                         per_proj = cached_costs.get("per_project", {})
@@ -2743,7 +3023,7 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                         snap["total_cost"] = cached_costs.get("total", 0.0)
 
                 usage.update(snap)   # auto-resets daily state on day rollover
-                if costs:
+                if costs is not None:
                     usage.update_costs(costs, snap["total_cost"], org_cost)
 
                 # If yesterday's sealed tracks were just moved to pending_track_unseal
@@ -2773,6 +3053,17 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                             print("[mode] → URGENT (milestone crossed)")
                         usage.set_last_milestone_ts(time.time())
 
+                # ── Spend monitoring (org + per-project + unlisted-model anomaly) ──
+                # Independent of token-cap path. Catches embedding/image/audio/
+                # fine-tune spend that the token watchlist misses.
+                if not usage.has_spend_seeded():
+                    seed_spend(snap, usage, subs, names)
+                    print("[poll] Spend seeded — already-crossed thresholds notified silently")
+                    new_spend, spend_cap_crossed = False, False
+                else:
+                    new_spend, spend_cap_crossed = check_spend(snap, usage, subs, names)
+                check_unlisted_models(snap, usage, subs, names)
+
                 # ── Track-level mass throttle (preventive, at 95% utilisation) ──
                 # Each track is independent and idempotent via the per-day mass_sealed
                 # flag — once the sweep has fired for a track today, it won't re-fire.
@@ -2788,6 +3079,20 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
 
                 if normal_exceeded or premium_exceeded:
                     _handle_overcap(usage, subs, names, normal_exceeded, premium_exceeded)
+                elif spend_cap_crossed:
+                    # Dollar cap reached but no token cap — flip to AGGRESSIVE so
+                    # the user gets fast polling + visible mode badge until they act.
+                    usage.set_mode("aggressive")
+                    print("[mode] → AGGRESSIVE (spend cap crossed)")
+                elif new_spend:
+                    mode = usage.get_mode()
+                    if mode == "passive":
+                        usage.set_mode("urgent")
+                        usage.set_last_milestone_ts(time.time())
+                        print("[mode] → URGENT (spend milestone crossed)")
+                    elif mode == "urgent":
+                        usage.reset_urgent_step()
+                        usage.set_last_milestone_ts(time.time())
                 else:
                     mode = usage.get_mode()
                     if mode == "urgent":
