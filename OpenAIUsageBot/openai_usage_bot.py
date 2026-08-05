@@ -18,6 +18,7 @@ import calendar
 import html
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -45,12 +46,12 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-06-07"
+BOT_UPDATED = "2026-08-05"
 BOT_CHANGES = (
-    "Spend monitoring: org milestones, per-project, unlisted-model anomaly alert",
-    "Daily spend cap tightened from $5 → $2/day",
-    "Embeddings / image / audio / fine-tune use now alerts on first request",
-    "Cap crossed → AGGRESSIVE polling (no auto-seal — unlisted models bypass it)",
+    "Fixed: o1-pro / gpt-5.4-pro / *-tts / *-transcribe no longer count as free-tier",
+    "Strict matching: only exact names or dated snapshots inherit a track",
+    "Overcap escalation: new alert every extra $0.50 past the $2 cap",
+    "Fixed: spend-cap AGGRESSIVE mode now holds until midnight (was 1 poll)",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -77,6 +78,13 @@ SPEND_MILESTONES = [
     (2.00, "cap"),      # = DAILY_LIMIT — flip to AGGRESSIVE mode
 ]
 PROJECT_SPEND_THRESHOLDS = (0.25, 0.50, 1.00)   # per-project (USD)
+
+# Past the cap, keep escalating: a fresh cap-level alert fires every extra
+# SPEND_OVERCAP_STEP dollars ($2.00, $2.50, $3.00, …). Without this the bot
+# alerts once at the cap and then goes silent no matter how far spend runs.
+# Keep the step at a binary-exact value (x.00 / x.50) — thresholds are stored
+# and compared as floats in the notified list.
+SPEND_OVERCAP_STEP = 0.50
 
 # Unlisted-model alert: any non-zero usage of a model that isn't in either
 # free-tier watchlist fires once per (project, model) per day. Catches the
@@ -221,7 +229,10 @@ OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 
 # ── Free-tier model classification (from OpenAI's free-usage page) ─────────
-# Match by prefix so date-suffixed variants ("gpt-4o-mini-2024-07-18") still classify.
+# Names must match EXACTLY or carry a date-stamp snapshot suffix
+# ("gpt-4o-mini-2024-07-18") — see _is_listed_variant. Same-prefix paid products
+# (o1-pro, gpt-5.4-pro, gpt-4o-mini-tts, …) are NOT free-tier and must classify
+# as unlisted so the anomaly alert fires.
 # Normal-band models share 10M tokens/day free:
 NORMAL_MODEL_PREFIXES = (
     "gpt-5.4-mini", "gpt-5.4-nano",
@@ -263,26 +274,46 @@ def _color(text: str, code: str) -> str:
 
 # ── Model band classifier ──────────────────────────────────────────────────
 
+# Suffix that marks a date-stamped snapshot of the SAME model (e.g.
+# "gpt-4o-mini-2024-07-18"). Only these variants inherit the base model's
+# free-tier classification.
+_SNAPSHOT_SUFFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _is_listed_variant(m: str, p: str) -> bool:
+    """True iff `m` IS the listed model `p`: exact name, or `p` plus a
+    date-stamp snapshot suffix. Any other suffix is a DIFFERENT paid product —
+    o1-pro ($150/$600!), gpt-5.4-pro, gpt-4o-mini-tts, gpt-4o-transcribe,
+    gpt-5.4-cyber, gpt-5.2-chat-latest, gpt-5-search-api all share a listed
+    prefix but bill at standard rates and are NOT covered by the free tier."""
+    if m == p:
+        return True
+    if not m.startswith(p + "-"):
+        return False
+    return bool(_SNAPSHOT_SUFFIX_RE.match(m[len(p) + 1:]))
+
+
 def _track_for_model(model: str) -> Optional[str]:
     """Return the free-tier track a model belongs to, or None if it's not on
     either of OpenAI's two daily-free-quota lists.
 
-    Strict match: a model `m` is in the track of prefix `p` iff `m == p` or
-    `m.startswith(p + "-")`. The trailing-hyphen guard stops the broad `gpt-5`
-    premium prefix from swallowing unrelated future models like `gpt-5.5-mini`
-    (which starts with `gpt-5.` not `gpt-5-`).
+    Strict match via _is_listed_variant: exact name or date-stamped snapshot
+    only. This is deliberately conservative — a misclassified-as-unlisted model
+    costs at most one noisy anomaly alert per day, while a misclassified-as-listed
+    model silently absorbs standard-rate spend into the "free" bucket (the o1-pro
+    failure mode: prefix-matched into premium, no alert, $150/1M input).
 
     Normal is checked first because its prefixes are more specific (e.g.
-    `gpt-5.4-mini` is a longer prefix than `gpt-5.4`). No heuristic fallback —
-    unlisted models (sora-2, babbage-002, chatgpt-image-latest, gpt-3.5-turbo, etc.)
-    return None and are NOT touched by seal/unseal and NOT counted toward the
-    1M / 10M track buckets. They're billed at standard rates anyway."""
+    `gpt-5.4-mini` before `gpt-5.4`). No heuristic fallback — unlisted models
+    (sora-2, babbage-002, gpt-3.5-turbo, embeddings, *-pro, *-tts, etc.) return
+    None: NOT touched by seal/unseal, NOT counted toward the 1M / 10M buckets,
+    and their first use today trips the off-watchlist anomaly alert."""
     m = model.lower()
     for p in NORMAL_MODEL_PREFIXES:
-        if m == p or m.startswith(p + "-"):
+        if _is_listed_variant(m, p):
             return "normal"
     for p in PREMIUM_MODEL_PREFIXES:
-        if m == p or m.startswith(p + "-"):
+        if _is_listed_variant(m, p):
             return "premium"
     return None
 
@@ -2168,6 +2199,21 @@ def check_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
             if level == "cap":
                 cap_crossed = True
 
+    # ── Overcap escalation — never go silent while the bleed continues ──────
+    # Every extra SPEND_OVERCAP_STEP past the cap fires another cap-level alert
+    # ($2.50, $3.00, …). Dynamic thresholds share the same notified list; they
+    # never collide with the static ones (all static thresholds ≤ DAILY_LIMIT).
+    if total_cost > DAILY_LIMIT:
+        steps = int((total_cost - DAILY_LIMIT) / SPEND_OVERCAP_STEP)
+        for i in range(1, steps + 1):
+            threshold = round(DAILY_LIMIT + i * SPEND_OVERCAP_STEP, 2)
+            if threshold not in notified:
+                hit = True
+                cap_crossed = True
+                usage.add_spend_milestone_notified(threshold)
+                _broadcast(lambda n, t=threshold, c=total_cost:
+                    fmt_spend_milestone(t, c, "cap", n), subs, names)
+
     # ── Per-project spend thresholds ────────────────────────────────────────
     for pid, p in snap.get("projects", {}).items():
         cost = float(p.get("cost_usd", 0.0) or 0.0)
@@ -2229,7 +2275,13 @@ def seed_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
 
     # Mark every crossed org threshold as notified — silent — then fire only the
     # highest as a catch-up broadcast (mirrors token seed_milestones pattern).
+    # Includes the dynamic overcap steps ($2.50, $3.00, …) so a restart at $3.40
+    # doesn't flood every step in one burst on the next poll.
     crossed = [(t, l) for t, l in SPEND_MILESTONES if total_cost >= t]
+    if total_cost > DAILY_LIMIT:
+        steps = int((total_cost - DAILY_LIMIT) / SPEND_OVERCAP_STEP)
+        for i in range(1, steps + 1):
+            crossed.append((round(DAILY_LIMIT + i * SPEND_OVERCAP_STEP, 2), "cap"))
     for t, _ in crossed:
         usage.add_spend_milestone_notified(t)
     if crossed and subs:
@@ -3101,9 +3153,17 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                             usage.set_mode("passive")
                             print("[mode] → PASSIVE (1 h without new milestone)")
                     elif mode == "aggressive":
-                        # Both caps cleared (likely day rollover handled by update())
-                        usage.set_mode("passive")
-                        print("[mode] → PASSIVE (caps no longer exceeded)")
+                        # Hold aggressive while the SPEND cap is still breached —
+                        # spend never decreases intraday, so this holds until the
+                        # midnight reset. Without this check, spend-cap aggressive
+                        # lasted exactly one poll (spend_cap_crossed only fires on
+                        # the first crossing) and the bot dozed off mid-emergency.
+                        if snap.get("total_cost", 0.0) >= DAILY_LIMIT:
+                            pass   # still bleeding — keep fast polling
+                        else:
+                            # Token caps cleared (day rollover) and spend under cap
+                            usage.set_mode("passive")
+                            print("[mode] → PASSIVE (caps no longer exceeded)")
 
                 fail_count = 0
             else:

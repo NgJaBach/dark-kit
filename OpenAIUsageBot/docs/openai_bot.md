@@ -137,17 +137,28 @@ Must use an **Admin API key** (`sk-admin-...`):
 Platform → Organization → API Keys → Create Admin Key
 
 ### Model classification
-`_is_premium_model(model)` in source is the single source of truth. Order of checks:
+`_track_for_model(model)` is the single source of truth: it returns `"normal"`,
+`"premium"`, or `None` (unlisted). A model matches a listed name only if it is:
 
-1. **Normal-band prefix match** (listed mini/nano variants) → normal.
-2. **`mini`/`nano` substring** anywhere in name → normal (catches unlisted future
-   variants like `gpt-5.5-mini`).
-3. Anything else → premium.
+1. the **exact name** (`gpt-4o-mini`, `o1`, `gpt-5-chat-latest`, …), or
+2. the name plus a **date-stamp snapshot suffix** (`gpt-4o-mini-2024-07-18`,
+   `gpt-4o-2024-08-06`) — recognised by `_is_listed_variant` via a `-YYYY-MM-DD`
+   regex.
 
-`PREMIUM_MODEL_PREFIXES` is kept in source as documentation of the listed premium models
-but is not consulted at runtime — the order above means premium status is the catch-all
-fallback. This is conservative for free-tier alerting (unknown full-size models count
-against the lower 1M cap rather than going untracked).
+**Any other suffix means a different paid product and classifies as `None`**:
+`o1-pro` ($150/$600 per 1M), `gpt-5.4-pro`, `gpt-5.2-pro`, `gpt-5-pro`, `o3-pro`,
+`gpt-4o-mini-tts`, `gpt-4o-transcribe`, `gpt-5.4-cyber`, `gpt-5.2-chat-latest`,
+`gpt-5-search-api`, etc. An earlier version used loose prefix matching
+(`m.startswith(p + "-")`), which silently counted `o1-pro` usage toward the
+premium free bucket — no anomaly alert, no standard-rate warning. The strict rule
+is deliberately conservative: misclassifying toward *unlisted* costs one anomaly
+alert per (project, model) per day, while misclassifying toward *listed* silently
+absorbs standard-rate spend into the "free" bucket.
+
+There is **no heuristic fallback**. Unlisted models are not counted toward either
+token bucket, are never touched by seal/unseal, and trip the off-watchlist
+anomaly alert (§7.5) on first use each day. Both prefix tuples must be re-checked
+against OpenAI's free-usage page whenever OpenAI updates the model lists.
 
 ---
 
@@ -305,11 +316,19 @@ Three independent dimensions, all alarm-only (no auto-seal — see §7.5 note be
 
 **Cap behaviour** — when the org total first crosses `DAILY_LIMIT` ($2/day), the bot:
 - broadcasts the cap milestone alert,
-- flips to **AGGRESSIVE** mode (3-min polling) so subsequent spend is caught fast,
+- flips to **AGGRESSIVE** mode (3-min polling) and **holds it while spend ≥ cap**
+  (spend never decreases intraday, so in practice until the midnight reset —
+  an earlier version reverted to passive on the very next poll),
 - does **NOT** auto-mass-seal. Reason: unlisted models (the likely culprit, since the
   token-cap auto-seal already covers listed models) bypass the seal logic by design.
   An auto-seal at the spend cap would throttle legitimate listed-model use without
   stopping the actual leak. Manual `@bot archive seal both ALL` is one click away.
+
+**Overcap escalation** — past the cap, a fresh cap-level alert fires every extra
+`SPEND_OVERCAP_STEP` ($0.50): at $2.50, $3.00, $3.50, … Dynamic thresholds share the
+same per-day notified list as the static ones, so each fires exactly once. `seed_spend()`
+marks already-crossed escalation steps silently on restart (one catch-up broadcast for
+the highest crossed level only). The bot is never silent while the bleed continues.
 
 **Seed-on-first-poll** — `seed_spend()` runs once per UTC day (atomic via
 `claim_spend_seed()`). On bot restart mid-day it marks every already-crossed threshold
@@ -545,6 +564,7 @@ Non-subscribed chats can only use `arise`. All other commands are silently ignor
 | minhphung-project | `proj_cEHeqXeLfsJ6jrQhOXDlt9wH` |
 | kong-project | `proj_wmeni3BelwvPUahovs5wQy3i` |
 | ngocvo-project | `proj_E8F4KEaZSMfBuaPhE3Y69BzM` |
+| tubel-project | `proj_MIieWaC8hSsgAp4rSaN86BEp` |
 
 IDs are case-sensitive. Always re-export from Platform → Projects → Export CSV when adding new projects.
 

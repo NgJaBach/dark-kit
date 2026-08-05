@@ -104,10 +104,42 @@ def test_model_classification():
     for m in ["sora-2", "dall-e-3", "gpt-3.5-turbo", "text-embedding-3-small",
               "text-embedding-3-large", "whisper-1", "tts-1"]:
         assert bot._track_for_model(m) is None, m
-    # Dated variants
+    # Date-stamped snapshots inherit the base model's track
     assert bot._track_for_model("gpt-4o-mini-2024-07-18") == "normal"
     assert bot._track_for_model("gpt-4o-2024-08-06")      == "premium"
     print("  ✅ Listed-model + unlisted-model classification correct")
+
+
+def test_same_prefix_paid_products_are_unlisted():
+    """Regression for the greedy-prefix bug: paid products sharing a listed
+    prefix (o1-pro is $150/$600 per 1M!) must NOT classify into a free tier —
+    they must be None so the off-watchlist anomaly alert fires."""
+    paid_lookalikes = [
+        "o1-pro",                 # was: premium via 'o1-' prefix
+        "o3-pro",                 # was: premium via 'o3-'
+        "gpt-5-pro",              # was: premium via 'gpt-5-'
+        "gpt-5.4-pro",            # was: premium via 'gpt-5.4-'
+        "gpt-5.2-pro",            # was: premium via 'gpt-5.2-'
+        "gpt-5.4-cyber",          # was: premium via 'gpt-5.4-'
+        "gpt-5.2-chat-latest",    # was: premium via 'gpt-5.2-' (only gpt-5-chat-latest is free)
+        "gpt-5-search-api",       # was: premium via 'gpt-5-'
+        "gpt-4o-mini-tts",        # was: NORMAL via 'gpt-4o-mini-'
+        "gpt-4o-mini-transcribe", # was: NORMAL via 'gpt-4o-mini-'
+        "gpt-4o-transcribe",      # was: premium via 'gpt-4o-'
+        "gpt-4o-transcribe-diarize",
+        "o1-mini-tts-hypothetical",  # future-proofing: suffix on a normal-list name
+        # brand-new families that share no boundary — must also be None
+        "gpt-5.5", "gpt-5.5-pro", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+        "gpt-5.3-codex", "gpt-5.3-chat-latest", "chat-latest",
+        "gpt-image-2", "gpt-realtime-2.1", "gpt-audio-1.5",
+    ]
+    for m in paid_lookalikes:
+        got = bot._track_for_model(m)
+        assert got is None, f"{m} classified as {got!r} — should be unlisted (None)"
+    # And the exact listed names still work
+    assert bot._track_for_model("gpt-5-chat-latest") == "premium"
+    assert bot._track_for_model("codex-mini-latest") == "normal"
+    print("  ✅ Same-prefix paid products (o1-pro, *-tts, *-pro, …) all unlisted")
 
 
 # ─── Spend monitoring ──────────────────────────────────────────────────────
@@ -274,6 +306,51 @@ def test_spend_seed_atomic():
     print("  ✅ 30 concurrent claim_spend_seed → exactly 1 winner")
 
 
+def test_overcap_escalation_keeps_alerting():
+    """After the $2 cap, every extra $0.50 must fire another cap-level alert —
+    the bot must never go silent while the bleed continues."""
+    usage, subs, names, _ = _fresh_stores()
+    usage._data["spend_seeded"] = True
+    fired = []
+    with mock.patch.object(bot, "_send", side_effect=lambda text, *a, **kw: fired.append(text)):
+        # First poll at $2.10 — static cap ($2.00) fires
+        new, cap = bot.check_spend({"total_cost": 2.10, "projects": {}}, usage, subs, names)
+        assert new and cap
+        n_after_cap = len(fired)
+
+        # Same total again — silent
+        new, cap = bot.check_spend({"total_cost": 2.10, "projects": {}}, usage, subs, names)
+        assert not new and not cap and len(fired) == n_after_cap
+
+        # Bleed continues to $3.10 — steps $2.50 and $3.00 both fire, cap=True again
+        new, cap = bot.check_spend({"total_cost": 3.10, "projects": {}}, usage, subs, names)
+        assert new and cap
+        assert len(fired) == n_after_cap + 2, f"expected 2 escalation alerts, got {len(fired) - n_after_cap}"
+
+        # Same total — silent again
+        new, cap = bot.check_spend({"total_cost": 3.10, "projects": {}}, usage, subs, names)
+        assert not new and not cap
+    print("  ✅ Overcap escalation: new cap alert per extra $0.50, deduped")
+
+
+def test_seed_spend_covers_overcap_steps():
+    """Restart at $3.40: seed must mark $2.50 and $3.00 silently too, so the
+    next poll doesn't flood every escalation step at once."""
+    usage, subs, names, _ = _fresh_stores()
+    fired = []
+    with mock.patch.object(bot, "_send", side_effect=lambda text, *a, **kw: fired.append(text)):
+        bot.seed_spend({"total_cost": 3.40, "projects": {}}, usage, subs, names)
+        assert len(fired) == 1, f"seed should fire exactly 1 catch-up, got {len(fired)}"
+        # Next poll at the same spend — fully silent
+        fired.clear()
+        new, cap = bot.check_spend({"total_cost": 3.40, "projects": {}}, usage, subs, names)
+        assert not new and not cap and not fired
+        # Bleed continues to $3.60 — exactly one new step ($3.50) fires
+        new, cap = bot.check_spend({"total_cost": 3.60, "projects": {}}, usage, subs, names)
+        assert new and cap and len(fired) == 1
+    print("  ✅ Seed at $3.40 marks overcap steps silently; escalation resumes cleanly")
+
+
 def test_day_rollover_resets_spend_tracking():
     usage, _, _, _ = _fresh_stores()
     usage._data["spend_seeded"] = True
@@ -319,6 +396,9 @@ if __name__ == "__main__":
         ("Callback refuses when busy",                   test_callback_refuses_when_busy),
         ("Callback validates inputs",                    test_callback_validates_inputs),
         ("Model classification (listed + unlisted)",     test_model_classification),
+        ("Same-prefix paid products are unlisted",       test_same_prefix_paid_products_are_unlisted),
+        ("Overcap escalation keeps alerting",            test_overcap_escalation_keeps_alerting),
+        ("Seed covers overcap steps (no restart flood)", test_seed_spend_covers_overcap_steps),
         ("DAILY_LIMIT = $2 and SPEND_MILESTONES align",  test_daily_limit_is_two_dollars),
         ("Spend milestones fire in order",               test_spend_milestones_fire_in_order),
         ("Per-project spend thresholds",                 test_per_project_spend_thresholds),
