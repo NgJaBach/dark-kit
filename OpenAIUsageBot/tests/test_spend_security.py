@@ -21,6 +21,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import openai_usage_bot as bot
 
+# Redirect the intel log for the WHOLE suite — without this, test broadcasts
+# (fake milestones, fake anomaly alerts) pollute the real events-*.jsonl.
+bot.LOGS_DIR = Path(tempfile.mkdtemp(prefix="intel_suite_"))
+
 
 def _fresh_stores():
     tmp = tempfile.mkdtemp(prefix="bot_test_")
@@ -386,6 +390,162 @@ def test_check_spend_handles_missing_cost():
     print("  ✅ Missing/None cost handled gracefully")
 
 
+# ─── Wave guard (throttle-lag fix) ──────────────────────────────────────────
+
+def test_per_track_seal_thresholds():
+    """Premium needs a far bigger relative buffer than normal: the wave crossed
+    the old 50k buffer during the sweep itself on 2026-08-13."""
+    assert bot.NORMAL_TRACK_SEAL_THRESHOLD  == 9_500_000, bot.NORMAL_TRACK_SEAL_THRESHOLD
+    assert bot.PREMIUM_TRACK_SEAL_THRESHOLD ==   850_000, bot.PREMIUM_TRACK_SEAL_THRESHOLD
+    print("  ✅ Premium seals at 850k (150k buffer), normal at 9.5M (500k buffer)")
+
+
+def test_wave_projection_math():
+    # Real numbers from the 2026-08-13 incident: 879.9k → 947.7k over 10 min
+    # (~113 tok/s). Projection over 20 min must cross the 1M cap even though
+    # 947.7k was still below the OLD static threshold (950k).
+    projected = bot._wave_projected(947_700, 879_900, 600, lookahead=1200)
+    assert projected >= 1_000_000, f"projected {projected:,} should cross 1M"
+
+    # Slow burn: 10k over 10 min → projection stays far under cap.
+    projected = bot._wave_projected(500_000, 490_000, 600, lookahead=1200)
+    assert projected < 550_001, projected
+
+    # Day rollover (negative delta) clamps to zero rate, never projects backwards.
+    projected = bot._wave_projected(5_000, 900_000, 600, lookahead=1200)
+    assert projected == 5_000, projected
+
+    # Zero/near-zero dt must not divide by zero.
+    bot._wave_projected(100, 50, 0)
+    print("  ✅ Wave projection: catches the real 8-13 ramp, ignores slow burn, rollover-safe")
+
+
+def test_mass_seal_parallel_covers_all_projects():
+    """Parallel sweep must process every non-exempt project and retry failures."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    calls, fail_once = [], {"proj_OWrxxJaWk5MXHBi3HIdPxBDh"}   # oduong fails 1st try
+
+    def fake_throttle(pid, track, usage_):
+        calls.append(pid)
+        if pid in fail_once:
+            fail_once.discard(pid)
+            return "failed"
+        return "throttled"
+
+    with mock.patch.object(bot, "_throttle_track_for_project", side_effect=fake_throttle), \
+         mock.patch.object(bot, "_ordered_projects_for_track_seal",
+                           return_value=list(bot.KNOWN_PROJECTS)), \
+         mock.patch.object(bot, "_send"):
+        assert bot._try_claim_busy()
+        try:
+            bot._mass_seal_track("premium", usage, subs, names, consumed=850_000)
+        finally:
+            bot._release_busy()
+
+    n_projects = len(bot.KNOWN_PROJECTS)
+    assert len(set(calls)) == n_projects, f"only {len(set(calls))}/{n_projects} projects attempted"
+    # oduong appears twice: initial failure + retry that succeeds
+    assert calls.count("proj_OWrxxJaWk5MXHBi3HIdPxBDh") == 2, "failed project must be retried"
+    assert usage.is_mass_sealed("premium")
+    print(f"  ✅ Parallel sweep hits all {n_projects} projects; failure retried in-sweep")
+
+
+def test_seal_gap_repair():
+    """A project missing from sealed_tracks after the sweep must be re-sealed
+    on the next poll — this is the fix for the oduong post-cap leak."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    bot._REPAIR_DONE.clear()
+    usage.mark_mass_sealed("premium")
+    # Everyone sealed except oduong (failed) and phongnguyen (exempt)
+    for pid in bot.KNOWN_PROJECTS:
+        if pid in ("proj_OWrxxJaWk5MXHBi3HIdPxBDh", "proj_zRWDq4YWIDEkxbgMAjX0xy79"):
+            continue
+        usage.add_track_originals("premium", pid, [{"id": "rl1", "model": "gpt-4o"}])
+    usage.add_track_exemption("proj_zRWDq4YWIDEkxbgMAjX0xy79", "premium")
+
+    attempted = []
+    with mock.patch.object(bot, "_throttle_track_for_project",
+                           side_effect=lambda pid, t, u: (attempted.append(pid), "throttled")[1]), \
+         mock.patch.object(bot, "_send"):
+        bot._repair_seal_gaps("premium", usage, subs, names)
+
+    assert attempted == ["proj_OWrxxJaWk5MXHBi3HIdPxBDh"], \
+        f"only the gap project should be re-attempted, got {attempted}"
+
+    # Second pass: memo prevents re-POSTing the same project
+    attempted.clear()
+    with mock.patch.object(bot, "_throttle_track_for_project",
+                           side_effect=lambda pid, t, u: (attempted.append(pid), "throttled")[1]), \
+         mock.patch.object(bot, "_send"):
+        bot._repair_seal_gaps("premium", usage, subs, names)
+    assert attempted == [], "repaired project must not be re-attempted (memo)"
+    print("  ✅ Gap repair seals exactly the straggler, skips exempt, memoized")
+
+
+def test_seal_gap_repair_respects_busy():
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    bot._REPAIR_DONE.clear()
+    usage.mark_mass_sealed("premium")   # all projects are gaps
+    assert bot._try_claim_busy()
+    try:
+        with mock.patch.object(bot, "_throttle_track_for_project") as thr, \
+             mock.patch.object(bot, "_send"):
+            bot._repair_seal_gaps("premium", usage, subs, names)
+            assert not thr.called, "repair must defer while busy claim is held"
+    finally:
+        bot._release_busy()
+    print("  ✅ Gap repair defers when another seal op is running")
+
+
+# ─── Local intel log ────────────────────────────────────────────────────────
+
+def test_intel_log_captures_broadcasts():
+    """Every _broadcast must land one JSONL entry in the intel log."""
+    usage, subs, names, _ = _fresh_stores()
+    logdir = Path(tempfile.mkdtemp(prefix="intel_"))
+    with mock.patch.object(bot, "LOGS_DIR", logdir), mock.patch.object(bot, "_send"):
+        bot._broadcast(lambda n: f"<b>test alert for {n}</b>", subs, names)
+        bot._log_event("mode", from_mode="passive", to_mode="urgent")
+
+    files = list(logdir.glob("events-*.jsonl"))
+    assert len(files) == 1, f"expected one monthly file, got {files}"
+    lines = [json.loads(l) for l in files[0].read_text().splitlines()]
+    kinds = [l["kind"] for l in lines]
+    assert kinds == ["broadcast", "mode"], kinds
+    assert "test alert for Bach" in lines[0]["text"]
+    assert lines[1]["from_mode"] == "passive" and lines[1]["to_mode"] == "urgent"
+    assert all("ts" in l and "utc" in l for l in lines)
+    print("  ✅ Broadcasts + events land as structured JSONL entries")
+
+
+def test_intel_log_failure_never_breaks_bot():
+    """A logging failure (e.g. unwritable dir) must print and continue."""
+    usage, subs, names, _ = _fresh_stores()
+    with mock.patch.object(bot, "LOGS_DIR", Path("/proc/definitely/not/writable")), \
+         mock.patch.object(bot, "_send") as sender:
+        bot._broadcast(lambda n: "still delivered", subs, names)   # must not raise
+        assert sender.called, "Telegram delivery must proceed despite log failure"
+    print("  ✅ Log failure is swallowed; Telegram delivery unaffected")
+
+
+def test_mode_change_logged_once():
+    """set_mode logs only on actual transitions, not same-mode re-sets."""
+    usage, _, _, _ = _fresh_stores()
+    logdir = Path(tempfile.mkdtemp(prefix="intel_"))
+    with mock.patch.object(bot, "LOGS_DIR", logdir):
+        usage.set_mode("urgent")     # passive → urgent: logged
+        usage.set_mode("urgent")     # urgent → urgent: not logged
+        usage.set_mode("passive")    # urgent → passive: logged
+    files = list(logdir.glob("events-*.jsonl"))
+    lines = [json.loads(l) for l in files[0].read_text().splitlines()]
+    mode_events = [l for l in lines if l["kind"] == "mode"]
+    assert len(mode_events) == 2, f"expected 2 mode events, got {len(mode_events)}"
+    print("  ✅ Mode transitions logged exactly once each")
+
+
 # ─── Run ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -410,6 +570,14 @@ if __name__ == "__main__":
         ("Atomic claim_spend_seed (single winner)",      test_spend_seed_atomic),
         ("Day rollover resets spend tracking",           test_day_rollover_resets_spend_tracking),
         ("check_spend handles missing/None cost",        test_check_spend_handles_missing_cost),
+        ("Per-track seal thresholds (wave buffers)",     test_per_track_seal_thresholds),
+        ("Wave projection math",                         test_wave_projection_math),
+        ("Parallel sweep covers all + retries",          test_mass_seal_parallel_covers_all_projects),
+        ("Seal-gap repair (oduong leak fix)",            test_seal_gap_repair),
+        ("Seal-gap repair respects busy claim",          test_seal_gap_repair_respects_busy),
+        ("Intel log captures broadcasts",                test_intel_log_captures_broadcasts),
+        ("Intel log failure never breaks bot",           test_intel_log_failure_never_breaks_bot),
+        ("Mode change logged once per transition",       test_mode_change_logged_once),
     ]
     passes, fails = 0, []
     for name, fn in tests:

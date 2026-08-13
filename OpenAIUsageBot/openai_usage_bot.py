@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,12 +47,12 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-08-05"
+BOT_UPDATED = "2026-08-13"
 BOT_CHANGES = (
-    "Fixed: o1-pro / gpt-5.4-pro / *-tts / *-transcribe no longer count as free-tier",
-    "Strict matching: only exact names or dated snapshots inherit a track",
-    "Overcap escalation: new alert every extra $0.50 past the $2 cap",
-    "Fixed: spend-cap AGGRESSIVE mode now holds until midnight (was 1 poll)",
+    "Wave guard: premium now seals at 85% (was 95%) + predictive early seal",
+    "Sweep is parallel (~1 min, was ~5) with in-sweep retry for failures",
+    "Self-healing: stragglers the sweep missed get re-sealed automatically",
+    "Local intel log: every alert + state change mirrored to bot_data/logs/",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -109,6 +110,33 @@ BOT_DATA_DIR     = Path(__file__).parent / "bot_data"
 USAGE_STATE_PATH = BOT_DATA_DIR / "usage_state.json"
 SUBS_PATH        = BOT_DATA_DIR / "subscribers.json"
 NAMES_PATH       = BOT_DATA_DIR / "names.json"
+LOGS_DIR         = BOT_DATA_DIR / "logs"
+
+# ── Local intel log ─────────────────────────────────────────────────────────
+# Telegram broadcasts used to exist ONLY in the chat — nothing durable on disk
+# for later analysis. _log_event mirrors every broadcast and key state change
+# to a monthly JSONL file (bot_data/logs/events-YYYY-MM.jsonl). Each line:
+#   {"ts": ..., "utc": "...", "kind": "...", ...fields}
+# Kinds: broadcast | mode | poll | poll_fail | mass_seal | mass_unseal |
+#        manual_seal | manual_unseal | pending_unseal | day_rollover | command
+# Best-effort by design: a logging failure prints one line and never breaks
+# the bot. Files are small (a quiet month is well under 1 MB); prune by hand.
+_LOG_LOCK = threading.Lock()
+
+
+def _log_event(kind: str, **fields) -> None:
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        now  = datetime.now(timezone.utc)
+        path = LOGS_DIR / f"events-{now.strftime('%Y-%m')}.jsonl"
+        rec  = {"ts": round(time.time(), 3),
+                "utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "kind": kind, **fields}
+        with _LOG_LOCK:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[intel-log error] {e}")
 
 REQUEST_TIMEOUT  = 15
 POLL_TIMEOUT     = 30  # Telegram long-poll
@@ -190,13 +218,39 @@ def _is_busy() -> bool:
         return _BUSY
 
 # ── Track-level mass-seal trigger ──────────────────────────────────────────
-# When a track's remaining quota drops to this fraction (or below — including
-# negative remaining if the cap has been overshot), the bot mass-throttles every
-# project's rate-limit rows for that track's models. 0.05 = 5% remaining =
-# 9.5M of the 10M normal cap, 950k of the 1M premium cap.
-TRACK_SEAL_REMAINING_PCT       = 0.05
-NORMAL_TRACK_SEAL_THRESHOLD    = int(TOKEN_HARD_CAP         * (1 - TRACK_SEAL_REMAINING_PCT))
-PREMIUM_TRACK_SEAL_THRESHOLD   = int(PREMIUM_TOKEN_HARD_CAP * (1 - TRACK_SEAL_REMAINING_PCT))
+# When a track's remaining quota drops to its per-track fraction (or below),
+# the bot mass-throttles every project's rate-limit rows for that track.
+#
+# Buffers are PER-TRACK because of "the wave": the usage API lags 5–15 min, the
+# sweep takes time, and in-flight requests keep landing after throttle — so the
+# buffer must absorb (lag + poll gap + sweep) × burn rate. Observed live on
+# 2026-08-13: premium burned ~110 tok/s at the crest; the old 5% buffer (50k)
+# bought ~8 minutes and the cap was crossed DURING the sweep. Normal's 5% buffer
+# is 500k — ten times the absolute headroom — and has never been outrun.
+NORMAL_SEAL_REMAINING_PCT      = 0.05   # seal at 9.5M  (500k buffer)
+PREMIUM_SEAL_REMAINING_PCT     = 0.15   # seal at 850k  (150k buffer — wave fix)
+NORMAL_TRACK_SEAL_THRESHOLD    = int(TOKEN_HARD_CAP         * (1 - NORMAL_SEAL_REMAINING_PCT))
+PREMIUM_TRACK_SEAL_THRESHOLD   = int(PREMIUM_TOKEN_HARD_CAP * (1 - PREMIUM_SEAL_REMAINING_PCT))
+
+# ── Wave guard (predictive seal + tight polling near the threshold) ────────
+# Static thresholds alone can't catch a fast ramp: consumption visible NOW is
+# already 5–15 min old. The wave guard projects each track forward by the
+# lookahead window using the burn rate measured between polls, and seals early
+# when the projection crosses the cap — even if the static threshold hasn't
+# been reached yet. Near the threshold, polling is clamped to 60 s so urgent
+# mode's 3→10 min stepping can't reopen the detection gap.
+WAVE_LOOKAHEAD_SECS   = 20 * 60   # ingestion lag (≤15 min) + sweep time
+WAVE_WATCH_SLEEP_SECS = 60        # poll cadence inside the watch zone
+WAVE_WATCH_BAND_PCT   = 0.10      # watch zone starts 10% of cap below the seal threshold
+SEAL_SWEEP_WORKERS    = 4         # parallel per-project workers for the mass sweep
+
+
+def _wave_projected(tok_now: int, tok_prev: int, dt_secs: float,
+                    lookahead: int = WAVE_LOOKAHEAD_SECS) -> int:
+    """Project consumption `lookahead` seconds forward at the burn rate
+    measured between two polls. Negative deltas (day rollover) clamp to 0."""
+    rate = max(0.0, tok_now - tok_prev) / max(1.0, dt_secs)
+    return int(tok_now + rate * lookahead)
 
 
 def _matches_track(model: str, track: str) -> bool:
@@ -953,6 +1007,10 @@ class UsageStore:
             old_date = self._data.get("date")
             if new_date and old_date and new_date != old_date:
                 print(f"[store] Day rollover {old_date} → {new_date} — daily state reset")
+                _log_event("day_rollover", from_date=old_date, to_date=new_date,
+                           final_normal=self._data.get("total_normal_tokens", 0),
+                           final_premium=self._data.get("total_premium_tokens", 0),
+                           final_cost=self._data.get("total_cost", 0.0))
                 self._reset_daily_state_locked()
             preserved = {k: self._data[k] for k in self._PRESERVED if k in self._data}
             self._data = snapshot
@@ -1060,11 +1118,14 @@ class UsageStore:
     def set_mode(self, mode: str) -> None:
         """Switch mode. Entering urgent/aggressive resets the poll step to floor."""
         with self._lock:
+            prev = self._data.get("bot_mode", "passive")
             self._data["bot_mode"]        = mode
             self._data["mode_entered_ts"] = time.time()
             if mode in ("urgent", "aggressive"):
                 self._data["urgent_poll_step"] = 0
             self._save()
+        if prev != mode:
+            _log_event("mode", from_mode=prev, to_mode=mode)
 
     def reset_urgent_step(self) -> None:
         """Restart urgent interval back to floor without changing mode."""
@@ -1296,6 +1357,21 @@ class SubscriberStore:
         with self._lock:
             return list(self._ids)
 
+    def migrate(self, old_id: str, new_id: str) -> None:
+        """Replace a chat id after a group→supergroup upgrade. If the migrated
+        chat was the primary, the in-memory primary follows — but .env still
+        holds the old id, so shout about it."""
+        with self._lock:
+            if old_id not in self._ids:
+                return
+            self._ids.discard(old_id)
+            self._ids.add(new_id)
+            if self.primary == old_id:
+                self.primary = new_id
+                print(f"[subs] PRIMARY chat migrated {old_id} → {new_id} — "
+                      f"update TELEGRAM_CHAT_ID in .env before the next restart!")
+            self._save()
+
 
 class NameStore:
     """Persists per-chat display names. Default name for the primary chat is 'Bach'."""
@@ -1333,6 +1409,13 @@ class NameStore:
         with self._lock:
             return self._names.get(str(chat_id), "Bach")
 
+    def migrate(self, old_id: str, new_id: str) -> None:
+        """Carry a chat's display name over to its post-upgrade supergroup id."""
+        with self._lock:
+            if old_id in self._names:
+                self._names[str(new_id)] = self._names.pop(old_id)
+                self._save()
+
 
 # ── Telegram I/O ───────────────────────────────────────────────────────────
 
@@ -1354,10 +1437,16 @@ def _send_animation(path: Path, chat_id: str = None, thread_id: int = None) -> N
         print(f"[telegram anim error] {e}")
 
 
+# Set in main() to a callback(old_id, new_id) that rewrites the subscriber and
+# name stores when Telegram reports a group→supergroup migration. Module-level
+# because _send has no store references.
+_MIGRATION_CB = None
+
+
 def _send(text: str, chat_id: str = None, thread_id: int = None,
           keyboard: list = None) -> None:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    target_chat = chat_id or CHAT_ID
+    target_chat = str(chat_id or CHAT_ID)
     payload = {"chat_id": target_chat, "text": text, "parse_mode": "HTML"}
     if thread_id:
         payload["message_thread_id"] = thread_id
@@ -1369,8 +1458,31 @@ def _send(text: str, chat_id: str = None, thread_id: int = None,
             data=payload,
             timeout=REQUEST_TIMEOUT,
         )
-        if not r.ok:
-            print(f"[telegram send {r.status_code}] chat={chat_id or CHAT_ID} | {r.text[:400]}")
+        if r.ok:
+            return
+        # Group upgraded to supergroup: the old chat id is permanently dead and
+        # Telegram hands us the replacement. Update the stores and re-send once,
+        # so alerts don't silently 400 forever (observed live on 2026-08-13).
+        mig = None
+        try:
+            mig = r.json().get("parameters", {}).get("migrate_to_chat_id")
+        except Exception:
+            pass
+        if mig:
+            new_id = str(mig)
+            print(f"[telegram] chat {target_chat} migrated → {new_id} — updating stores")
+            _log_event("chat_migrated", old=target_chat, new=new_id)
+            if _MIGRATION_CB:
+                try:
+                    _MIGRATION_CB(target_chat, new_id)
+                except Exception as e:
+                    print(f"[telegram migration-cb error] {e}")
+            payload["chat_id"] = new_id
+            r2 = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
+            if not r2.ok:
+                print(f"[telegram send retry {r2.status_code}] chat={new_id} | {r2.text[:300]}")
+            return
+        print(f"[telegram send {r.status_code}] chat={target_chat} | {r.text[:400]}")
     except Exception as e:
         print(f"[telegram send network error] {e}")
 
@@ -1409,7 +1521,14 @@ def _broadcast(fmt_fn, subs: SubscriberStore, names: NameStore = None) -> None:
     """Send a personalised message to every subscriber.
     `fmt_fn` is a one-arg function: it receives the chat's registered display name
     (or "Bach" when no NameStore is wired) and returns the rendered HTML to send.
-    Replaces the older `if names: per-name else: shared-text` pattern."""
+
+    Every broadcast is also mirrored to the local intel log (one entry per
+    broadcast, canonical "Bach" rendering) — Telegram is no longer the only
+    place push alerts exist."""
+    try:
+        _log_event("broadcast", text=fmt_fn("Bach"))
+    except Exception as e:
+        print(f"[intel-log render error] {e}")
     for cid in subs.all():
         name = names.get(cid) if names is not None else "Bach"
         _send(fmt_fn(name), cid)
@@ -1846,17 +1965,48 @@ def _mass_seal_track(track: str, usage: UsageStore, subs: SubscriberStore,
         fmt_seal_batch_begin(t, c, cp, n), subs, names)
 
     throttled, exempt, noop, failed = [], [], [], []
+    todo: list[str] = []
     for pid in _ordered_projects_for_track_seal(track):
         if respect_exemptions and usage.is_exempt(pid, track):
             exempt.append(pid); continue
         if usage.is_project_track_sealed(pid, track):
             noop.append(pid); continue
-        result = _throttle_track_for_project(pid, track, usage)
-        {"throttled": throttled, "noop": noop, "failed": failed}.get(
-            result, failed).append(pid)
+        todo.append(pid)
+
+    # Projects are independent (each worker only touches its own project's
+    # rate-limit rows; the store methods are lock-guarded), so throttle them in
+    # parallel — the sequential sweep took ~5 min for 13 projects, during which
+    # the wave kept crashing in. 4 workers cut that to roughly a minute. The
+    # 50 ms inter-POST spacing is preserved *within* each project.
+    results: dict[str, str] = {}
+    if todo:
+        with ThreadPoolExecutor(max_workers=SEAL_SWEEP_WORKERS) as ex:
+            futs = {ex.submit(_throttle_track_for_project, pid, track, usage): pid
+                    for pid in todo}
+            for fut in as_completed(futs):
+                pid = futs[fut]
+                try:
+                    results[pid] = fut.result()
+                except Exception as e:
+                    print(f"[mass-seal] worker error {KNOWN_PROJECTS.get(pid, pid)}: {e}")
+                    results[pid] = "failed"
+
+    # One sequential retry for failures — a transient API blip mid-sweep used
+    # to leave a project unsealed and burning post-cap (observed live 2026-08-13).
+    for pid, r in list(results.items()):
+        if r == "failed":
+            print(f"[mass-seal] retrying {KNOWN_PROJECTS.get(pid, pid)}/{track}")
+            results[pid] = _throttle_track_for_project(pid, track, usage)
+
+    for pid, r in results.items():
+        {"throttled": throttled, "noop": noop, "failed": failed}.get(r, failed).append(pid)
 
     print(f"[mass-seal] {track} → done. throttled={len(throttled)} "
           f"exempt={len(exempt)} noop={len(noop)} failed={len(failed)}")
+    _log_event("mass_seal", track=track, consumed=consumed,
+               throttled=[KNOWN_PROJECTS.get(p, p) for p in throttled],
+               exempt=[KNOWN_PROJECTS.get(p, p) for p in exempt],
+               failed=[KNOWN_PROJECTS.get(p, p) for p in failed])
     _broadcast(lambda n, t=track, th=len(throttled), ex=len(exempt),
         f=len(failed): fmt_seal_batch_done(t, th, ex, f, n), subs, names)
 
@@ -1882,6 +2032,7 @@ def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
         elif result == "failed":
             failed += 1
     print(f"[mass-unseal] {track} → restored={restored} failed={failed} ({reason})")
+    _log_event("mass_unseal", track=track, restored=restored, failed=failed, reason=reason)
     _broadcast(lambda n, t=track, r=restored, f=failed:
         fmt_unseal_batch_done(t, r, f, n), subs, names)
 
@@ -1900,6 +2051,7 @@ def _manual_seal_project(track: str, pid: str, usage: UsageStore,
     proj   = KNOWN_PROJECTS.get(pid, pid)
     if result == "throttled":
         print(f"[manual-seal] {proj}/{track}: sealed")
+        _log_event("manual_seal", project=proj, track=track)
         _broadcast(lambda n, p=proj, t=track: fmt_manual_seal(p, t, n), subs, names)
         return "sealed"
     if result == "noop":
@@ -1921,6 +2073,7 @@ def _manual_unseal_project(track: str, pid: str, usage: UsageStore,
     if result == "restored":
         usage.add_track_exemption(pid, track)
         print(f"[manual-unseal] {proj}/{track}: restored + exempt")
+        _log_event("manual_unseal", project=proj, track=track)
         _broadcast(lambda n, p=proj, t=track: fmt_manual_unseal(p, t, n), subs, names)
         return "unsealed"
     if result == "noop":
@@ -1945,6 +2098,58 @@ def _handle_track_seal(track: str, snap: dict, usage: UsageStore,
         consumed_key = "total_normal_tokens" if track == "normal" else "total_premium_tokens"
         _mass_seal_track(track, usage, subs, names,
                          consumed=snap.get(consumed_key, 0), respect_exemptions=True)
+    finally:
+        _release_busy()
+
+
+# Per-(date, track) memo of projects already successfully repaired, so the gap
+# check doesn't re-POST zeros to the same project every poll. In-memory only —
+# a restart just costs one redundant repair pass.
+_REPAIR_DONE: dict[tuple, set] = {}
+
+
+def fmt_seal_repair(track: str, n: int, name: str = "Bach") -> str:
+    return (
+        f"🔧 <b>{_band_label(track)} — {n} straggler project(s) sealed.</b>\n"
+        f"<i>The initial sweep left gaps (transient API failure); they are "
+        f"throttled now, Monarch {name}.</i>"
+    )
+
+
+def _repair_seal_gaps(track: str, usage: UsageStore, subs: SubscriberStore,
+                      names: NameStore) -> None:
+    """After a mass sweep, a project can remain unsealed — a transient API
+    failure mid-sweep, or state loss. Observed live 2026-08-13: 1/13 premium
+    seals failed and that project kept burning post-cap for hours with no
+    self-healing. Called every poll while a track is mass-sealed and over its
+    threshold: re-attempts exactly the gap projects (non-exempt, no captured
+    originals, not yet repaired today). Quiet unless something got sealed."""
+    sealed = usage.get_sealed_tracks().get(track, {}).get("originals_by_project", {})
+    memo_key = (today_str(), track)
+    done = _REPAIR_DONE.setdefault(memo_key, set())
+    gaps = [pid for pid in KNOWN_PROJECTS
+            if pid not in sealed and pid not in done
+            and not usage.is_exempt(pid, track)]
+    if not gaps:
+        return
+    if not _try_claim_busy():
+        return   # another op running — retry next poll
+    try:
+        repaired = []
+        for pid in gaps:
+            result = _throttle_track_for_project(pid, track, usage)
+            if result in ("throttled", "noop"):
+                done.add(pid)          # settled — don't re-attempt today
+                if result == "throttled":
+                    repaired.append(pid)
+            # 'failed' stays out of the memo → retried next poll
+        if repaired:
+            names_str = ", ".join(KNOWN_PROJECTS.get(p, p) for p in repaired)
+            print(f"[seal-repair] {track}: sealed stragglers → {names_str}")
+            _log_event("seal_repair", track=track,
+                       repaired=[KNOWN_PROJECTS.get(p, p) for p in repaired])
+            _broadcast(lambda n, t=track, c=len(repaired):
+                fmt_seal_repair(t, c, n), subs, names)
     finally:
         _release_busy()
 
@@ -1986,6 +2191,7 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
                 usage.pop_pending_track_project(track, pid)
                 restored += 1
 
+        _log_event("pending_unseal", tracks=tracks_str, restored=restored, failed=failed_p)
         _broadcast(lambda n, r=restored, f=failed_p, t=tracks_str:
             fmt_unseal_batch_done(t, r, f, n), subs, names)
     finally:
@@ -2663,7 +2869,7 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
         if n_sealed:
             tag = f"🔒 {n_sealed} sealed"
         elif consumed >= threshold:
-            tag = "⚠️ ≥95% (not sealed)"
+            tag = f"⚠️ ≥{threshold / cap * 100:.0f}% (not sealed)"
         else:
             tag = "✅ active"
         lines.append(f"  • <b>{track}</b>: {_fmt_tokens(consumed)} / {_fmt_tokens(cap)} "
@@ -3002,6 +3208,7 @@ def telegram_poll_loop(usage: UsageStore, subs: SubscriberStore,
                 cmd = rest.split()[0].lower() if rest.split() else "help"
                 if cmd != "arise" and chat_id not in subs.all():
                     continue  # not subscribed — ignore all commands except arise
+                _log_event("command", chat=chat_id, cmd=rest[:120])
                 reply, keyboard = dispatch(text, usage, subs, bot_username, chat_id, names, thread_id)
                 if reply:
                     _send(reply, chat_id, thread_id, keyboard=keyboard)
@@ -3028,6 +3235,7 @@ def _handle_callback_update(cq: dict, usage: UsageStore, subs: SubscriberStore,
         return
 
     print(f"[callback] chat={chat_id} data={data!r}")
+    _log_event("command", chat=chat_id, cmd=f"callback:{data[:100]}")
     try:
         text, keyboard, toast = handle_archive_callback(
             data, usage, subs, names, name, chat_id, msg_id)
@@ -3046,7 +3254,10 @@ def _handle_callback_update(cq: dict, usage: UsageStore, subs: SubscriberStore,
 def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> None:
     """Day rollover is handled by UsageStore.update() (auto-detects date change) and by
     the constructor's stale-date check. seed-vs-check is driven by has_seeded()."""
-    fail_count = 0
+    fail_count  = 0
+    last_logged = None   # (date, normal, premium, cost) of last intel-logged poll
+    prev_poll   = None   # (date, ts, {track: tokens}) — wave-guard burn-rate sample
+    watch_zone  = False  # True while an unsealed track is near its seal threshold
 
     while True:
         try:
@@ -3090,6 +3301,14 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 cost_str = f"  cost=${snap.get('total_cost', 0.0):.4f}" if snap.get("total_cost") else ""
                 print(f"[poll/{usage.get_mode()}] {snap.get('date')}  normal={n_str}  premium={p_str}{cost_str}")
 
+                # Intel log: one entry per poll where the totals actually moved.
+                cur = (snap.get("date"), normal_tok, premium_tok,
+                       round(snap.get("total_cost", 0.0), 4))
+                if cur != last_logged:
+                    _log_event("poll", date=cur[0], normal=cur[1], premium=cur[2],
+                               cost=cur[3], mode=usage.get_mode())
+                    last_logged = cur
+
                 # ── Milestone handling ─────────────────────────────────────
                 if not usage.has_seeded():
                     seed_milestones(snap, usage, subs, names)
@@ -3116,13 +3335,53 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                     new_spend, spend_cap_crossed = check_spend(snap, usage, subs, names)
                 check_unlisted_models(snap, usage, subs, names)
 
-                # ── Track-level mass throttle (preventive, at 95% utilisation) ──
+                # ── Wave guard: predictive early seal + watch-zone detection ──
+                # Static thresholds react to numbers that are already 5–15 min
+                # stale. Project each track forward by the lookahead window at
+                # the burn rate measured between polls; if the projection
+                # crosses the CAP, seal now — don't wait for the threshold.
+                now_ts     = time.time()
+                track_view = (
+                    ("normal",  normal_tok,  TOKEN_HARD_CAP,         NORMAL_TRACK_SEAL_THRESHOLD),
+                    ("premium", premium_tok, PREMIUM_TOKEN_HARD_CAP, PREMIUM_TRACK_SEAL_THRESHOLD),
+                )
+                if prev_poll and prev_poll[0] == snap.get("date"):
+                    dt = now_ts - prev_poll[1]
+                    for track, tok, cap, thr in track_view:
+                        if tok >= thr or usage.is_mass_sealed(track):
+                            continue   # static path below handles it / already done
+                        projected = _wave_projected(tok, prev_poll[2][track], dt)
+                        if projected >= cap:
+                            rate = (tok - prev_poll[2][track]) / max(1.0, dt)
+                            print(f"[wave] {track}: {tok:,} at ~{rate:.0f} tok/s → "
+                                  f"projected {projected:,} ≥ cap in {WAVE_LOOKAHEAD_SECS // 60} min — sealing early")
+                            _log_event("wave_trigger", track=track, tokens=tok,
+                                       rate_per_sec=round(rate, 2), projected=projected)
+                            _handle_track_seal(track, snap, usage, subs, names)
+                prev_poll = (snap.get("date"), now_ts,
+                             {"normal": normal_tok, "premium": premium_tok})
+
+                # Watch zone: an unsealed track close to its threshold forces
+                # 60 s polling below (urgent mode's 3→10 min stepping would
+                # otherwise reopen the detection gap right at the worst time).
+                watch_zone = any(
+                    tok >= thr - int(cap * WAVE_WATCH_BAND_PCT) and not usage.is_mass_sealed(track)
+                    for track, tok, cap, thr in track_view
+                )
+
+                # ── Track-level mass throttle (static threshold path) ──
                 # Each track is independent and idempotent via the per-day mass_sealed
                 # flag — once the sweep has fired for a track today, it won't re-fire.
                 if normal_tok >= NORMAL_TRACK_SEAL_THRESHOLD and not usage.is_mass_sealed("normal"):
                     _handle_track_seal("normal", snap, usage, subs, names)
                 if premium_tok >= PREMIUM_TRACK_SEAL_THRESHOLD and not usage.is_mass_sealed("premium"):
                     _handle_track_seal("premium", snap, usage, subs, names)
+
+                # ── Seal-gap repair: re-seal projects the sweep missed ──
+                # A failed seal used to leave a project burning post-cap all day.
+                for track, tok, cap, thr in track_view:
+                    if usage.is_mass_sealed(track) and tok >= thr:
+                        _repair_seal_gaps(track, usage, subs, names)
 
                 # ── Cap check (alarm-only; mass throttle above should normally
                 #    keep this from firing except for manually-exempt projects)
@@ -3173,6 +3432,8 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 max_back = PASSIVE_BACKOFF_MAX   if mode == "passive" else URGENT_INTERVAL_MAX
                 backoff  = min(base * (2 ** min(fail_count - 1, 4)), max_back)
                 print(f"[poll] Fetch failed ({fail_count}) — retry in {backoff // 60:.0f} min (backoff)")
+                if fail_count in (1, 5, 10):   # log the onset + escalation, not every retry
+                    _log_event("poll_fail", consecutive=fail_count, backoff_secs=backoff)
                 time.sleep(backoff)
                 continue
         except Exception as e:
@@ -3187,7 +3448,13 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
             sleep_secs = usage.get_urgent_interval()
             usage.increment_urgent_step()
 
-        print(f"[poll] Next poll in {sleep_secs // 60:.0f} min  (mode={mode})")
+        if watch_zone and sleep_secs > WAVE_WATCH_SLEEP_SECS:
+            # Near an unsealed threshold — tighten the loop so the wave can't
+            # ride an 8-minute poll gap over the cap.
+            sleep_secs = WAVE_WATCH_SLEEP_SECS
+            print(f"[poll] Watch zone — next poll in {sleep_secs} s  (mode={mode})")
+        else:
+            print(f"[poll] Next poll in {sleep_secs // 60:.0f} min  (mode={mode})")
         time.sleep(sleep_secs)
 
 
@@ -3232,6 +3499,11 @@ def main() -> None:
     usage = UsageStore(USAGE_STATE_PATH)
     subs  = SubscriberStore(SUBS_PATH, CHAT_ID)
     names = NameStore(NAMES_PATH, CHAT_ID)
+
+    # Wire the chat-migration handler so a group→supergroup upgrade rewrites
+    # the stores instead of 400-ing on every broadcast forever.
+    global _MIGRATION_CB
+    _MIGRATION_CB = lambda old, new: (subs.migrate(old, new), names.migrate(old, new))
 
     bot_username = _fetch_bot_username()
     if bot_username:

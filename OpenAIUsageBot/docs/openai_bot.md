@@ -94,7 +94,10 @@ OpenAIUsageBot/
 └── bot_data/                  # Auto-created on first run (gitignored)
     ├── usage_state.json       # Today's snapshot + mode state
     ├── subscribers.json       # Subscribed chat IDs
-    └── names.json             # Per-chat display names
+    ├── names.json             # Per-chat display names
+    └── logs/                  # Local intel log (durable history)
+        ├── events-YYYY-MM.jsonl   # Structured events: every broadcast + state change
+        └── stdout-YYYY-MM.log     # Raw console output (tee'd by run script)
 ```
 
 ---
@@ -357,25 +360,49 @@ strict-matches each model to `normal` / `premium` / `None`; unlisted models
 (sora-2, babbage-002, dall-e-3, etc.) are never throttled — they bill at standard
 rates regardless, so throttling them is pointless.
 
-#### Auto trigger — track-level mass seal
+#### Auto trigger — track-level mass seal + wave guard
 
 Constants:
 ```
-TRACK_SEAL_REMAINING_PCT      = 0.05
-NORMAL_TRACK_SEAL_THRESHOLD   = 9,500,000     (5% of 10M remaining)
-PREMIUM_TRACK_SEAL_THRESHOLD  =   950,000     (5% of 1M  remaining)
+NORMAL_SEAL_REMAINING_PCT     = 0.05  → NORMAL_TRACK_SEAL_THRESHOLD  = 9,500,000  (500k buffer)
+PREMIUM_SEAL_REMAINING_PCT    = 0.15  → PREMIUM_TRACK_SEAL_THRESHOLD =   850,000  (150k buffer)
+WAVE_LOOKAHEAD_SECS           = 1200  (20 min: API ingestion lag + sweep time)
+WAVE_WATCH_BAND_PCT           = 0.10  (watch zone starts 10% of cap below threshold)
+WAVE_WATCH_SLEEP_SECS         = 60
+SEAL_SWEEP_WORKERS            = 4
 ```
 
-`usage_poll_loop()` and `cmd_refresh()` both check, after every poll:
+**Why per-track buffers ("the wave"):** usage numbers are 5–15 min stale when the
+bot sees them, the sweep takes time, and in-flight requests land after throttling.
+The buffer must absorb `(lag + poll gap + sweep) × burn rate`. On 2026-08-13
+premium burned ~110 tok/s at the crest; the old uniform 5% buffer (50k on premium)
+bought ~8 minutes and the cap was crossed *during* the sweep. Premium now seals at
+85% (150k buffer); normal keeps 95% (500k absolute headroom has never been outrun).
 
-```
-if total_normal_tokens  ≥ 9.5M  and not is_mass_sealed('normal')  → _handle_track_seal('normal')
-if total_premium_tokens ≥ 950k  and not is_mass_sealed('premium') → _handle_track_seal('premium')
-```
+Three trigger paths, all idempotent via the per-day `mass_sealed_tracks` flag:
 
-`_handle_track_seal()` is a thin wrapper: it checks the per-day `mass_sealed_tracks`
-flag (idempotency) and delegates to `_mass_seal_track()`. Each track's auto-sweep
-fires at most once per UTC day.
+1. **Static threshold** — `usage_poll_loop()` and `cmd_refresh()` check
+   `tokens ≥ threshold` after every poll.
+2. **Predictive (wave guard)** — every poll measures the burn rate against the
+   previous poll and projects `WAVE_LOOKAHEAD_SECS` forward. If the projection
+   crosses the **cap**, the seal fires immediately even below the static
+   threshold. Logged as `wave_trigger` in the intel log with rate + projection.
+3. **Watch zone** — while an unsealed track is within 10% of cap below its
+   threshold, the poll sleep is clamped to 60 s, overriding urgent mode's
+   3→10 min stepping (which used to reopen the detection gap at the worst time).
+
+#### Sweep execution — parallel + self-healing
+
+`_mass_seal_track()` throttles projects **in parallel** (4 workers; projects are
+independent, 50 ms inter-POST spacing preserved within each project) — ~1 min for
+13 projects instead of ~5. Failed projects get one **in-sweep sequential retry**.
+
+If a project still ends up unsealed (transient API failure; observed live
+2026-08-13 — the straggler kept burning post-cap for hours), **`_repair_seal_gaps()`**
+runs on every poll while a track is mass-sealed and over threshold: it re-attempts
+exactly the gap projects (non-exempt, no captured originals), broadcasts a short
+"🔧 straggler sealed" note on success, and memoizes per-(day, track) so settled
+projects aren't re-POSTed every poll. Failures stay unmemoized and retry next poll.
 
 #### What a mass throttle does
 
@@ -517,10 +544,10 @@ The legacy per-project-full-seal fields (`sealed_projects`, `pending_unseal`,
 
 #### Latency & blast radius
 
-- **Detection latency**: up to one poll cycle (30 min passive, 3–10 min urgent). Normal crossing ~9M flips mode to urgent so the 95% trigger is caught quickly.
+- **Detection latency**: up to one poll cycle, clamped to 60 s inside the watch zone (an unsealed track within 10% of cap below its threshold). Milestones flip mode to urgent well before any threshold.
 - **Per-project throttle cost**: ~50–80 track rows × ~50 ms ≈ a few seconds per project per track.
-- **Full mass sweep**: 13 projects ≈ ~50 s for one track. Auto-sweep & midnight restore block the **poll** thread for that duration (it has nothing else to do); manual button-driven sweeps run in a daemon worker thread so the Telegram poll thread stays free for other commands.
-- **Inflight window**: a brief gap between detection and full throttle where running requests complete. Unavoidable, bounded by the sweep wall-time.
+- **Full mass sweep**: 13 projects with 4 parallel workers ≈ ~1 min per track (observed ~5 min sequential on 2026-08-13 — that gap is what let the wave crest during the sweep). Auto-sweep & midnight restore block the **poll** thread for that duration; manual button-driven sweeps run in a daemon worker thread so the Telegram poll thread stays free.
+- **Inflight window**: a brief gap between detection and full throttle where running requests complete. Unavoidable — bounded by sweep wall-time, absorbed by the per-track buffer.
 
 ---
 
@@ -609,6 +636,34 @@ All fields reset at UTC midnight. Two reset paths, both internal:
   rollover.
 
 Both paths share `_reset_daily_state_locked()` (private — caller must hold the store lock).
+
+### `bot_data/logs/` — local intel log
+
+Telegram used to be the only place push alerts existed; the intel log mirrors
+everything to disk for later analysis.
+
+**`events-YYYY-MM.jsonl`** (monthly rotation, written by `_log_event`) — one JSON
+object per line: `{"ts", "utc", "kind", ...fields}`. Kinds:
+
+| Kind | When | Key fields |
+|---|---|---|
+| `broadcast` | Every `_broadcast` (all push alerts, canonical "Bach" rendering) | `text` |
+| `poll` | Each poll where totals moved (quiet polls skipped) | `date, normal, premium, cost, mode` |
+| `poll_fail` | API-failure onset + escalation (1st, 5th, 10th consecutive) | `consecutive, backoff_secs` |
+| `mode` | Actual mode transitions only | `from_mode, to_mode` |
+| `mass_seal` / `mass_unseal` | Sweep completion | `track`, per-project outcome lists / counts |
+| `manual_seal` / `manual_unseal` | Button-driven single-project ops | `project, track` |
+| `pending_unseal` | Midnight restore drain | `tracks, restored, failed` |
+| `day_rollover` | UTC date change | `from_date, to_date, final_*` totals |
+| `command` | Every accepted @command and archive button press | `chat, cmd` |
+
+Logging is best-effort: a failure prints `[intel-log error]` and never blocks
+delivery or polling. A quiet month is well under 1 MB; prune old files by hand.
+
+**`stdout-YYYY-MM.log`** — the run script tees all console output here
+(`PYTHONUNBUFFERED=1 python3 … | tee -a`), so `[poll]` lines, errors and
+tracebacks survive reboots. Note: lines contain ANSI color codes; `grep` works
+fine, use `less -R` for reading.
 
 ### `bot_data/subscribers.json`
 JSON array of chat ID strings. Primary chat (`TELEGRAM_CHAT_ID`) is always included and cannot be removed.

@@ -81,8 +81,15 @@ echo "  Poll    : ${POLL_INTERVAL_MINS:-60} min  |  Limit: \$${DAILY_SPEND_LIMIT
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
+# Console output is mirrored to a monthly log file so history survives
+# reboots/restarts (tmux scrollback does not). PYTHONUNBUFFERED keeps prints
+# line-buffered through the tee pipe; tmux still shows everything live.
+STDOUT_LOG_DIR="$BOT_DIR/bot_data/logs"
+mkdir -p "$STDOUT_LOG_DIR"
+
 while true; do
-    "$PYTHON" "$BOT_DIR/openai_usage_bot.py"
+    PYTHONUNBUFFERED=1 "$PYTHON" "$BOT_DIR/openai_usage_bot.py" 2>&1 \
+        | tee -a "$STDOUT_LOG_DIR/stdout-$(date -u +%Y-%m).log"
     echo "[watchdog] Bot exited. Restarting in 5 seconds... (tmux kill-session -t bot to stop)"
     sleep 5
 done
