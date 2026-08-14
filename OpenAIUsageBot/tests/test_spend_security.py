@@ -420,6 +420,69 @@ def test_wave_projection_math():
     print("  ✅ Wave projection: catches the real 8-13 ramp, ignores slow burn, rollover-safe")
 
 
+def _feed(guard, samples, cap=1_000_000, thr=850_000, track="premium", date="2026-08-14"):
+    """Feed (ts, tok) samples; return list of verdicts (None or dict)."""
+    return [guard.observe(date, track, tok, cap, thr, False, now_ts=ts)
+            for ts, tok in samples]
+
+
+def test_wave_guard_ignores_ingestion_chunk():
+    """Regression for the 46% false seal (2026-08-14): one delayed ingestion
+    chunk makes a single poll-to-poll delta look like ~450 tok/s. The windowed
+    rate + 2-poll confirmation must NOT fire."""
+    g = bot._WaveGuard()
+    # Flat at 433k for 4 min, then one +27k chunk lands, then flat again.
+    verdicts = _feed(g, [
+        (0,   433_000), (60,  433_000), (120, 433_000), (180, 433_000),
+        (240, 460_000),           # the chunk — instantaneous rate looks huge
+        (300, 460_000), (360, 460_000),
+    ])
+    assert all(v is None for v in verdicts), f"chunk artifact fired: {verdicts}"
+    print("  ✅ One ingestion chunk (the 46% incident) no longer triggers a seal")
+
+
+def test_wave_guard_floor_gate():
+    """Below 60% utilization the predictor stays disarmed no matter the rate."""
+    g = bot._WaveGuard()
+    # Violent sustained ramp but under 600k the whole time.
+    verdicts = _feed(g, [(i * 60, 300_000 + i * 40_000) for i in range(7)])  # →540k
+    assert all(v is None for v in verdicts), verdicts
+    print("  ✅ Utilization floor: no predictive seal below 60% of cap")
+
+
+def test_wave_guard_fires_on_sustained_wave():
+    """A genuine sustained wave above the floor fires after 2 confirmations."""
+    g = bot._WaveGuard()
+    # 650k climbing 30k/min (500 tok/s) — projects >1M once the window spans 2 min.
+    verdicts = _feed(g, [(i * 60, 650_000 + i * 30_000) for i in range(6)])
+    fired = [v for v in verdicts if v]
+    assert fired, "sustained wave must fire"
+    first = next(i for i, v in enumerate(verdicts) if v)
+    assert first >= 3, f"needs window span + 2 confirmations, fired at poll {first}"
+    assert fired[0]["rate"] > 400, fired[0]
+    print(f"  ✅ Sustained 500 tok/s wave fires at poll {first} (~{650 + first * 30}k)")
+
+
+def test_wave_guard_streak_resets_when_wave_subsides():
+    g = bot._WaveGuard()
+    verdicts = _feed(g, [
+        (0,   650_000), (60,  680_000), (120, 710_000),   # ramp → 1st confirmation
+        (180, 711_000), (240, 712_000), (300, 713_000),   # wave dies → streak resets
+        (360, 714_000),
+    ])
+    assert all(v is None for v in verdicts), f"subsided wave must not fire: {verdicts}"
+    print("  ✅ Confirmation streak resets when the wave subsides")
+
+
+def test_wave_guard_resets_on_day_change():
+    g = bot._WaveGuard()
+    _feed(g, [(0, 650_000), (60, 700_000), (120, 750_000)])
+    # New day: history must not carry over (no bogus span/rate)
+    v = g.observe("2026-08-15", "premium", 900_000, 1_000_000, 850_000, False, now_ts=200)
+    assert v is None
+    print("  ✅ Sample history resets on UTC day change")
+
+
 def test_mass_seal_parallel_covers_all_projects():
     """Parallel sweep must process every non-exempt project and retry failures."""
     usage, subs, names, _ = _fresh_stores()
@@ -572,6 +635,11 @@ if __name__ == "__main__":
         ("check_spend handles missing/None cost",        test_check_spend_handles_missing_cost),
         ("Per-track seal thresholds (wave buffers)",     test_per_track_seal_thresholds),
         ("Wave projection math",                         test_wave_projection_math),
+        ("WaveGuard ignores ingestion chunk (46% fix)",  test_wave_guard_ignores_ingestion_chunk),
+        ("WaveGuard utilization floor",                  test_wave_guard_floor_gate),
+        ("WaveGuard fires on sustained wave",            test_wave_guard_fires_on_sustained_wave),
+        ("WaveGuard streak resets on subsided wave",     test_wave_guard_streak_resets_when_wave_subsides),
+        ("WaveGuard resets on day change",               test_wave_guard_resets_on_day_change),
         ("Parallel sweep covers all + retries",          test_mass_seal_parallel_covers_all_projects),
         ("Seal-gap repair (oduong leak fix)",            test_seal_gap_repair),
         ("Seal-gap repair respects busy claim",          test_seal_gap_repair_respects_busy),

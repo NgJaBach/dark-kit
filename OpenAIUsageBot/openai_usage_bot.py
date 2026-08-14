@@ -47,11 +47,11 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-08-13"
+BOT_UPDATED = "2026-08-14"
 BOT_CHANGES = (
-    "Wave guard: premium now seals at 85% (was 95%) + predictive early seal",
-    "Sweep is parallel (~1 min, was ~5) with in-sweep retry for failures",
-    "Self-healing: stragglers the sweep missed get re-sealed automatically",
+    "Fixed: predictive seal no longer panics on ingestion chunks (46% incident)",
+    "Wave trigger now needs windowed+sustained rate, ≥60% usage, 2-poll confirm",
+    "Premium seals at 85%; parallel sweep + auto re-seal of missed stragglers",
     "Local intel log: every alert + state change mirrored to bot_data/logs/",
 )
 
@@ -235,22 +235,93 @@ PREMIUM_TRACK_SEAL_THRESHOLD   = int(PREMIUM_TOKEN_HARD_CAP * (1 - PREMIUM_SEAL_
 # ── Wave guard (predictive seal + tight polling near the threshold) ────────
 # Static thresholds alone can't catch a fast ramp: consumption visible NOW is
 # already 5–15 min old. The wave guard projects each track forward by the
-# lookahead window using the burn rate measured between polls, and seals early
-# when the projection crosses the cap — even if the static threshold hasn't
-# been reached yet. Near the threshold, polling is clamped to 60 s so urgent
-# mode's 3→10 min stepping can't reopen the detection gap.
-WAVE_LOOKAHEAD_SECS   = 20 * 60   # ingestion lag (≤15 min) + sweep time
-WAVE_WATCH_SLEEP_SECS = 60        # poll cadence inside the watch zone
-WAVE_WATCH_BAND_PCT   = 0.10      # watch zone starts 10% of cap below the seal threshold
-SEAL_SWEEP_WORKERS    = 4         # parallel per-project workers for the mass sweep
+# lookahead window and seals early when the projection crosses the cap.
+#
+# v1 extrapolated the single poll-to-poll delta and got fooled: OpenAI's
+# ingestion is LUMPY — delayed data lands in chunks, so one poll can show a
+# +27k jump "in 60 s" that really accumulated over 10 min. On 2026-08-14 one
+# such chunk read as ~450 tok/s and the bot sealed premium at 46%, wasting
+# free quota. Three gates now make the predictor burst-resistant:
+#   1. Rate is measured over a sliding sample WINDOW (≥2 min, ≤10 min of
+#      polls) — a chunk gets diluted to its true average rate.
+#   2. Armed only at ≥60% utilization — below that, even a genuine rocket
+#      leaves ample runway and the static threshold is the primary defense.
+#   3. The projection must cross the cap on 2 CONSECUTIVE polls — a chunk
+#      artifact spikes exactly one interval; a real wave persists.
+WAVE_LOOKAHEAD_SECS      = 20 * 60   # ingestion lag (≤15 min) + sweep time
+WAVE_RATE_WINDOW_SECS    = 10 * 60   # rate-measurement window (dilutes chunks)
+WAVE_MIN_SPAN_SECS       = 120       # need ≥2 min of samples before projecting
+WAVE_MIN_UTILIZATION_PCT = 0.60      # predictive armed only above this fraction of cap
+WAVE_CONFIRM_POLLS       = 2         # consecutive over-cap projections required
+WAVE_WATCH_SLEEP_SECS    = 60        # poll cadence inside the watch zone
+WAVE_WATCH_BAND_PCT      = 0.10      # watch zone starts 10% of cap below the seal threshold
+SEAL_SWEEP_WORKERS       = 4         # parallel per-project workers for the mass sweep
 
 
 def _wave_projected(tok_now: int, tok_prev: int, dt_secs: float,
                     lookahead: int = WAVE_LOOKAHEAD_SECS) -> int:
     """Project consumption `lookahead` seconds forward at the burn rate
-    measured between two polls. Negative deltas (day rollover) clamp to 0."""
+    measured across the sample window. Negative deltas clamp to 0."""
     rate = max(0.0, tok_now - tok_prev) / max(1.0, dt_secs)
     return int(tok_now + rate * lookahead)
+
+
+class _WaveGuard:
+    """Per-track burst-resistant predictive trigger (see gate rationale above).
+    Feed every poll via observe(); it returns None, or {"rate", "projected"}
+    when an early seal is warranted. Sample history and confirmation streaks
+    reset on UTC day change."""
+
+    def __init__(self):
+        self._date    = None
+        self._samples: dict[str, list] = {}   # track -> [(ts, tokens), …]
+        self._streak:  dict[str, int]  = {}
+
+    def observe(self, date: str, track: str, tok: int, cap: int,
+                threshold: int, already_sealed: bool,
+                now_ts: float = None) -> Optional[dict]:
+        if now_ts is None:
+            now_ts = time.time()
+        if date != self._date:
+            self._date, self._samples, self._streak = date, {}, {}
+
+        dq = self._samples.setdefault(track, [])
+        dq.append((now_ts, tok))
+        while dq and now_ts - dq[0][0] > WAVE_RATE_WINDOW_SECS:
+            dq.pop(0)
+
+        # Gate 0: static path already covers it / nothing left to protect.
+        if already_sealed or tok >= threshold:
+            self._streak[track] = 0
+            return None
+        # Gate 2: utilization floor.
+        if tok < cap * WAVE_MIN_UTILIZATION_PCT:
+            self._streak[track] = 0
+            return None
+        # Gate 1: windowed rate needs a meaningful span.
+        t0, tok0 = dq[0]
+        span = now_ts - t0
+        if span < WAVE_MIN_SPAN_SECS or len(dq) < 2:
+            return None
+        projected = _wave_projected(tok, tok0, span)
+        if projected < cap:
+            self._streak[track] = 0
+            return None
+        # Gate 1b: the LAST interval must also project over cap. The windowed
+        # average stays hot for minutes after a wave dies; conversely a lone
+        # ingestion chunk is hot instantaneously but dilutes in the window.
+        # Only a genuinely sustained wave passes both.
+        t_prev, tok_prev = dq[-2]
+        inst_projected = _wave_projected(tok, tok_prev, now_ts - t_prev)
+        if inst_projected < cap:
+            self._streak[track] = 0
+            return None
+        # Gate 3: consecutive confirmation.
+        self._streak[track] = self._streak.get(track, 0) + 1
+        if self._streak[track] < WAVE_CONFIRM_POLLS:
+            return None
+        self._streak[track] = 0
+        return {"rate": (tok - tok0) / max(1.0, span), "projected": projected}
 
 
 def _matches_track(model: str, track: str) -> bool:
@@ -3256,7 +3327,7 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
     the constructor's stale-date check. seed-vs-check is driven by has_seeded()."""
     fail_count  = 0
     last_logged = None   # (date, normal, premium, cost) of last intel-logged poll
-    prev_poll   = None   # (date, ts, {track: tokens}) — wave-guard burn-rate sample
+    wave_guard  = _WaveGuard()   # burst-resistant predictive seal trigger
     watch_zone  = False  # True while an unsealed track is near its seal threshold
 
     while True:
@@ -3337,29 +3408,24 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
 
                 # ── Wave guard: predictive early seal + watch-zone detection ──
                 # Static thresholds react to numbers that are already 5–15 min
-                # stale. Project each track forward by the lookahead window at
-                # the burn rate measured between polls; if the projection
-                # crosses the CAP, seal now — don't wait for the threshold.
-                now_ts     = time.time()
+                # stale. The guard projects each track forward on a WINDOWED
+                # burn rate; all gating (window span, 60% floor, 2-poll
+                # confirmation) lives in _WaveGuard — see its rationale.
                 track_view = (
                     ("normal",  normal_tok,  TOKEN_HARD_CAP,         NORMAL_TRACK_SEAL_THRESHOLD),
                     ("premium", premium_tok, PREMIUM_TOKEN_HARD_CAP, PREMIUM_TRACK_SEAL_THRESHOLD),
                 )
-                if prev_poll and prev_poll[0] == snap.get("date"):
-                    dt = now_ts - prev_poll[1]
-                    for track, tok, cap, thr in track_view:
-                        if tok >= thr or usage.is_mass_sealed(track):
-                            continue   # static path below handles it / already done
-                        projected = _wave_projected(tok, prev_poll[2][track], dt)
-                        if projected >= cap:
-                            rate = (tok - prev_poll[2][track]) / max(1.0, dt)
-                            print(f"[wave] {track}: {tok:,} at ~{rate:.0f} tok/s → "
-                                  f"projected {projected:,} ≥ cap in {WAVE_LOOKAHEAD_SECS // 60} min — sealing early")
-                            _log_event("wave_trigger", track=track, tokens=tok,
-                                       rate_per_sec=round(rate, 2), projected=projected)
-                            _handle_track_seal(track, snap, usage, subs, names)
-                prev_poll = (snap.get("date"), now_ts,
-                             {"normal": normal_tok, "premium": premium_tok})
+                for track, tok, cap, thr in track_view:
+                    verdict = wave_guard.observe(snap.get("date"), track, tok, cap,
+                                                 thr, usage.is_mass_sealed(track))
+                    if verdict:
+                        print(f"[wave] {track}: {tok:,} at ~{verdict['rate']:.0f} tok/s "
+                              f"(windowed, confirmed ×{WAVE_CONFIRM_POLLS}) → projected "
+                              f"{verdict['projected']:,} ≥ cap — sealing early")
+                        _log_event("wave_trigger", track=track, tokens=tok,
+                                   rate_per_sec=round(verdict["rate"], 2),
+                                   projected=verdict["projected"])
+                        _handle_track_seal(track, snap, usage, subs, names)
 
                 # Watch zone: an unsealed track close to its threshold forces
                 # 60 s polling below (urgent mode's 3→10 min stepping would

@@ -383,10 +383,17 @@ Three trigger paths, all idempotent via the per-day `mass_sealed_tracks` flag:
 
 1. **Static threshold** — `usage_poll_loop()` and `cmd_refresh()` check
    `tokens ≥ threshold` after every poll.
-2. **Predictive (wave guard)** — every poll measures the burn rate against the
-   previous poll and projects `WAVE_LOOKAHEAD_SECS` forward. If the projection
-   crosses the **cap**, the seal fires immediately even below the static
-   threshold. Logged as `wave_trigger` in the intel log with rate + projection.
+2. **Predictive (wave guard, `_WaveGuard`)** — projects each track forward by
+   `WAVE_LOOKAHEAD_SECS` at the measured burn rate; if the projection crosses
+   the **cap**, the seal fires even below the static threshold. Logged as
+   `wave_trigger` with rate + projection. Because OpenAI ingestion is lumpy
+   (delayed data lands in chunks — one chunk read as ~450 tok/s and falsely
+   sealed premium at 46% on 2026-08-14), the trigger is gated four ways:
+   rate is measured over a **2–10 min sample window** (chunks dilute), the
+   **last poll interval must also project over cap** (a window stays hot after
+   a wave dies; a chunk is hot for exactly one interval — only sustained waves
+   pass both), it is **armed only ≥60% utilization**, and it needs the
+   projection over cap on **2 consecutive polls**.
 3. **Watch zone** — while an unsealed track is within 10% of cap below its
    threshold, the poll sleep is clamped to 60 s, overriding urgent mode's
    3→10 min stepping (which used to reopen the detection gap at the worst time).
