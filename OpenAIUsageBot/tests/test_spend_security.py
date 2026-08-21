@@ -563,6 +563,126 @@ def test_seal_gap_repair_respects_busy():
     print("  ✅ Gap repair defers when another seal op is running")
 
 
+# ─── Quarantine (auto full-seal on off-watchlist usage) ─────────────────────
+
+OFFENDER_SNAP = {
+    "projects": {
+        "proj_OWrxxJaWk5MXHBi3HIdPxBDh": {   # oduong — used gpt-5.6-sol
+            "cost_usd": 0.5,
+            "models": {"gpt-5.6-sol": {"input": 9000, "output": 2000, "requests": 4},
+                       "gpt-4o-mini": {"input": 100, "output": 50, "requests": 1}},
+        },
+        "proj_J4rNEXilII2l889OotmE7YNW": {   # ngjabach — listed models only
+            "cost_usd": 0.0,
+            "models": {"gpt-5-mini": {"input": 500, "output": 100, "requests": 2}},
+        },
+    },
+}
+
+
+def test_quarantine_seals_offender_only():
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy(); bot._QUARANTINE_NOOP.clear()
+    sealed = []
+    def fake_full_seal(pid, u):
+        sealed.append(pid)
+        u.add_track_originals(bot.QUARANTINE_TRACK, pid, [{"id": "r1", "model": "gpt-5.6-sol"}])
+        return "sealed"
+    with mock.patch.object(bot, "_full_seal_project", side_effect=fake_full_seal), \
+         mock.patch.object(bot, "_send"):
+        bot._quarantine_unlisted_users(OFFENDER_SNAP, usage, subs, names)
+    assert sealed == ["proj_OWrxxJaWk5MXHBi3HIdPxBDh"], sealed
+    assert usage.is_project_track_sealed("proj_OWrxxJaWk5MXHBi3HIdPxBDh", "full")
+
+    # Second poll: already sealed → no re-attempt
+    sealed.clear()
+    with mock.patch.object(bot, "_full_seal_project", side_effect=fake_full_seal), \
+         mock.patch.object(bot, "_send"):
+        bot._quarantine_unlisted_users(OFFENDER_SNAP, usage, subs, names)
+    assert sealed == [], "already-quarantined project must not be re-sealed"
+    print("  ✅ Quarantine seals exactly the offender, once; clean projects untouched")
+
+
+def test_quarantine_respects_exemption_and_retries_failure():
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy(); bot._QUARANTINE_NOOP.clear()
+    # Exempt (user released earlier today) → skipped
+    usage.add_track_exemption("proj_OWrxxJaWk5MXHBi3HIdPxBDh", bot.QUARANTINE_TRACK)
+    with mock.patch.object(bot, "_full_seal_project") as fs, mock.patch.object(bot, "_send"):
+        bot._quarantine_unlisted_users(OFFENDER_SNAP, usage, subs, names)
+        assert not fs.called, "exempt project must not be quarantined"
+    usage.remove_track_exemption("proj_OWrxxJaWk5MXHBi3HIdPxBDh", bot.QUARANTINE_TRACK)
+
+    # Failure → retried on the next poll (not memoized)
+    calls = []
+    with mock.patch.object(bot, "_full_seal_project",
+                           side_effect=lambda p, u: (calls.append(p), "failed")[1]), \
+         mock.patch.object(bot, "_send"):
+        bot._quarantine_unlisted_users(OFFENDER_SNAP, usage, subs, names)
+        bot._quarantine_unlisted_users(OFFENDER_SNAP, usage, subs, names)
+    assert len(calls) == 2, f"failed quarantine must retry, got {len(calls)} attempts"
+
+    # noop → memoized, no retry
+    calls.clear()
+    with mock.patch.object(bot, "_full_seal_project",
+                           side_effect=lambda p, u: (calls.append(p), "noop")[1]), \
+         mock.patch.object(bot, "_send"):
+        bot._quarantine_unlisted_users(OFFENDER_SNAP, usage, subs, names)
+        bot._quarantine_unlisted_users(OFFENDER_SNAP, usage, subs, names)
+    assert len(calls) == 1, "noop quarantine must be memoized"
+    print("  ✅ Quarantine skips exempt, retries failures, memoizes noops")
+
+
+def test_full_seal_project_captures_healthy_only():
+    usage, _, _, _ = _fresh_stores()
+    rows = [
+        {"id": "r-mini", "model": "gpt-4o-mini", "max_requests_per_1_minute": 5000,
+         "max_tokens_per_1_minute": 4_000_000},
+        {"id": "r-emb", "model": "text-embedding-3-small", "max_requests_per_1_minute": 3000,
+         "max_tokens_per_1_minute": 1_000_000},
+        {"id": "r-dead", "model": "gpt-3.5-turbo", "max_requests_per_1_minute": 0,
+         "max_tokens_per_1_minute": 0},   # pre-zeroed — must NOT be captured
+    ]
+    posted = []
+    with mock.patch.object(bot, "_fetch_project_rate_limits", return_value=rows), \
+         mock.patch.object(bot, "_update_project_rate_limit",
+                           side_effect=lambda p, rid, pl: (posted.append((rid, pl)), True)[1]), \
+         mock.patch.object(bot.time, "sleep"):
+        assert bot._full_seal_project("proj_X", usage) == "sealed"
+    assert {rid for rid, _ in posted} == {"r-mini", "r-emb", "r-dead"}, posted
+    caps = usage.get_sealed_tracks()["full"]["originals_by_project"]["proj_X"]
+    ids  = {c["id"] for c in caps}
+    assert ids == {"r-mini", "r-emb"}, f"pre-zeroed row must not be captured: {ids}"
+    print("  ✅ Full seal throttles ALL rows (embeddings included), captures healthy only")
+
+
+def test_release_quarantine_restores_and_exempts():
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    pid = "proj_OWrxxJaWk5MXHBi3HIdPxBDh"
+    usage.add_track_originals("full", pid, [{"id": "r-emb", "model": "text-embedding-3-small",
+                                             "max_requests_per_1_minute": 3000}])
+    with mock.patch.object(bot, "_compute_canonical_baseline", return_value={}), \
+         mock.patch.object(bot, "_restore_rate_limits", return_value=0), \
+         mock.patch.object(bot, "_send"):
+        assert bot._release_quarantine(pid, usage, subs, names) == "unsealed"
+    assert not usage.is_project_track_sealed(pid, "full")
+    assert usage.is_exempt(pid, "full"), "released project must be exempt for the day"
+    print("  ✅ Release restores rows, clears seal, exempts from re-quarantine")
+
+
+def test_quarantine_rolls_over_at_midnight():
+    usage, _, _, _ = _fresh_stores()
+    usage.add_track_originals("full", "proj_X", [{"id": "r1", "model": "gpt-5.6-sol"}])
+    usage._data["date"] = "2026-01-01"
+    usage.update({"date": "2026-01-02", "projects": {}})
+    assert not usage.is_project_track_sealed("proj_X", "full")
+    pending = usage.get_pending_track_unseal()
+    assert "proj_X" in pending.get("full", {}).get("originals_by_project", {}), \
+        "quarantine originals must queue for midnight restore"
+    print("  ✅ Quarantine flows through the standard midnight restore queue")
+
+
 # ─── Local intel log ────────────────────────────────────────────────────────
 
 def test_intel_log_captures_broadcasts():
@@ -643,6 +763,11 @@ if __name__ == "__main__":
         ("Parallel sweep covers all + retries",          test_mass_seal_parallel_covers_all_projects),
         ("Seal-gap repair (oduong leak fix)",            test_seal_gap_repair),
         ("Seal-gap repair respects busy claim",          test_seal_gap_repair_respects_busy),
+        ("Quarantine seals offender only, once",         test_quarantine_seals_offender_only),
+        ("Quarantine exemption / retry / noop memo",     test_quarantine_respects_exemption_and_retries_failure),
+        ("Full seal: all rows, healthy captures only",   test_full_seal_project_captures_healthy_only),
+        ("Release quarantine restores + exempts",        test_release_quarantine_restores_and_exempts),
+        ("Quarantine rolls over at midnight",            test_quarantine_rolls_over_at_midnight),
         ("Intel log captures broadcasts",                test_intel_log_captures_broadcasts),
         ("Intel log failure never breaks bot",           test_intel_log_failure_never_breaks_bot),
         ("Mode change logged once per transition",       test_mode_change_logged_once),

@@ -317,15 +317,35 @@ Three independent dimensions, all alarm-only (no auto-seal — see §7.5 note be
 | **Per-project spend** | $0.25 / $0.50 / $1.00 | per-(pid, threshold) per-day | `_fetch_costs()` by project |
 | **Unlisted-model first-touch** | any non-zero usage | per-(pid, model) per-day | `_fetch_tokens()` model breakdown |
 
+**Quarantine — auto full-seal on ANY off-watchlist usage.** Alerting alone proved
+insufficient: unlisted models can't be selectively track-throttled, so the bot now
+seals the offending project **entirely**. `_quarantine_unlisted_users()` runs every
+poll: any KNOWN project with non-zero usage of an unlisted model today gets
+`_full_seal_project()` — **every** rate-limit row POSTed to 0 (embeddings, gpt-5.6,
+audio — all model rows accept 0), healthy originals captured under
+`sealed_tracks["full"]` (the `QUARANTINE_TRACK`). Broadcast: "☣️ QUARANTINED".
+
+- **Dedup / self-healing**: presence in `sealed_tracks["full"]` is the memo; a
+  failed seal retries next poll; a `noop` (no rows) is memoized in-memory per day.
+- **Release**: `@bot archive` → Unseal → **Both** → project (or ALL) also lifts the
+  quarantine — restores all rows and exempts the project from re-quarantine for
+  the rest of the UTC day (`track_exemptions[pid] ⊇ ["full"]`). Off-watchlist
+  spend after a release is a deliberate human decision.
+- **Midnight**: the `"full"` entry flows through the standard rollover →
+  `pending_track_unseal` → restore path, like any track seal.
+- **Rows already at 0** (e.g. track-sealed earlier the same day) are throttled
+  again harmlessly but never captured — the 0/0-cascade guard applies.
+- Archive status marks quarantined projects with ☣️.
+
 **Cap behaviour** — when the org total first crosses `DAILY_LIMIT` ($2/day), the bot:
 - broadcasts the cap milestone alert,
 - flips to **AGGRESSIVE** mode (3-min polling) and **holds it while spend ≥ cap**
   (spend never decreases intraday, so in practice until the midnight reset —
   an earlier version reverted to passive on the very next poll),
-- does **NOT** auto-mass-seal. Reason: unlisted models (the likely culprit, since the
-  token-cap auto-seal already covers listed models) bypass the seal logic by design.
-  An auto-seal at the spend cap would throttle legitimate listed-model use without
-  stopping the actual leak. Manual `@bot archive seal both ALL` is one click away.
+- does **NOT** auto-mass-seal at the org level: off-watchlist culprits are already
+  handled per-project by the quarantine above, and an org-wide seal would throttle
+  legitimate listed-model use without adding protection. Manual
+  `@bot archive` → Seal → Both → ALL remains one click away.
 
 **Overcap escalation** — past the cap, a fresh cap-level alert fires every extra
 `SPEND_OVERCAP_STEP` ($0.50): at $2.50, $3.00, $3.50, … Dynamic thresholds share the

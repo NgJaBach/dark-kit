@@ -49,10 +49,10 @@ dotenv.load_dotenv()
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
 BOT_UPDATED = "2026-08-14"
 BOT_CHANGES = (
+    "☣️ Quarantine: any off-watchlist model use now full-seals that project",
+    "Release a quarantine via archive → Unseal → Both → project",
     "Fixed: predictive seal no longer panics on ingestion chunks (46% incident)",
-    "Wave trigger now needs windowed+sustained rate, ≥60% usage, 2-poll confirm",
     "Premium seals at 85%; parallel sweep + auto re-seal of missed stragglers",
-    "Local intel log: every alert + state change mirrored to bot_data/logs/",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -2272,7 +2272,11 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
 # ── Formatters — seal/unseal alerts ────────────────────────────────────────
 
 def _band_label(track: str) -> str:
-    return "Normal (10M)" if track == "normal" else "Premium (1M)"
+    if track == "normal":
+        return "Normal (10M)"
+    if track == "premium":
+        return "Premium (1M)"
+    return "Quarantine (all models)"   # QUARANTINE_TRACK
 
 
 def fmt_manual_seal(proj_name: str, track: str, name: str = "Bach") -> str:
@@ -2445,9 +2449,9 @@ def fmt_unlisted_model(pid: str, model: str, requests: int, tokens: int,
         f"Project: <b>{proj}</b>\n"
         f"Model:   <code>{model}</code>  (not on either free-tier list)\n"
         f"Usage:   {requests:,} req  •  {_fmt_tokens(tokens)} tok{cost_str}\n\n"
-        f"This model bills at <b>standard rates from the first token</b> and is "
-        f"<b>NOT</b> touched by the seal logic. If the request was not authorised, "
-        f"halt the source process — this bot cannot throttle off-watchlist models.\n"
+        f"This model bills at <b>standard rates from the first token</b>. "
+        f"The project will be <b>quarantined</b> — every rate limit throttled "
+        f"to 0 until UTC midnight.\n"
         f"<i>One alert per (project, model) per day. Monarch {name}, the off-list "
         f"ledger has shifted.</i>"
     )
@@ -2538,6 +2542,136 @@ def check_unlisted_models(snap: dict, usage: UsageStore, subs: SubscriberStore,
             print(f"[unlisted-alert] {KNOWN_PROJECTS.get(pid, pid)}/{model} "
                   f"reqs={reqs} tok={tok} est_cost=${est_cost:.4f}")
     return fired
+
+
+# ── Quarantine: full-project seal on ANY off-watchlist usage ────────────────
+# Unlisted models bill from token 1 and can't be selectively track-throttled —
+# the only safe response is to seal the offending project ENTIRELY (every
+# rate-limit row, listed or not; embedding/gpt-5.6/etc rows all accept 0).
+# Originals live in sealed_tracks[QUARANTINE_TRACK] so the standard midnight
+# rollover → pending_track_unseal → restore path applies unchanged.
+QUARANTINE_TRACK = "full"
+
+# In-memory memo of projects whose quarantine came back 'noop' (no rate-limit
+# rows to throttle) so they aren't re-attempted every poll. Keyed (date, pid).
+_QUARANTINE_NOOP: set = set()
+
+
+def fmt_quarantine(proj_name: str, models: list, name: str = "Bach") -> str:
+    ms = ", ".join(f"<code>{m}</code>" for m in models[:5])
+    return (
+        f"☣️ <b>{proj_name} — QUARANTINED.</b>\n\n"
+        f"Off-watchlist model usage detected: {ms}\n"
+        f"Unlisted models bill at standard rates from the first token and cannot "
+        f"be selectively throttled — <b>every</b> rate limit of this project is "
+        f"now 0 until UTC midnight.\n"
+        f"<i>Release: <code>@bot archive</code> → Unseal → Both → project. "
+        f"Monarch {name}, the breach is contained.</i>"
+    )
+
+
+def fmt_quarantine_release(proj_name: str, name: str = "Bach") -> str:
+    return (
+        f"🔓 <b>{proj_name} — quarantine lifted.</b>\n"
+        f"<i>All rate limits restored; exempt from re-quarantine until UTC "
+        f"midnight. Off-watchlist spend is on your head now, Monarch {name}.</i>"
+    )
+
+
+def _full_seal_project(pid: str, usage: UsageStore) -> str:
+    """Throttle EVERY rate-limit row of `pid` to 0 (all models, listed or not),
+    capturing healthy pre-throttle originals under QUARANTINE_TRACK. Returns
+    'sealed' / 'noop' / 'failed'. Rolls back its own rows on partial failure.
+    Caller must hold the busy claim."""
+    rate_limits = _fetch_project_rate_limits(pid)
+    if rate_limits is None:
+        return "failed"
+    if not rate_limits:
+        return "noop"
+    # Capture only healthy rows — rows already at 0 (e.g. track-sealed earlier
+    # today) stay owned by their existing capture; recording them here would
+    # re-create the 0/0 cascade on restore.
+    originals = _capture_originals(
+        [rl for rl in rate_limits
+         if rl.get("max_requests_per_1_minute") or rl.get("max_tokens_per_1_minute")]
+    )
+    throttled_ids: list[str] = []
+    for rl in rate_limits:
+        payload = _seal_payload(rl)
+        if not payload:
+            continue   # row exposes no settable fields
+        if _update_project_rate_limit(pid, rl["id"], payload):
+            throttled_ids.append(rl["id"])
+            time.sleep(0.05)
+        else:
+            _restore_rate_limits(pid, [o for o in originals if o["id"] in throttled_ids])
+            return "failed"
+    if originals:
+        usage.add_track_originals(QUARANTINE_TRACK, pid, originals)
+        return "sealed"
+    return "noop"
+
+
+def _quarantine_unlisted_users(snap: dict, usage: UsageStore, subs: SubscriberStore,
+                               names: NameStore = None) -> None:
+    """Auto-seal any KNOWN project that touched an off-watchlist model today —
+    even once. Runs every poll: sealed_tracks['full'] presence is the dedup,
+    an exemption on 'full' (set when the user releases the quarantine) is the
+    opt-out, and failures simply retry next poll."""
+    offenders: dict[str, list] = {}
+    for pid, p in snap.get("projects", {}).items():
+        if pid not in KNOWN_PROJECTS:
+            continue
+        bad = [m for m, mm in p.get("models", {}).items()
+               if _track_for_model(m) is None
+               and (mm.get("requests", 0) or mm.get("input", 0) + mm.get("output", 0))]
+        if bad:
+            offenders[pid] = bad
+
+    day = today_str()
+    todo = [pid for pid in offenders
+            if not usage.is_project_track_sealed(pid, QUARANTINE_TRACK)
+            and not usage.is_exempt(pid, QUARANTINE_TRACK)
+            and (day, pid) not in _QUARANTINE_NOOP]
+    if not todo:
+        return
+    if not _try_claim_busy():
+        print("[quarantine] deferred — another seal/unseal in progress")
+        return
+    try:
+        for pid in todo:
+            proj   = KNOWN_PROJECTS.get(pid, pid)
+            result = _full_seal_project(pid, usage)
+            if result == "sealed":
+                print(f"[quarantine] {proj} sealed (models: {offenders[pid]})")
+                _log_event("quarantine", project=proj, models=offenders[pid])
+                _broadcast(lambda n, p=proj, ms=offenders[pid]:
+                    fmt_quarantine(p, ms, n), subs, names)
+            elif result == "noop":
+                _QUARANTINE_NOOP.add((day, pid))
+            else:
+                print(f"[quarantine] {proj} failed — will retry next poll")
+    finally:
+        _release_busy()
+
+
+def _release_quarantine(pid: str, usage: UsageStore, subs: SubscriberStore,
+                        names: NameStore) -> str:
+    """Restore a quarantined project's rows and exempt it from re-quarantine
+    for the rest of the UTC day. Caller must hold the busy claim."""
+    proj = KNOWN_PROJECTS.get(pid, pid)
+    if not usage.is_project_track_sealed(pid, QUARANTINE_TRACK):
+        usage.add_track_exemption(pid, QUARANTINE_TRACK)   # opt out of re-quarantine
+        return "noop"
+    baseline = _compute_canonical_baseline(usage)
+    result   = _restore_track_for_project(pid, QUARANTINE_TRACK, usage, baseline)
+    if result == "restored":
+        usage.add_track_exemption(pid, QUARANTINE_TRACK)
+        print(f"[quarantine] {proj} released + exempt")
+        _log_event("quarantine_release", project=proj)
+        _broadcast(lambda n, p=proj: fmt_quarantine_release(p, n), subs, names)
+        return "unsealed"
+    return result
 
 
 def seed_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
@@ -2891,6 +3025,10 @@ def handle_archive_callback(data: str, usage: UsageStore, subs: SubscriberStore,
                         _mass_seal_track(t, usage, subs, names, respect_exemptions=False)
                     else:
                         _mass_unseal_track(t, usage, subs, names, reason="manual all")
+                if action == "unseal" and mode == "both":
+                    # "Both" is the full-release gesture — lift quarantines too.
+                    _mass_unseal_track(QUARANTINE_TRACK, usage, subs, names,
+                                       reason="manual all (quarantine)")
             _spawn_archive_worker(_work, _kb_archive_root, chat_id, msg_id, usage, name)
             placeholder = (f"{_fmt_archive_status(usage, name)}\n\n"
                            f"🔄 <i>Working on {action} ALL ({mode}) — watch chat for progress…</i>")
@@ -2909,6 +3047,10 @@ def handle_archive_callback(data: str, usage: UsageStore, subs: SubscriberStore,
                     _manual_seal_project(t, pid, usage, subs, names)
                 else:
                     _manual_unseal_project(t, pid, usage, subs, names)
+            if action == "unseal" and mode == "both":
+                # Full-release gesture: also lift this project's quarantine
+                # (restores off-watchlist rows + exempts from re-quarantine today).
+                _release_quarantine(pid, usage, subs, names)
         _spawn_archive_worker(_work,
                               lambda: _kb_archive_projects(action, mode, usage),
                               chat_id, msg_id, usage, name)
@@ -2950,6 +3092,8 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
     lines.append("<b>Projects</b>")
     for pid, proj_name in sorted(KNOWN_PROJECTS.items(), key=lambda kv: kv[1]):
         tags = []
+        if pid in sealed_tracks.get(QUARANTINE_TRACK, {}).get("originals_by_project", {}):
+            tags.append("☣️")                            # quarantined (off-watchlist use)
         for t in ("normal", "premium"):
             if pid in sealed_tracks.get(t, {}).get("originals_by_project", {}):
                 tags.append(f"🔒{t[0].upper()}")        # 🔒N / 🔒P
@@ -2961,7 +3105,8 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
         status = " ".join(tags) if tags else "✅"
         lines.append(f"  • <b>{proj_name}</b> — {status}")
     lines.append("")
-    lines.append("<i>🔒=sealed 🔓=exempt ⏳=restore-pending · N=normal P=premium</i>")
+    lines.append("<i>🔒=sealed ☣️=quarantined 🔓=exempt ⏳=restore-pending · "
+                 "N=normal P=premium F=quarantine</i>")
     lines.append(f"<i>Monarch {name}, the archive registry is presented.</i>")
     return "\n".join(lines)
 
@@ -2996,6 +3141,7 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
         else:
             new_spend, spend_cap_crossed = check_spend(snap, usage, subs, names)
         check_unlisted_models(snap, usage, subs, names)
+        _quarantine_unlisted_users(snap, usage, subs, names)
 
         mode             = usage.get_mode()
         mode_note        = ""
@@ -3405,6 +3551,7 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 else:
                     new_spend, spend_cap_crossed = check_spend(snap, usage, subs, names)
                 check_unlisted_models(snap, usage, subs, names)
+                _quarantine_unlisted_users(snap, usage, subs, names)
 
                 # ── Wave guard: predictive early seal + watch-zone detection ──
                 # Static thresholds react to numbers that are already 5–15 min
