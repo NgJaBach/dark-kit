@@ -62,8 +62,13 @@ usage_poll_loop()
        ├── _process_pending_track_unseals()          → drain per-track restore queue (day rollover)
        ├── seed_milestones() if !seeded              → fires top-1 milestone per track (idempotent)
        ├── check_milestones() otherwise              → fires on newly crossed thresholds
-       ├── _handle_track_seal("normal")              → if ≥95% utilisation, mass-throttle every project
-       ├── _handle_track_seal("premium")             →   (idempotent per UTC day via mass_sealed flag)
+       ├── check_spend() / seed_spend()              → org + per-project $ thresholds, overcap escalation
+       ├── check_unlisted_models()                   → off-watchlist first-touch alert
+       ├── _quarantine_unlisted_users()              → FULL-seals any project using an unlisted model
+       ├── _WaveGuard.observe()                      → predictive early seal (windowed rate, ≥60%, ×2)
+       ├── _handle_track_seal("normal")              → static: ≥95% utilisation → mass-throttle
+       ├── _handle_track_seal("premium")             → static: ≥85% utilisation (wave buffer)
+       ├── _repair_seal_gaps()                       → re-seals projects the sweep missed
        ├── _handle_overcap()                         → alarm-only: shouts at any project burning post-cap
        │     ├── _fetch_recent_activity_by_band()    → per-project, per-band counts
        │     └── _filter_to_exceeded_band()          → drop projects only using OK band
@@ -116,9 +121,12 @@ POLL_INTERVAL_MINS=30              # Passive-mode baseline (default 30, minimum 
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `DAILY_LIMIT` | $5.00 | Daily spend reference threshold |
-| `TOKEN_HARD_CAP` | 10,000,000 | Normal-model free-tier ceiling |
-| `PREMIUM_TOKEN_HARD_CAP` | 1,000,000 | Premium-model free-tier ceiling |
+| `DAILY_LIMIT` | $2.00 | Daily spend hard cap (alerts + AGGRESSIVE mode) |
+| `SPEND_MILESTONES` | $0.10/0.50/1.00/1.50/2.00 | Org-wide spend alert thresholds |
+| `PROJECT_SPEND_THRESHOLDS` | $0.25/0.50/1.00 | Per-project spend alert thresholds |
+| `SPEND_OVERCAP_STEP` | $0.50 | Extra spend per escalation alert past the cap |
+| `TOKEN_HARD_CAP` | 10,000,000 | Normal-model free-tier ceiling (tier 3+; 2.5M on tiers 1-2) |
+| `PREMIUM_TOKEN_HARD_CAP` | 1,000,000 | Premium-model free-tier ceiling (tier 3+; 250K on tiers 1-2) |
 | `PASSIVE_INTERVAL_SECS` | 30 min | Passive-mode poll interval |
 | `PASSIVE_BACKOFF_MAX` | 2 h | Max backoff on consecutive API failures |
 | `URGENT_INTERVAL_MIN` | 3 min | Starting poll interval in urgent/aggressive mode |
@@ -130,9 +138,17 @@ POLL_INTERVAL_MINS=30              # Passive-mode baseline (default 30, minimum 
 | `CONCURRENCY_WINDOW_MINS` | 5 | "Active" window for concurrency check (narrow, real-time use) |
 | `CONCURRENCY_COOLDOWN` | 900 s | Min gap between concurrency alerts |
 | `OVERCAP_WINDOW_MINS` | 20 | Activity window for overcap detection (wider, accounts for ingestion lag) |
-| `TRACK_SEAL_REMAINING_PCT` | 0.05 | Fraction of remaining quota that triggers track-level mass throttle |
-| `NORMAL_TRACK_SEAL_THRESHOLD` | 9,500,000 | Derived: cap × (1 − remaining_pct) for the normal band |
-| `PREMIUM_TRACK_SEAL_THRESHOLD` | 950,000 | Derived: cap × (1 − remaining_pct) for the premium band |
+| `NORMAL_SEAL_REMAINING_PCT` | 0.05 | Normal-band buffer → seals at 95% |
+| `PREMIUM_SEAL_REMAINING_PCT` | 0.15 | Premium-band buffer → seals at 85% (wave fix — see §7.7) |
+| `NORMAL_TRACK_SEAL_THRESHOLD` | 9,500,000 | Derived: cap × (1 − remaining_pct), normal band |
+| `PREMIUM_TRACK_SEAL_THRESHOLD` | 850,000 | Derived: cap × (1 − remaining_pct), premium band |
+| `WAVE_LOOKAHEAD_SECS` | 1200 | Predictive-seal projection horizon (ingestion lag + sweep) |
+| `WAVE_RATE_WINDOW_SECS` | 600 | Sliding window for burn-rate measurement (dilutes ingestion chunks) |
+| `WAVE_MIN_UTILIZATION_PCT` | 0.60 | Predictive seal armed only above this fraction of cap |
+| `WAVE_CONFIRM_POLLS` | 2 | Consecutive over-cap projections required to fire |
+| `WAVE_WATCH_SLEEP_SECS` | 60 | Poll cadence inside the watch zone |
+| `SEAL_SWEEP_WORKERS` | 4 | Parallel per-project workers for the mass sweep |
+| `QUARANTINE_TRACK` | `"full"` | Pseudo-track holding full-project quarantine seals (§7.5) |
 
 ### Admin key requirement
 Regular `sk-...` keys cannot access `/v1/organization/*` endpoints.
@@ -140,28 +156,57 @@ Must use an **Admin API key** (`sk-admin-...`):
 Platform → Organization → API Keys → Create Admin Key
 
 ### Model classification
-`_track_for_model(model)` is the single source of truth: it returns `"normal"`,
-`"premium"`, or `None` (unlisted). A model matches a listed name only if it is:
 
-1. the **exact name** (`gpt-4o-mini`, `o1`, `gpt-5-chat-latest`, …), or
-2. the name plus a **date-stamp snapshot suffix** (`gpt-4o-mini-2024-07-18`,
-   `gpt-4o-2024-08-06`) — recognised by `_is_listed_variant` via a `-YYYY-MM-DD`
-   regex.
+**Source of truth** — re-check whenever OpenAI updates the offer:
+<https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai>
+(section *"What models are included in this offer?"*). **Last synced: 2026-08-21.**
+
+`_track_for_model(model)` is the single source of truth in code: it returns
+`"normal"`, `"premium"`, or `None` (unlisted). A model matches a listed name only
+if it is (a) the **exact name**, or (b) the name plus a **`-YYYY-MM-DD` snapshot
+suffix** — `_is_listed_variant`.
+
+OpenAI publishes **dated snapshots** (`gpt-5.4-2026-03-05`); the tuples store the
+**base name**, so one entry covers every dated snapshot of that model while
+same-prefix paid products stay unlisted. Bare aliases resolve too, because the
+usage API sometimes reports `gpt-4o` rather than `gpt-4o-2024-08-06`.
+
+| Group | Cap (tier 3+) | Cap (tiers 1-2) | Models |
+|---|---|---|---|
+| **Premium** | 1M/day | 250K/day | `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.4`, `gpt-5.2`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5-codex`, `gpt-5`, `gpt-5-chat-latest`, `gpt-4.5-preview`¹, `gpt-4.1`, `gpt-4o`, `o3`, `o1-preview`, `o1` |
+| **Normal** | 10M/day | 2.5M/day | `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.1-codex-mini`, `gpt-5-mini`, `gpt-5-nano`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o-mini`, `o4-mini`, `o1-mini`, `codex-mini-latest` |
+
+¹ deprecated and shut down 2025-07-14; kept for completeness.
+
+Quota is **shared across each group**. OpenAI excludes from the offer regardless
+of model name: **fine-tuned models, fine-tuning training, evals, and tool use** —
+so `ft:*` classifies as unlisted (and therefore triggers quarantine).
+
+> **Tier caveat**: `TOKEN_HARD_CAP` (10M) and `PREMIUM_TOKEN_HARD_CAP` (1M) assume
+> **usage tier 3+**. On tiers 1-2 the real allowances are 2.5M / 250K — drop the
+> constants accordingly, or the bot will let the org run 4× past the real cap
+> before alarming.
 
 **Any other suffix means a different paid product and classifies as `None`**:
-`o1-pro` ($150/$600 per 1M), `gpt-5.4-pro`, `gpt-5.2-pro`, `gpt-5-pro`, `o3-pro`,
+`o1-pro` ($150/$600 per 1M), `gpt-5.5-pro`, `gpt-5.4-pro`, `o3-pro`,
 `gpt-4o-mini-tts`, `gpt-4o-transcribe`, `gpt-5.4-cyber`, `gpt-5.2-chat-latest`,
-`gpt-5-search-api`, etc. An earlier version used loose prefix matching
-(`m.startswith(p + "-")`), which silently counted `o1-pro` usage toward the
-premium free bucket — no anomaly alert, no standard-rate warning. The strict rule
-is deliberately conservative: misclassifying toward *unlisted* costs one anomaly
-alert per (project, model) per day, while misclassifying toward *listed* silently
-absorbs standard-rate spend into the "free" bucket.
+`gpt-5-search-api`, `gpt-5.3-codex`, etc. An earlier version used loose prefix
+matching (`m.startswith(p + "-")`), which silently counted `o1-pro` usage toward
+the premium free bucket. The strict rule is deliberately conservative in the
+cheap direction: misclassifying toward *unlisted* costs an alert and a
+quarantine (reversible); misclassifying toward *listed* silently absorbs
+standard-rate spend into the "free" bucket.
 
 There is **no heuristic fallback**. Unlisted models are not counted toward either
-token bucket, are never touched by seal/unseal, and trip the off-watchlist
-anomaly alert (§7.5) on first use each day. Both prefix tuples must be re-checked
-against OpenAI's free-usage page whenever OpenAI updates the model lists.
+token bucket, are never touched by track seal/unseal, and trigger the
+off-watchlist anomaly alert **and an automatic full-project quarantine** (§7.5)
+on first use each day.
+
+**When OpenAI updates the lists**, edit `NORMAL_MODEL_PREFIXES` /
+`PREMIUM_MODEL_PREFIXES` (base names only), update the table above and the
+`test_model_classification` fixture, and re-run the suite. Note that a model
+*joining* a free list retroactively reclassifies that day's usage into the track
+buckets — which can push a track over its cap the moment the bot restarts.
 
 ---
 
@@ -424,12 +469,39 @@ Three trigger paths, all idempotent via the per-day `mass_sealed_tracks` flag:
 independent, 50 ms inter-POST spacing preserved within each project) — ~1 min for
 13 projects instead of ~5. Failed projects get one **in-sweep sequential retry**.
 
-If a project still ends up unsealed (transient API failure; observed live
-2026-08-13 — the straggler kept burning post-cap for hours), **`_repair_seal_gaps()`**
-runs on every poll while a track is mass-sealed and over threshold: it re-attempts
-exactly the gap projects (non-exempt, no captured originals), broadcasts a short
-"🔧 straggler sealed" note on success, and memoizes per-(day, track) so settled
-projects aren't re-POSTed every poll. Failures stay unmemoized and retry next poll.
+**`_repair_seal_gaps()`** runs on every poll while a track is mass-sealed and over
+threshold, and heals **two** distinct failure modes:
+
+1. **Gap** — a project missing from `sealed_tracks` because its seal failed
+   mid-sweep (observed 2026-08-13: the straggler kept burning post-cap for hours).
+   Re-sealed, then memoized per-(day, track) so settled projects aren't re-POSTed
+   every poll; failures stay unmemoized and retry next poll.
+2. **Drift** — a project the bot *believes* is sealed whose limits are actually
+   healthy again (found 2026-08-22 during a smoke test: state and reality
+   disagreed and nothing ever noticed, so the bot was confidently wrong while a
+   project could burn freely). Believed-sealed projects are therefore **verified
+   against the live API** every pass and re-zeroed on drift. Never memoized —
+   drift can recur at any time.
+
+Drift re-seal **merges** captures via `merge_track_originals()` rather than
+overwriting: only some rows may have drifted, and replacing the capture list
+wholesale would discard the originals of rows still at 0 — the 0/0 cascade in a
+new disguise.
+
+#### Org rate-limit ceiling on restore
+
+`GET` can report a project rate-limit value that `POST` then refuses, because the
+**organization-level** ceiling for that model is lower (`400
+organization_rate_limit_exceeded`). Observed live 2026-08-22 on every `*-pro` row.
+Before the fix this made the whole restore return `failed`, so the project was
+never removed from `sealed_tracks` — **a quarantine could never be lifted, and the
+midnight queue would retry and fail forever**.
+
+`_update_project_rate_limit()` now parses the ceiling out of the error message and
+retries with that field clamped — **iteratively**, because the API names only one
+offending field per response and a row can exceed on several (`max_requests…`
+first, then `max_tokens…`). After 4 rounds it soft-skips: one unrestorable row
+must never strand an entire project in a sealed state.
 
 #### What a mass throttle does
 
@@ -573,6 +645,7 @@ The legacy per-project-full-seal fields (`sealed_projects`, `pending_unseal`,
 
 - **Detection latency**: up to one poll cycle, clamped to 60 s inside the watch zone (an unsealed track within 10% of cap below its threshold). Milestones flip mode to urgent well before any threshold.
 - **Per-project throttle cost**: ~50–80 track rows × ~50 ms ≈ a few seconds per project per track.
+- **`@bot refresh` never blocks**: `cmd_refresh` runs on the Telegram thread, so the quarantine sweep and any mass seal it triggers are handed to daemon workers via `_spawn_bg()`. Running them inline froze every command for minutes (fixed 2026-08-22).
 - **Full mass sweep**: 13 projects with 4 parallel workers ≈ ~1 min per track (observed ~5 min sequential on 2026-08-13 — that gap is what let the wave crest during the sweep). Auto-sweep & midnight restore block the **poll** thread for that duration; manual button-driven sweeps run in a daemon worker thread so the Telegram poll thread stays free.
 - **Inflight window**: a brief gap between detection and full throttle where running requests complete. Unavoidable — bounded by sweep wall-time, absorbed by the per-track buffer.
 

@@ -97,21 +97,42 @@ def test_callback_validates_inputs():
 # ─── Model classification ──────────────────────────────────────────────────
 
 def test_model_classification():
-    premium = ["gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5.1-codex", "gpt-5",
-               "gpt-5-codex", "gpt-5-chat-latest", "gpt-4.1", "gpt-4o", "o1", "o3"]
-    normal = ["gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.1-codex-mini",
-              "gpt-5-mini", "gpt-5-nano", "gpt-4.1-mini", "gpt-4.1-nano",
-              "gpt-4o-mini", "o1-mini", "o3-mini", "o4-mini", "codex-mini-latest"]
+    """Mirrors OpenAI's published free-tier lists verbatim (synced 2026-08-21).
+    Re-check: help.openai.com article 10306912 -> "What models are included"."""
+    # 1M group (250K for usage tiers 1-2) - OpenAI publishes dated snapshots
+    premium = ["gpt-5.6-sol", "gpt-5.5-2026-04-23", "gpt-5.4-2026-03-05",
+               "gpt-5.2-2025-12-11", "gpt-5.1-2025-11-13", "gpt-5.1-codex",
+               "gpt-5-codex", "gpt-5-2025-08-07", "gpt-5-chat-latest",
+               "gpt-4.5-preview-2025-02-27", "gpt-4.1-2025-04-14",
+               "gpt-4o-2024-05-13", "gpt-4o-2024-08-06", "gpt-4o-2024-11-20",
+               "o3-2025-04-16", "o1-preview-2024-09-12", "o1-2024-12-17"]
+    # 10M group (2.5M for usage tiers 1-2)
+    normal = ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini-2026-03-17",
+              "gpt-5.4-nano-2026-03-17", "gpt-5.1-codex-mini",
+              "gpt-5-mini-2025-08-07", "gpt-5-nano-2025-08-07",
+              "gpt-4.1-mini-2025-04-14", "gpt-4.1-nano-2025-04-14",
+              "gpt-4o-mini-2024-07-18", "o4-mini-2025-04-16",
+              "o1-mini-2024-09-12", "codex-mini-latest"]
     for m in premium: assert bot._track_for_model(m) == "premium", m
     for m in normal:  assert bot._track_for_model(m) == "normal",  m
-    # Unlisted models — the spend-anomaly target class
+
+    # Bare aliases must resolve too - the usage API sometimes reports the alias
+    # rather than the resolved snapshot.
+    for m, exp in [("gpt-5.6-sol", "premium"), ("gpt-5.5", "premium"),
+                   ("gpt-5.4", "premium"), ("gpt-5", "premium"),
+                   ("gpt-4o", "premium"), ("o1", "premium"), ("o3", "premium"),
+                   ("gpt-5.6-terra", "normal"), ("gpt-5.6-luna", "normal"),
+                   ("gpt-4o-mini", "normal"), ("gpt-5-mini", "normal"),
+                   ("o4-mini", "normal")]:
+        assert bot._track_for_model(m) == exp, f"{m} -> {bot._track_for_model(m)}"
+
+    # Unlisted models - the spend-anomaly / quarantine target class
     for m in ["sora-2", "dall-e-3", "gpt-3.5-turbo", "text-embedding-3-small",
-              "text-embedding-3-large", "whisper-1", "tts-1"]:
+              "text-embedding-3-large", "whisper-1", "tts-1", "gpt-image-2"]:
         assert bot._track_for_model(m) is None, m
-    # Date-stamped snapshots inherit the base model's track
-    assert bot._track_for_model("gpt-4o-mini-2024-07-18") == "normal"
-    assert bot._track_for_model("gpt-4o-2024-08-06")      == "premium"
-    print("  ✅ Listed-model + unlisted-model classification correct")
+    # OpenAI excludes fine-tuned models from the offer regardless of base model
+    assert bot._track_for_model("ft:gpt-4o-mini-2024-07-18:acme::abc123") is None
+    print("  \u2705 Both free-tier lists match OpenAI's published groups (30 models + aliases)")
 
 
 def test_same_prefix_paid_products_are_unlisted():
@@ -132,10 +153,10 @@ def test_same_prefix_paid_products_are_unlisted():
         "gpt-4o-transcribe",      # was: premium via 'gpt-4o-'
         "gpt-4o-transcribe-diarize",
         "o1-mini-tts-hypothetical",  # future-proofing: suffix on a normal-list name
-        # brand-new families that share no boundary — must also be None
-        "gpt-5.5", "gpt-5.5-pro", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-        "gpt-5.3-codex", "gpt-5.3-chat-latest", "chat-latest",
-        "gpt-image-2", "gpt-realtime-2.1", "gpt-audio-1.5",
+        # paid siblings of NOW-LISTED families (gpt-5.5 / gpt-5.6-* joined the
+        # free tiers on 2026-08-21; their -pro/-codex variants did NOT)
+        "gpt-5.5-pro", "gpt-5.6-sol-pro", "gpt-5.3-codex", "gpt-5.3-chat-latest",
+        "chat-latest", "gpt-image-2", "gpt-realtime-2.1", "gpt-audio-1.5",
     ]
     for m in paid_lookalikes:
         got = bot._track_for_model(m)
@@ -567,9 +588,9 @@ def test_seal_gap_repair_respects_busy():
 
 OFFENDER_SNAP = {
     "projects": {
-        "proj_OWrxxJaWk5MXHBi3HIdPxBDh": {   # oduong — used gpt-5.6-sol
+        "proj_OWrxxJaWk5MXHBi3HIdPxBDh": {   # offender - used an off-list model
             "cost_usd": 0.5,
-            "models": {"gpt-5.6-sol": {"input": 9000, "output": 2000, "requests": 4},
+            "models": {"text-embedding-3-small": {"input": 9000, "output": 2000, "requests": 4},
                        "gpt-4o-mini": {"input": 100, "output": 50, "requests": 1}},
         },
         "proj_J4rNEXilII2l889OotmE7YNW": {   # ngjabach — listed models only
@@ -586,7 +607,7 @@ def test_quarantine_seals_offender_only():
     sealed = []
     def fake_full_seal(pid, u):
         sealed.append(pid)
-        u.add_track_originals(bot.QUARANTINE_TRACK, pid, [{"id": "r1", "model": "gpt-5.6-sol"}])
+        u.add_track_originals(bot.QUARANTINE_TRACK, pid, [{"id": "r1", "model": "text-embedding-3-small"}])
         return "sealed"
     with mock.patch.object(bot, "_full_seal_project", side_effect=fake_full_seal), \
          mock.patch.object(bot, "_send"):
@@ -673,7 +694,7 @@ def test_release_quarantine_restores_and_exempts():
 
 def test_quarantine_rolls_over_at_midnight():
     usage, _, _, _ = _fresh_stores()
-    usage.add_track_originals("full", "proj_X", [{"id": "r1", "model": "gpt-5.6-sol"}])
+    usage.add_track_originals("full", "proj_X", [{"id": "r1", "model": "text-embedding-3-small"}])
     usage._data["date"] = "2026-01-01"
     usage.update({"date": "2026-01-02", "projects": {}})
     assert not usage.is_project_track_sealed("proj_X", "full")
@@ -681,6 +702,171 @@ def test_quarantine_rolls_over_at_midnight():
     assert "proj_X" in pending.get("full", {}).get("originals_by_project", {}), \
         "quarantine originals must queue for midnight restore"
     print("  ✅ Quarantine flows through the standard midnight restore queue")
+
+
+# ─── Thread safety + HTML robustness (2026-08-22 audit) ─────────────────────
+
+def test_cmd_refresh_never_blocks_telegram_thread():
+    """cmd_refresh runs on the Telegram poll thread. A quarantine sweep or mass
+    seal there would freeze every command for minutes, so both must be handed to
+    a background worker. Regression for the audit finding."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    usage._data["spend_seeded"] = True
+    # Over BOTH seal thresholds and with an off-list model in play.
+    snap = {
+        "date": bot.today_str(), "total_cost": 0.0,
+        "total_normal_tokens": 9_900_000, "total_premium_tokens": 990_000,
+        "projects": {"proj_J4rNEXilII2l889OotmE7YNW": {
+            "cost_usd": 0.0, "num_requests": 1, "total_tokens": 100,
+            "models": {"text-embedding-3-small": {"input": 100, "output": 0, "requests": 1}}}},
+    }
+    spawned = []
+    def slow(*a, **k):
+        time.sleep(5)   # would be a 5 s freeze if called inline
+    with mock.patch.object(bot, "fetch_today_usage", return_value=snap), \
+         mock.patch.object(bot, "_enrich_costs", side_effect=lambda s, *a, **k: s), \
+         mock.patch.object(bot, "_fetch_recent_activity_by_band", return_value={}), \
+         mock.patch.object(bot, "_quarantine_unlisted_users", side_effect=slow), \
+         mock.patch.object(bot, "_handle_track_seal", side_effect=slow), \
+         mock.patch.object(bot, "_spawn_bg",
+                           side_effect=lambda label, fn, *a: spawned.append(label)), \
+         mock.patch.object(bot, "_send"):
+        t0 = time.time()
+        out = bot.cmd_refresh(usage, subs, names, "Bach")
+        elapsed = time.time() - t0
+    assert elapsed < 1.0, f"cmd_refresh blocked for {elapsed:.1f}s — must be backgrounded"
+    assert "quarantine/refresh" in spawned, spawned
+    assert "track-seal/normal" in spawned and "track-seal/premium" in spawned, spawned
+    assert "Data refreshed" in out
+    print(f"  ✅ cmd_refresh returns in {elapsed*1000:.0f}ms; 3 sweeps backgrounded")
+
+
+def test_model_names_escaped_in_alerts():
+    """A model name containing HTML metacharacters must not break Telegram's
+    parser — an unparseable message is a 400 and the alert is LOST entirely."""
+    evil = 'gpt-<b>&"x'
+    for text in (bot.fmt_unlisted_model("proj_X", evil, 3, 500, 0.02),
+                 bot.fmt_quarantine("some-project", [evil])):
+        assert "<b>&\"x" not in text, "raw metacharacters leaked into HTML"
+        assert "&lt;b&gt;" in text and "&amp;" in text, text[:200]
+    # Report commands render model names too
+    usage, _, _, _ = _fresh_stores()
+    usage._data.update({"date": "2026-08-22", "projects": {"p": {
+        "name": "p", "total_tokens": 10, "input_tokens": 5, "output_tokens": 5,
+        "num_requests": 1, "models": {evil: {"input": 5, "output": 5, "requests": 1}}}}})
+    for out in (bot.cmd_tokens(usage), bot.cmd_models(usage)):
+        assert "&lt;b&gt;" in out and "<code>gpt-<b>" not in out, out[:200]
+    print("  ✅ Model names HTML-escaped in every alert and report path")
+
+
+def test_quarantine_and_track_seal_coexist_without_cascade():
+    """Full-day integration: a project is BOTH track-sealed and quarantined.
+    Neither capture may record an already-zeroed row (that is the 0/0 cascade
+    that once bricked projects), and midnight must restore healthy values."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy(); bot._QUARANTINE_NOOP.clear()
+    pid = "proj_J4rNEXilII2l889OotmE7YNW"
+    live = {   # id -> current limits, mutated by the fake API
+        "r-4o":  {"id": "r-4o",  "model": "gpt-4o", "max_requests_per_1_minute": 5000,
+                  "max_tokens_per_1_minute": 4_000_000},
+        "r-emb": {"id": "r-emb", "model": "text-embedding-3-small",
+                  "max_requests_per_1_minute": 3000, "max_tokens_per_1_minute": 1_000_000},
+    }
+    def fake_get(p): return [dict(v) for v in live.values()]
+    def fake_post(p, rid, payload):
+        live[rid].update(payload); return True
+    with mock.patch.object(bot, "_fetch_project_rate_limits", side_effect=fake_get), \
+         mock.patch.object(bot, "_update_project_rate_limit", side_effect=fake_post), \
+         mock.patch.object(bot.time, "sleep"), mock.patch.object(bot, "_send"):
+        # 1. premium track seal zeroes the gpt-4o row and captures its originals
+        assert bot._throttle_track_for_project(pid, "premium", usage) == "throttled"
+        assert live["r-4o"]["max_requests_per_1_minute"] == 0
+        assert live["r-emb"]["max_requests_per_1_minute"] == 3000, "embedding row untouched by track seal"
+        # 2. quarantine then full-seals everything; must NOT re-capture the zeroed row
+        assert bot._full_seal_project(pid, usage) == "sealed"
+        assert live["r-emb"]["max_requests_per_1_minute"] == 0, "embedding row must be zeroed"
+        caps = usage.get_sealed_tracks()["full"]["originals_by_project"][pid]
+        assert {c["id"] for c in caps} == {"r-emb"}, f"0/0 cascade risk: captured {caps}"
+        # 3. midnight rollover queues both entries
+        usage._data["date"] = "2026-08-22"
+        usage.update({"date": "2026-08-23", "projects": {}})
+        pending = usage.get_pending_track_unseal()
+        assert pid in pending["premium"]["originals_by_project"]
+        assert pid in pending["full"]["originals_by_project"]
+        # 4. drain restores HEALTHY values for every row
+        with mock.patch.object(bot, "_compute_canonical_baseline", return_value={}):
+            bot._process_pending_track_unseals(usage, subs, names)
+    assert live["r-4o"]["max_requests_per_1_minute"] == 5000, live["r-4o"]
+    assert live["r-emb"]["max_requests_per_1_minute"] == 3000, live["r-emb"]
+    assert not usage.get_pending_track_unseal(), "queue must drain fully"
+    print("  ✅ Track seal + quarantine coexist; midnight restores all rows, no 0/0 cascade")
+
+
+def test_org_ceiling_clamp_on_restore():
+    """A captured original above the ORG ceiling must clamp-and-retry, and must
+    never permanently fail (which would strand the project sealed forever).
+    Regression for the 2026-08-22 live finding on every *-pro row."""
+    posts = []
+    class R:
+        def __init__(s, ok, body=None): s.ok, s._b, s.status_code, s.text = ok, body, 200 if ok else 400, str(body)
+        def json(s): return s._b
+    def fake_post(url, headers=None, json=None, timeout=None):
+        posts.append(dict(json))
+        if json.get("max_requests_per_1_minute", 0) > 500:
+            return R(False, {"error": {"code": "organization_rate_limit_exceeded",
+                "message": "The max_requests_per_1_minute for rl-gpt-5-pro cannot "
+                           "exceed the organization rate limit of 500.0"}})
+        return R(True, {})
+    with mock.patch.object(bot.requests, "post", side_effect=fake_post):
+        ok = bot._update_project_rate_limit("p", "rl-gpt-5-pro",
+                {"max_requests_per_1_minute": 5000, "max_tokens_per_1_minute": 100})
+    assert ok is True, "must not hard-fail"
+    assert len(posts) == 2, f"expected original + clamped retry, got {posts}"
+    assert posts[1]["max_requests_per_1_minute"] == 500, posts[1]
+    assert posts[1]["max_tokens_per_1_minute"] == 100, "other fields preserved"
+
+    # Unparseable ceiling -> soft-skip, still never strands the project
+    def fake_post2(url, headers=None, json=None, timeout=None):
+        return R(False, {"error": {"code": "organization_rate_limit_exceeded",
+                                   "message": "nope"}})
+    with mock.patch.object(bot.requests, "post", side_effect=fake_post2):
+        assert bot._update_project_rate_limit("p", "rl-x", {"max_requests_per_1_minute": 9}) is True
+    print("  ✅ Org-ceiling restores clamp-and-retry; never strand a sealed project")
+
+
+def test_repair_detects_seal_drift():
+    """A project the bot BELIEVES is sealed but whose limits are actually healthy
+    must be detected and re-zeroed. Regression for the 2026-08-22 drift finding."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy(); bot._REPAIR_DONE.clear()
+    pid = "proj_J4rNEXilII2l889OotmE7YNW"
+    usage.mark_mass_sealed("premium")
+    # State says sealed, with one row captured...
+    usage.add_track_originals("premium", pid, [
+        {"id": "r-4o",  "model": "gpt-4o",  "max_requests_per_1_minute": 5000},
+        {"id": "r-41",  "model": "gpt-4.1", "max_requests_per_1_minute": 5000}])
+    # ...but reality: r-4o drifted back to healthy, r-41 still correctly 0
+    live = {"r-4o": {"id": "r-4o", "model": "gpt-4o", "max_requests_per_1_minute": 5000,
+                     "max_tokens_per_1_minute": 400000},
+            "r-41": {"id": "r-41", "model": "gpt-4.1", "max_requests_per_1_minute": 0,
+                     "max_tokens_per_1_minute": 0}}
+    posted = []
+    def fake_post(p, rid, payload, **kw):
+        posted.append(rid); live[rid].update(payload); return True
+    others = {p for p in bot.KNOWN_PROJECTS if p != pid}
+    with mock.patch.object(bot, "_fetch_project_rate_limits",
+                           side_effect=lambda p: [dict(v) for v in live.values()] if p == pid else []), \
+         mock.patch.object(bot, "_update_project_rate_limit", side_effect=fake_post), \
+         mock.patch.object(bot.time, "sleep"), mock.patch.object(bot, "_send"):
+        for o in others:   # keep other projects out of the way
+            usage.add_track_exemption(o, "premium")
+        bot._repair_seal_gaps("premium", usage, subs, names)
+    assert posted == ["r-4o"], f"only the drifted row should be re-zeroed: {posted}"
+    assert live["r-4o"]["max_requests_per_1_minute"] == 0
+    caps = {c["id"] for c in usage.get_sealed_tracks()["premium"]["originals_by_project"][pid]}
+    assert caps == {"r-4o", "r-41"}, f"merge must preserve the still-sealed row: {caps}"
+    print("  ✅ Drift detected and re-sealed; existing captures preserved by merge")
 
 
 # ─── Local intel log ────────────────────────────────────────────────────────
@@ -768,6 +954,11 @@ if __name__ == "__main__":
         ("Full seal: all rows, healthy captures only",   test_full_seal_project_captures_healthy_only),
         ("Release quarantine restores + exempts",        test_release_quarantine_restores_and_exempts),
         ("Quarantine rolls over at midnight",            test_quarantine_rolls_over_at_midnight),
+        ("cmd_refresh never blocks Telegram thread",     test_cmd_refresh_never_blocks_telegram_thread),
+        ("Model names HTML-escaped in alerts",           test_model_names_escaped_in_alerts),
+        ("Quarantine + track seal, no 0/0 cascade",      test_quarantine_and_track_seal_coexist_without_cascade),
+        ("Org-ceiling clamp on restore",                 test_org_ceiling_clamp_on_restore),
+        ("Repair detects seal drift",                    test_repair_detects_seal_drift),
         ("Intel log captures broadcasts",                test_intel_log_captures_broadcasts),
         ("Intel log failure never breaks bot",           test_intel_log_failure_never_breaks_bot),
         ("Mode change logged once per transition",       test_mode_change_logged_once),

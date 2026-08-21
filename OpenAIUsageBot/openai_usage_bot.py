@@ -47,12 +47,12 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-08-14"
+BOT_UPDATED = "2026-08-22"
 BOT_CHANGES = (
-    "☣️ Quarantine: any off-watchlist model use now full-seals that project",
-    "Release a quarantine via archive → Unseal → Both → project",
-    "Fixed: predictive seal no longer panics on ingestion chunks (46% incident)",
-    "Premium seals at 85%; parallel sweep + auto re-seal of missed stragglers",
+    "Model lists resynced: gpt-5.6-sol -> 1M tier, gpt-5.6-terra/luna -> 10M tier",
+    "Fixed: a quarantine could never be lifted if a row hit the org rate ceiling",
+    "New: seals are now VERIFIED against the API — silent drift is re-sealed",
+    "Fixed: @bot refresh no longer freezes the command loop during a sweep",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -354,30 +354,46 @@ OPENAI_COSTS_URL = "https://api.openai.com/v1/organization/costs"
 OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 
 # ── Free-tier model classification (from OpenAI's free-usage page) ─────────
-# Names must match EXACTLY or carry a date-stamp snapshot suffix
-# ("gpt-4o-mini-2024-07-18") — see _is_listed_variant. Same-prefix paid products
-# (o1-pro, gpt-5.4-pro, gpt-4o-mini-tts, …) are NOT free-tier and must classify
-# as unlisted so the anomaly alert fires.
+# SOURCE OF TRUTH — re-check when OpenAI updates the offer:
+#   https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai
+#   (section: "What models are included in this offer?")
+# Last synced: 2026-08-21.
+#
+# OpenAI lists DATED SNAPSHOTS (e.g. "gpt-5.4-2026-03-05"). We store the BASE
+# name; _is_listed_variant accepts the exact name or base + a -YYYY-MM-DD
+# snapshot suffix, so one entry covers every dated snapshot of that model while
+# same-prefix paid products (gpt-5.5-pro, o1-pro, gpt-4o-mini-tts, …) stay
+# unlisted. Quota is SHARED across each group. Excluded by OpenAI regardless of
+# name: fine-tuned models, fine-tuning training, evals, and tool use.
+#
+# NOTE ON TIERS: the groups are 1M / 10M for usage tier 3+, but only
+# 250K / 2.5M for tiers 1-2. TOKEN_HARD_CAP / PREMIUM_TOKEN_HARD_CAP below
+# assume tier 3+. Drop them to 2_500_000 / 250_000 if the org is tier 1-2.
+#
 # Normal-band models share 10M tokens/day free:
 NORMAL_MODEL_PREFIXES = (
+    "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.1-codex-mini",
     "gpt-5-mini", "gpt-5-nano",
     "gpt-4.1-mini", "gpt-4.1-nano",
     "gpt-4o-mini",
+    "o4-mini",
     "o1-mini",
-    "o3-mini", "o4-mini",
     "codex-mini-latest",
 )
 # Premium-band models share 1M tokens/day free:
 PREMIUM_MODEL_PREFIXES = (
+    "gpt-5.6-sol",
+    "gpt-5.5",
     "gpt-5.4", "gpt-5.2",
     "gpt-5.1-codex", "gpt-5.1",
     "gpt-5-codex", "gpt-5-chat-latest", "gpt-5",
+    "gpt-4.5-preview",          # deprecated & shut down 2025-07-14; listed for completeness
     "gpt-4.1",
     "gpt-4o",
-    "o1",
     "o3",
+    "o1-preview", "o1",
 )
 
 # ── Terminal colors (ANSI) ──────────────────────────────────────────────────
@@ -771,9 +787,26 @@ _SKIPPABLE_RATE_LIMIT_ERR_CODES = frozenset({
 })
 
 
-def _update_project_rate_limit(pid: str, rate_limit_id: str, payload: dict) -> bool:
+# "The max_requests_per_1_minute for rl-gpt-5-pro cannot exceed the
+#  organization rate limit of 500.0" — GET can report a project value that POST
+# then refuses because the ORG ceiling is lower. Observed live 2026-08-22 on
+# every *-pro row: restoring a captured original 400'd, which made the whole
+# restore fail and left the project sealed forever. Parse the ceiling and retry
+# clamped to it.
+_ORG_LIMIT_RE = re.compile(
+    r"The (\w+) for \S+ cannot exceed the organization rate limit of ([\d.]+)")
+
+
+def _update_project_rate_limit(pid: str, rate_limit_id: str, payload: dict,
+                               _attempts_left: int = 4) -> bool:
     """POST a partial update to a single rate-limit row.
-    Returns True on 2xx and on the soft-skip codes above. False on any other failure."""
+    Returns True on 2xx and on the soft-skip codes above. False on any other failure.
+
+    On `organization_rate_limit_exceeded` the requested value is above the org
+    ceiling. The API names ONE offending field per response, so clamp that field
+    and retry — iteratively, since a row can exceed the ceiling on several fields
+    (rpm first, then tpm). After `_attempts_left` rounds, soft-skip: leaving one
+    row unrestorable must never strand a whole project in a sealed state."""
     url = f"{OPENAI_RATE_LIMITS_URL_TMPL.format(pid=pid)}/{rate_limit_id}"
     try:
         r = requests.post(
@@ -787,13 +820,28 @@ def _update_project_rate_limit(pid: str, rate_limit_id: str, payload: dict) -> b
         return False
     if r.ok:
         return True
-    err_code = ""
+    err_code, err_msg = "", ""
     try:
-        err_code = r.json().get("error", {}).get("code", "") or ""
+        err = r.json().get("error", {}) or {}
+        err_code, err_msg = err.get("code", "") or "", err.get("message", "") or ""
     except Exception:
         pass
     if err_code in _SKIPPABLE_RATE_LIMIT_ERR_CODES:
         return True   # soft skip — non-updatable / no org access
+    if err_code == "organization_rate_limit_exceeded":
+        m = _ORG_LIMIT_RE.search(err_msg)
+        if m and _attempts_left > 0:
+            field, ceiling = m.group(1), float(m.group(2))
+            if field in payload and payload[field] > int(ceiling):
+                clamped = dict(payload)
+                clamped[field] = int(ceiling)
+                print(f"[openai rate-limits] {pid}/{rate_limit_id}: {field} clamped "
+                      f"to org ceiling {int(ceiling)} — retrying")
+                return _update_project_rate_limit(pid, rate_limit_id, clamped,
+                                                  _attempts_left=_attempts_left - 1)
+        print(f"[openai rate-limits] {pid}/{rate_limit_id}: above org ceiling and "
+              f"not clampable — skipping so the seal state can still clear")
+        return True   # soft skip: never strand a project sealed over one row
     print(f"[openai rate-limits POST {r.status_code}] {pid}/{rate_limit_id}: {r.text[:300]}")
     return False
 
@@ -1264,6 +1312,22 @@ class UsageStore:
             entry.setdefault("originals_by_project", {})[pid] = originals
             self._save()
 
+    def merge_track_originals(self, track: str, pid: str, originals: list) -> None:
+        """Add originals for rows not already captured, keyed by rate-limit id.
+        Used by drift re-seal: only SOME rows may have drifted healthy, and a
+        plain overwrite would discard the captures for the rows still at 0 —
+        that is the 0/0 cascade in a new disguise."""
+        with self._lock:
+            tracks = self._data.setdefault("sealed_tracks", {})
+            entry  = tracks.setdefault(track, {"sealed_at": time.time(),
+                                               "originals_by_project": {}})
+            existing = entry.setdefault("originals_by_project", {}).get(pid, [])
+            by_id = {o["id"]: o for o in existing}
+            for o in originals:
+                by_id[o["id"]] = o          # freshly-observed healthy value wins
+            entry["originals_by_project"][pid] = list(by_id.values())
+            self._save()
+
     def pop_track_originals(self, track: str, pid: str) -> Optional[list]:
         """Remove and return one project's saved originals for a track. Clears the
         track entry if no projects remain under it."""
@@ -1586,6 +1650,19 @@ def _answer_callback(callback_id: str, text: str = None) -> None:
         requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         print(f"[telegram answerCallback error] {e}")
+
+
+def _spawn_bg(label: str, fn, *args) -> None:
+    """Run `fn(*args)` in a daemon thread so slow rate-limit work never blocks the
+    caller. Used by cmd_refresh, which executes on the Telegram poll thread — a
+    mass seal or quarantine sweep there would freeze every command for minutes.
+    Callees self-guard with the busy claim, so concurrent invocations are safe."""
+    def _runner():
+        try:
+            fn(*args)
+        except Exception as e:
+            print(f"[bg:{label}] error: {e}")
+    threading.Thread(target=_runner, daemon=True, name=f"bg-{label}").start()
 
 
 def _broadcast(fmt_fn, subs: SubscriberStore, names: NameStore = None) -> None:
@@ -2187,39 +2264,79 @@ def fmt_seal_repair(track: str, n: int, name: str = "Bach") -> str:
     )
 
 
+def _reseal_drifted_project(pid: str, track: str, usage: UsageStore) -> int:
+    """Re-throttle rows of an already-'sealed' project that have drifted back to
+    healthy values. Returns the number of rows re-zeroed (0 = no drift).
+
+    Captures are MERGED, never overwritten: only some rows may have drifted, and
+    replacing the capture list wholesale would discard the originals of rows
+    still at 0. Caller must hold the busy claim."""
+    rate_limits = _fetch_project_rate_limits(pid)
+    if not rate_limits:
+        return 0
+    drifted = [rl for rl in rate_limits
+               if _matches_track(rl.get("model", ""), track)
+               and (rl.get("max_requests_per_1_minute") or rl.get("max_tokens_per_1_minute"))]
+    if not drifted:
+        return 0
+    usage.merge_track_originals(track, pid, _capture_originals(drifted))
+    rezeroed = 0
+    for rl in drifted:
+        payload = _seal_payload(rl)
+        if payload and _update_project_rate_limit(pid, rl["id"], payload):
+            rezeroed += 1
+            time.sleep(0.05)
+    return rezeroed
+
+
 def _repair_seal_gaps(track: str, usage: UsageStore, subs: SubscriberStore,
                       names: NameStore) -> None:
-    """After a mass sweep, a project can remain unsealed — a transient API
-    failure mid-sweep, or state loss. Observed live 2026-08-13: 1/13 premium
-    seals failed and that project kept burning post-cap for hours with no
-    self-healing. Called every poll while a track is mass-sealed and over its
-    threshold: re-attempts exactly the gap projects (non-exempt, no captured
-    originals, not yet repaired today). Quiet unless something got sealed."""
+    """Self-healing pass, run every poll while a track is mass-sealed and over
+    threshold. Two failure modes, both observed live:
+
+    1. GAP — a project missing from `sealed_tracks` because its seal failed
+       mid-sweep (2026-08-13: 1/13 premium seals failed and that project kept
+       burning post-cap for hours). Re-sealed, then memoized per (day, track).
+    2. DRIFT — a project the bot BELIEVES is sealed whose rate limits are
+       actually healthy again (2026-08-22: found via smoke test — state and
+       reality disagreed and nothing ever noticed). Trusting state alone makes
+       the bot confidently wrong, so believed-sealed projects are VERIFIED
+       against the live API and re-zeroed on drift. Never memoized: drift can
+       recur at any time.
+    """
     sealed = usage.get_sealed_tracks().get(track, {}).get("originals_by_project", {})
     memo_key = (today_str(), track)
     done = _REPAIR_DONE.setdefault(memo_key, set())
-    gaps = [pid for pid in KNOWN_PROJECTS
-            if pid not in sealed and pid not in done
-            and not usage.is_exempt(pid, track)]
-    if not gaps:
+    candidates = [pid for pid in KNOWN_PROJECTS if not usage.is_exempt(pid, track)]
+    gaps    = [p for p in candidates if p not in sealed and p not in done]
+    believed = [p for p in candidates if p in sealed]
+    if not gaps and not believed:
         return
     if not _try_claim_busy():
         return   # another op running — retry next poll
     try:
-        repaired = []
+        repaired, drifted = [], []
         for pid in gaps:
             result = _throttle_track_for_project(pid, track, usage)
             if result in ("throttled", "noop"):
                 done.add(pid)          # settled — don't re-attempt today
                 if result == "throttled":
                     repaired.append(pid)
-            # 'failed' stays out of the memo → retried next poll
-        if repaired:
-            names_str = ", ".join(KNOWN_PROJECTS.get(p, p) for p in repaired)
-            print(f"[seal-repair] {track}: sealed stragglers → {names_str}")
+            # 'failed' stays out of the memo -> retried next poll
+        for pid in believed:
+            if _reseal_drifted_project(pid, track, usage):
+                drifted.append(pid)
+        if repaired or drifted:
+            if repaired:
+                print(f"[seal-repair] {track}: sealed gaps -> "
+                      f"{', '.join(KNOWN_PROJECTS.get(p, p) for p in repaired)}")
+            if drifted:
+                print(f"[seal-repair] {track}: re-sealed DRIFTED -> "
+                      f"{', '.join(KNOWN_PROJECTS.get(p, p) for p in drifted)}")
             _log_event("seal_repair", track=track,
-                       repaired=[KNOWN_PROJECTS.get(p, p) for p in repaired])
-            _broadcast(lambda n, t=track, c=len(repaired):
+                       repaired=[KNOWN_PROJECTS.get(p, p) for p in repaired],
+                       drifted=[KNOWN_PROJECTS.get(p, p) for p in drifted])
+            _broadcast(lambda n, t=track, c=len(repaired) + len(drifted):
                 fmt_seal_repair(t, c, n), subs, names)
     finally:
         _release_busy()
@@ -2447,7 +2564,7 @@ def fmt_unlisted_model(pid: str, model: str, requests: int, tokens: int,
     return (
         f"🟠 <b>Unlisted Model Activity — Off-Watchlist Spend</b>\n\n"
         f"Project: <b>{proj}</b>\n"
-        f"Model:   <code>{model}</code>  (not on either free-tier list)\n"
+        f"Model:   <code>{html.escape(model)}</code>  (not on either free-tier list)\n"
         f"Usage:   {requests:,} req  •  {_fmt_tokens(tokens)} tok{cost_str}\n\n"
         f"This model bills at <b>standard rates from the first token</b>. "
         f"The project will be <b>quarantined</b> — every rate limit throttled "
@@ -2558,7 +2675,7 @@ _QUARANTINE_NOOP: set = set()
 
 
 def fmt_quarantine(proj_name: str, models: list, name: str = "Bach") -> str:
-    ms = ", ".join(f"<code>{m}</code>" for m in models[:5])
+    ms = ", ".join(f"<code>{html.escape(m)}</code>" for m in models[:5])
     return (
         f"☣️ <b>{proj_name} — QUARANTINED.</b>\n\n"
         f"Off-watchlist model usage detected: {ms}\n"
@@ -2760,7 +2877,7 @@ def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
             mi = _fmt_tokens(m.get("input", 0))
             mo = _fmt_tokens(m.get("output", 0))
             mr = m.get("requests", 0)
-            lines.append(f"   <code>{model}</code>  {mi} in / {mo} out  ({mr:,} reqs)")
+            lines.append(f"   <code>{html.escape(model)}</code>  {mi} in / {mo} out  ({mr:,} reqs)")
         lines.append("")
 
     total_premium = snap.get("total_premium_tokens", 0)
@@ -3141,7 +3258,12 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
         else:
             new_spend, spend_cap_crossed = check_spend(snap, usage, subs, names)
         check_unlisted_models(snap, usage, subs, names)
-        _quarantine_unlisted_users(snap, usage, subs, names)
+        # Quarantine can full-seal up to 13 projects (~50-80 rate-limit rows each).
+        # cmd_refresh runs on the TELEGRAM thread, so doing it inline would freeze
+        # every command for minutes — the same freeze that was fixed for archive
+        # buttons. Hand it to a daemon worker; it self-guards via the busy claim.
+        _spawn_bg("quarantine/refresh", _quarantine_unlisted_users,
+                  snap, usage, subs, names)
 
         mode             = usage.get_mode()
         mode_note        = ""
@@ -3151,12 +3273,17 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
         # Track-seal triggers — same logic as the poll loop, fired on demand so
         # /refresh near the threshold doesn't wait for the next poll. _handle_track_seal
         # is self-guarding (idempotent via the per-day mass_sealed flag).
-        if total_normal >= NORMAL_TRACK_SEAL_THRESHOLD and not usage.is_mass_sealed("normal"):
-            _handle_track_seal("normal", snap, usage, subs, names)
-            mode_note = "\n🛑 Normal track passed 95% — mass throttle complete."
-        if total_premium >= PREMIUM_TRACK_SEAL_THRESHOLD and not usage.is_mass_sealed("premium"):
-            _handle_track_seal("premium", snap, usage, subs, names)
-            mode_note = "\n🛑 Premium track passed 95% — mass throttle complete."
+        # Mass sweeps are backgrounded for the same reason as the quarantine above:
+        # a sweep takes ~1 min and must never block the Telegram command loop.
+        for _trk, _tok, _thr, _pct in (
+            ("normal",  total_normal,  NORMAL_TRACK_SEAL_THRESHOLD,  95),
+            ("premium", total_premium, PREMIUM_TRACK_SEAL_THRESHOLD, 85),
+        ):
+            if _tok >= _thr and not usage.is_mass_sealed(_trk):
+                _spawn_bg(f"track-seal/{_trk}", _handle_track_seal,
+                          _trk, snap, usage, subs, names)
+                mode_note = (f"\n🛑 {_trk.title()} track passed {_pct}% — "
+                             f"mass throttle started (watch chat for the summary).")
 
         if normal_exceeded or premium_exceeded:
             banded = _fetch_recent_activity_by_band(minutes=OVERCAP_WINDOW_MINS)
@@ -3264,7 +3391,7 @@ def cmd_models(usage: UsageStore, name: str = "Bach") -> str:
         reqs = e["requests"]
         pct  = int((e["input"] + e["output"]) / total_tok * 100)
         lines.append(
-            f"🔹 <code>{model}</code>\n"
+            f"🔹 <code>{html.escape(model)}</code>\n"
             f"   {tot}  ({inp} in / {out} out)  •  {reqs:,} reqs  •  {pct}%"
         )
 
