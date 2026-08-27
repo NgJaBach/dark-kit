@@ -47,12 +47,12 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-08-22"
+BOT_UPDATED = "2026-08-27"
 BOT_CHANGES = (
-    "Model lists resynced: gpt-5.6-sol -> 1M tier, gpt-5.6-terra/luna -> 10M tier",
+    "Premium now seals at 80% (was 85%) — sized to the measured reporting lag",
     "Fixed: a quarantine could never be lifted if a row hit the org rate ceiling",
     "New: seals are now VERIFIED against the API — silent drift is re-sealed",
-    "Fixed: @bot refresh no longer freezes the command loop during a sweep",
+    "Model lists resynced (gpt-5.6-sol / terra / luna are now free-tier)",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -223,12 +223,19 @@ def _is_busy() -> bool:
 #
 # Buffers are PER-TRACK because of "the wave": the usage API lags 5–15 min, the
 # sweep takes time, and in-flight requests keep landing after throttle — so the
-# buffer must absorb (lag + poll gap + sweep) × burn rate. Observed live on
-# 2026-08-13: premium burned ~110 tok/s at the crest; the old 5% buffer (50k)
-# bought ~8 minutes and the cap was crossed DURING the sweep. Normal's 5% buffer
-# is 500k — ten times the absolute headroom — and has never been outrun.
+# buffer must absorb the REPORTING BLIND SPOT (tokens already spent but not yet
+# visible), not just future burn.
+#
+# Measured blind spot = (end-of-day total) − (total observed when the seal fired):
+#   2026-08-19:  43k     2026-08-20: 137k     2026-08-26: 166k  <- worst
+# The 15% buffer (150k) fell ~21k short on 2026-08-26 ($0.097 of overage) even
+# though all 13 projects sealed with zero failures. 20% (200k) clears the worst
+# observed case by 34k. It costs nothing in practice: across 14 days no day ever
+# ended between 800k and 850k, and every day that reached 850k blew past 1M
+# anyway. Normal's 5% buffer is 500k — ten times the absolute headroom — and has
+# never been outrun.
 NORMAL_SEAL_REMAINING_PCT      = 0.05   # seal at 9.5M  (500k buffer)
-PREMIUM_SEAL_REMAINING_PCT     = 0.15   # seal at 850k  (150k buffer — wave fix)
+PREMIUM_SEAL_REMAINING_PCT     = 0.20   # seal at 800k  (200k buffer — see note)
 NORMAL_TRACK_SEAL_THRESHOLD    = int(TOKEN_HARD_CAP         * (1 - NORMAL_SEAL_REMAINING_PCT))
 PREMIUM_TRACK_SEAL_THRESHOLD   = int(PREMIUM_TOKEN_HARD_CAP * (1 - PREMIUM_SEAL_REMAINING_PCT))
 

@@ -67,7 +67,7 @@ usage_poll_loop()
        ├── _quarantine_unlisted_users()              → FULL-seals any project using an unlisted model
        ├── _WaveGuard.observe()                      → predictive early seal (windowed rate, ≥60%, ×2)
        ├── _handle_track_seal("normal")              → static: ≥95% utilisation → mass-throttle
-       ├── _handle_track_seal("premium")             → static: ≥85% utilisation (wave buffer)
+       ├── _handle_track_seal("premium")             → static: ≥80% utilisation (blind-spot buffer)
        ├── _repair_seal_gaps()                       → re-seals projects the sweep missed
        ├── _handle_overcap()                         → alarm-only: shouts at any project burning post-cap
        │     ├── _fetch_recent_activity_by_band()    → per-project, per-band counts
@@ -139,9 +139,9 @@ POLL_INTERVAL_MINS=30              # Passive-mode baseline (default 30, minimum 
 | `CONCURRENCY_COOLDOWN` | 900 s | Min gap between concurrency alerts |
 | `OVERCAP_WINDOW_MINS` | 20 | Activity window for overcap detection (wider, accounts for ingestion lag) |
 | `NORMAL_SEAL_REMAINING_PCT` | 0.05 | Normal-band buffer → seals at 95% |
-| `PREMIUM_SEAL_REMAINING_PCT` | 0.15 | Premium-band buffer → seals at 85% (wave fix — see §7.7) |
+| `PREMIUM_SEAL_REMAINING_PCT` | 0.20 | Premium-band buffer → seals at 80% (sized to the measured blind spot — §7.7) |
 | `NORMAL_TRACK_SEAL_THRESHOLD` | 9,500,000 | Derived: cap × (1 − remaining_pct), normal band |
-| `PREMIUM_TRACK_SEAL_THRESHOLD` | 850,000 | Derived: cap × (1 − remaining_pct), premium band |
+| `PREMIUM_TRACK_SEAL_THRESHOLD` | 800,000 | Derived: cap × (1 − remaining_pct), premium band |
 | `WAVE_LOOKAHEAD_SECS` | 1200 | Predictive-seal projection horizon (ingestion lag + sweep) |
 | `WAVE_RATE_WINDOW_SECS` | 600 | Sliding window for burn-rate measurement (dilutes ingestion chunks) |
 | `WAVE_MIN_UTILIZATION_PCT` | 0.60 | Predictive seal armed only above this fraction of cap |
@@ -430,7 +430,7 @@ rates regardless, so throttling them is pointless.
 Constants:
 ```
 NORMAL_SEAL_REMAINING_PCT     = 0.05  → NORMAL_TRACK_SEAL_THRESHOLD  = 9,500,000  (500k buffer)
-PREMIUM_SEAL_REMAINING_PCT    = 0.15  → PREMIUM_TRACK_SEAL_THRESHOLD =   850,000  (150k buffer)
+PREMIUM_SEAL_REMAINING_PCT    = 0.20  → PREMIUM_TRACK_SEAL_THRESHOLD =   800,000  (200k buffer)
 WAVE_LOOKAHEAD_SECS           = 1200  (20 min: API ingestion lag + sweep time)
 WAVE_WATCH_BAND_PCT           = 0.10  (watch zone starts 10% of cap below threshold)
 WAVE_WATCH_SLEEP_SECS         = 60
@@ -439,10 +439,27 @@ SEAL_SWEEP_WORKERS            = 4
 
 **Why per-track buffers ("the wave"):** usage numbers are 5–15 min stale when the
 bot sees them, the sweep takes time, and in-flight requests land after throttling.
-The buffer must absorb `(lag + poll gap + sweep) × burn rate`. On 2026-08-13
-premium burned ~110 tok/s at the crest; the old uniform 5% buffer (50k on premium)
-bought ~8 minutes and the cap was crossed *during* the sweep. Premium now seals at
-85% (150k buffer); normal keeps 95% (500k absolute headroom has never been outrun).
+What the buffer really has to absorb is the **reporting blind spot** — tokens
+already spent when the seal fires but not yet visible to the API.
+
+Measured blind spot = *(end-of-day total) − (total observed when the seal fired)*:
+
+| Date | Seal fired at | End of day | Blind spot | Result |
+|---|---|---|---|---|
+| 2026-08-19 | 911,516 | 954,270 | 43k | under cap |
+| 2026-08-20 | 895,212 | 1,032,623 | 137k | 33k over — $0.26 |
+| 2026-08-26 | 854,438 | 1,020,876 | **166k** | 21k over — $0.097 |
+
+The 15% buffer (150k) fell ~21k short of the worst case on 2026-08-26 *even with
+all 13 projects sealed and zero failures* — proof the leak is reporting lag, not
+seal failure. Premium therefore seals at **80% (200k buffer)**, clearing the worst
+observed blind spot by 34k. This costs nothing in practice: across 14 days no day
+ever ended between 800k and 850k, and every day that reached 850k blew past 1M
+anyway. Normal keeps 95% — its 500k absolute headroom has never been outrun.
+
+**If overshoot recurs**, re-derive the blind spot from the intel log
+(`day_rollover.final_premium` vs the `mass_seal.consumed` of the same day) and
+widen the buffer past the new maximum.
 
 Three trigger paths, all idempotent via the per-day `mass_sealed_tracks` flag:
 

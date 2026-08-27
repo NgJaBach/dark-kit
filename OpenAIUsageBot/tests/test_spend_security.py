@@ -417,8 +417,13 @@ def test_per_track_seal_thresholds():
     """Premium needs a far bigger relative buffer than normal: the wave crossed
     the old 50k buffer during the sweep itself on 2026-08-13."""
     assert bot.NORMAL_TRACK_SEAL_THRESHOLD  == 9_500_000, bot.NORMAL_TRACK_SEAL_THRESHOLD
-    assert bot.PREMIUM_TRACK_SEAL_THRESHOLD ==   850_000, bot.PREMIUM_TRACK_SEAL_THRESHOLD
-    print("  ✅ Premium seals at 850k (150k buffer), normal at 9.5M (500k buffer)")
+    assert bot.PREMIUM_TRACK_SEAL_THRESHOLD ==   800_000, bot.PREMIUM_TRACK_SEAL_THRESHOLD
+    # The buffer must exceed the worst MEASURED reporting blind spot (tokens
+    # already spent when the seal fires but not yet visible). Observed max on
+    # 2026-08-26: 166,438 — the old 150k buffer fell short and cost $0.097.
+    buffer = bot.PREMIUM_TOKEN_HARD_CAP - bot.PREMIUM_TRACK_SEAL_THRESHOLD
+    assert buffer >= 170_000, f"premium buffer {buffer:,} <= worst blind spot 166,438"
+    print(f"  ✅ Premium seals at 800k ({buffer:,} buffer > 166k worst blind spot)")
 
 
 def test_wave_projection_math():
