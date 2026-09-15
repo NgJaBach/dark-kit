@@ -47,12 +47,12 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-08-27"
+BOT_UPDATED = "2026-09-16"
 BOT_CHANGES = (
-    "Premium now seals at 80% (was 85%) — sized to the measured reporting lag",
-    "Fixed: a quarantine could never be lifted if a row hit the org rate ceiling",
-    "New: seals are now VERIFIED against the API — silent drift is re-sealed",
-    "Model lists resynced (gpt-5.6-sol / terra / luna are now free-tier)",
+    "New \U0001f9ea Exotic lane: $ spent on models outside the free lanes",
+    "Each lane now shows its billed cost, e.g. \"/ 1M. Cost: 0.00$\"",
+    "Network blips (DNS/timeouts) are retried — no more half-finished seals",
+    "Premium seals at 80%; seals are verified against the API each poll",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -232,8 +232,14 @@ def _is_busy() -> bool:
 # though all 13 projects sealed with zero failures. 20% (200k) clears the worst
 # observed case by 34k. It costs nothing in practice: across 14 days no day ever
 # ended between 800k and 850k, and every day that reached 850k blew past 1M
-# anyway. Normal's 5% buffer is 500k — ten times the absolute headroom — and has
-# never been outrun.
+# anyway.
+#
+# Normal's 5% buffer (500k) was OUTRUN for the first time on 2026-09-15: the
+# usage API jumped 8.88M -> 10.08M in one reporting interval (~1.2M in ~7 min,
+# ~2,900 tok/s — 26x the premium wave), so the first reading past the 9.5M
+# threshold was already past the 10M cap. Cost only $0.21, because normal-lane
+# overage is cheap. Single data point, and an exempt project's burn muddies the
+# post-seal numbers, so the threshold is unchanged — resize if it recurs.
 NORMAL_SEAL_REMAINING_PCT      = 0.05   # seal at 9.5M  (500k buffer)
 PREMIUM_SEAL_REMAINING_PCT     = 0.20   # seal at 800k  (200k buffer — see note)
 NORMAL_TRACK_SEAL_THRESHOLD    = int(TOKEN_HARD_CAP         * (1 - NORMAL_SEAL_REMAINING_PCT))
@@ -517,18 +523,63 @@ def _openai_headers() -> dict:
     return {"Authorization": f"Bearer {OPENAI_ADMIN_KEY}"}
 
 
-def _fetch_costs() -> Optional[dict[str, float]]:
-    """Today's cost per project. '__org__' key holds any unattributed org-level cost.
-    Returns None on API failure (distinguished from {} = no spend today)."""
+# Network-level failures are transient on this host: 67 DNS resolution failures
+# in ~18 h on 2026-09-15. One of them used to fail an entire 186-row quarantine
+# sweep (the seal aborts and rolls back on the first failed POST), leaving the
+# project unthrottled until the next poll. Retry those in place. HTTP error
+# RESPONSES are deliberately not retried — they are answers, not blips.
+_NET_RETRY_BACKOFF = (1, 2)   # seconds before attempts 2 and 3
+
+
+def _openai_call(method: str, url: str, **kwargs):
+    """requests.get/post to the OpenAI Admin API, retrying DNS / connection /
+    timeout errors up to twice. Re-raises the last error if every attempt fails,
+    so every caller's existing `except Exception` handling still applies."""
+    for attempt in range(len(_NET_RETRY_BACKOFF) + 1):
+        try:
+            return getattr(requests, method)(url, **kwargs)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            if attempt == len(_NET_RETRY_BACKOFF):
+                raise
+            time.sleep(_NET_RETRY_BACKOFF[attempt])
+
+
+LANES = ("normal", "premium", "exotic")
+
+
+def _lane_for_line_item(line_item: Optional[str]) -> str:
+    """Map a costs-API line item to its lane.
+
+    Line items look like "gpt-audio-mini-2025-12-15 audio, input" or
+    "gpt-5.4-mini-2026-03-17, cached input": the model is the first token before
+    the comma, optionally followed by a modality word. Anything that is not a
+    normal/premium model is EXOTIC — including non-model items such as web
+    search or storage — so every non-free-tier dollar is visible and the three
+    lanes always sum to the total."""
+    head = (line_item or "").split(",")[0].strip()
+    model = head.split()[0] if head else ""
+    return _track_for_model(model) or "exotic"
+
+
+def _fetch_costs_breakdown() -> Optional[tuple[dict, dict]]:
+    """Today's billed cost, grouped by project AND line item in one call.
+    Returns (per_project, per_lane) — per_project keyed by project id with
+    '__org__' for unattributed spend; per_lane keyed by LANES. Returns None on
+    API failure (distinguished from ({}, zeros) = no spend today).
+
+    The costs API reports actual billing, so a free-tier lane reads $0 until
+    its allowance is exhausted and only overage appears."""
     start, end = today_window_costs()
     params = [
         ("start_time",   start),
         ("end_time",     end),
         ("bucket_width", "1d"),
         ("group_by[]",   "project_id"),
+        ("group_by[]",   "line_item"),
         ("limit",        100),
     ]
     costs: dict[str, float] = {}
+    lanes: dict[str, float] = {l: 0.0 for l in LANES}
     page = None
     fetched_any_page = False
     while True:
@@ -536,13 +587,13 @@ def _fetch_costs() -> Optional[dict[str, float]]:
         if page:
             p.append(("page", page))
         try:
-            r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            r = _openai_call("get", OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             print(f"[openai costs network error] {e}")
-            return None if not fetched_any_page else costs
+            return None if not fetched_any_page else (costs, lanes)
         if not r.ok:
             print(f"[openai costs {r.status_code}] {r.text[:500]}")
-            return None if not fetched_any_page else costs
+            return None if not fetched_any_page else (costs, lanes)
         fetched_any_page = True
         data = r.json()
         for bucket in data.get("data", []):
@@ -550,12 +601,20 @@ def _fetch_costs() -> Optional[dict[str, float]]:
                 pid = result.get("project_id") or "__org__"
                 val = float(result.get("amount", {}).get("value", 0.0))
                 costs[pid] = costs.get(pid, 0.0) + val
+                lanes[_lane_for_line_item(result.get("line_item"))] += val
         if not data.get("has_more"):
             break
         page = data.get("next_page")
         if not page:
             break
-    return costs
+    return costs, lanes
+
+
+def _fetch_costs() -> Optional[dict[str, float]]:
+    """Today's cost per project ('__org__' = unattributed). None on API failure.
+    Thin wrapper kept for callers that don't need the lane split."""
+    res = _fetch_costs_breakdown()
+    return None if res is None else res[0]
 
 
 def _fetch_tokens() -> Optional[dict[str, dict]]:
@@ -580,7 +639,7 @@ def _fetch_tokens() -> Optional[dict[str, dict]]:
         if page:
             p.append(("page", page))
         try:
-            r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            r = _openai_call("get", OPENAI_USAGE_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             print(f"[openai usage network error] {e}")
             return None if not fetched_any_page else tokens
@@ -644,7 +703,7 @@ def _fetch_monthly_costs(year: int, month: int) -> dict[str, float]:
         if page:
             p.append(("page", page))
         try:
-            r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            r = _openai_call("get", OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             print(f"[openai monthly costs error] {e}")
             break
@@ -679,7 +738,7 @@ def _fetch_recent_activity(minutes: int = CONCURRENCY_WINDOW_MINS) -> Optional[d
         ("limit",        100),
     ]
     try:
-        r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
+        r = _openai_call("get", OPENAI_USAGE_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         print(f"[openai activity error] {e}")
         return None
@@ -713,7 +772,7 @@ def _fetch_recent_activity_by_band(minutes: int) -> Optional[dict[str, dict[str,
         ("limit",        100),
     ]
     try:
-        r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
+        r = _openai_call("get", OPENAI_USAGE_URL, headers=_openai_headers(), params=params, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         print(f"[openai activity-by-band error] {e}")
         return None
@@ -763,7 +822,7 @@ def _fetch_project_rate_limits(pid: str) -> Optional[list[dict]]:
         if page:
             p.append(("after", page))
         try:
-            r = requests.get(url, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            r = _openai_call("get", url, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
         except Exception as e:
             print(f"[openai rate-limits GET error] {pid}: {e}")
             return None
@@ -816,8 +875,8 @@ def _update_project_rate_limit(pid: str, rate_limit_id: str, payload: dict,
     row unrestorable must never strand a whole project in a sealed state."""
     url = f"{OPENAI_RATE_LIMITS_URL_TMPL.format(pid=pid)}/{rate_limit_id}"
     try:
-        r = requests.post(
-            url,
+        r = _openai_call(
+            "post", url,
             headers={**_openai_headers(), "Content-Type": "application/json"},
             json=payload,
             timeout=REQUEST_TIMEOUT,
@@ -881,7 +940,7 @@ def _fetch_recent_data(days: int = 31) -> dict:
             p = list(cost_params)
             if page:
                 p.append(("page", page))
-            r = requests.get(OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            r = _openai_call("get", OPENAI_COSTS_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
             if r.ok:
                 data = r.json()
                 for bucket in data.get("data", []):
@@ -914,7 +973,7 @@ def _fetch_recent_data(days: int = 31) -> dict:
             p = list(tok_params)
             if page:
                 p.append(("page", page))
-            r = requests.get(OPENAI_USAGE_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
+            r = _openai_call("get", OPENAI_USAGE_URL, headers=_openai_headers(), params=p, timeout=REQUEST_TIMEOUT)
             if r.ok:
                 data = r.json()
                 for bucket in data.get("data", []):
@@ -981,15 +1040,17 @@ def _enrich_costs(snap: dict, usage: "UsageStore" = None, live: bool = True) -> 
     cleanly. Critical for matching the poll loop's empty-day handling."""
     import copy
     snap  = copy.deepcopy(snap)
-    costs = _fetch_costs() if live else None
-    if costs is not None:
+    breakdown = _fetch_costs_breakdown() if live else None
+    if breakdown is not None:
+        costs, lane_costs = breakdown
         org_cost = costs.pop("__org__", 0.0)
         for pid, p in snap.get("projects", {}).items():
             p["cost_usd"] = round(costs.get(pid, 0.0), 6)
         snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
         snap["org_cost"]   = round(org_cost, 6)
+        snap["lane_costs"] = {l: round(v, 6) for l, v in lane_costs.items()}
         if usage:
-            usage.update_costs(costs, snap["total_cost"], org_cost)
+            usage.update_costs(costs, snap["total_cost"], org_cost, lane_costs)
     else:
         cached = usage.get_costs_cache() if usage else None
         if cached:
@@ -997,6 +1058,7 @@ def _enrich_costs(snap: dict, usage: "UsageStore" = None, live: bool = True) -> 
             for pid, p in snap.get("projects", {}).items():
                 p["cost_usd"] = round(per_proj.get(pid, 0.0), 6)
             snap["total_cost"] = cached.get("total", 0.0)
+            snap["lane_costs"] = dict(cached.get("per_lane", {}))
             snap["costs_stale"] = True
             snap["costs_ts"]    = cached.get("ts")
     return snap
@@ -1220,10 +1282,12 @@ class UsageStore:
             return self._data.get("active_window_mins", CONCURRENCY_WINDOW_MINS)
 
     # Costs cache (per-project costs from last successful fetch)
-    def update_costs(self, per_project: dict, total: float, org: float) -> None:
+    def update_costs(self, per_project: dict, total: float, org: float,
+                     per_lane: dict = None) -> None:
         with self._lock:
             self._data["costs_cache"] = {
                 "per_project": dict(per_project),
+                "per_lane":    dict(per_lane or {}),
                 "total":       total,
                 "org":         org,
                 "ts":          time.time(),
@@ -1762,6 +1826,34 @@ def _fmt_tokens(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(n)
+
+
+def _fmt_cost(usd: Optional[float]) -> str:
+    """Compact lane cost in Bach's requested "x.y$" style. Never renders real
+    spend as zero: sub-cent amounts keep 4 decimals, because surfacing small
+    off-watchlist spend is the Exotic lane's entire purpose. None -> "—" (no
+    cost data yet, e.g. before the first successful costs fetch)."""
+    if usd is None:
+        return "—"
+    if usd == 0:
+        return "0.00$"
+    if usd < 0.01:
+        return f"{usd:.4f}$"
+    return f"{usd:.2f}$"
+
+
+def _fmt_lane_lines(premium_tok: int, normal_tok: int, lane_costs: Optional[dict],
+                    indent: str = "   ") -> list:
+    """The three lane lines shared by every report. Free-tier lanes show tokens
+    against their allowance plus billed cost (which stays 0.00$ until the
+    allowance is exhausted). Exotic has no allowance to count against, so it
+    shows cost only."""
+    lc = lane_costs or {}
+    return [
+        f"{indent}⭐ Premium (1M): <b>{_fmt_tokens(premium_tok)}</b> / 1M. Cost: {_fmt_cost(lc.get('premium'))}",
+        f"{indent}📦 Normal (10M): <b>{_fmt_tokens(normal_tok)}</b> / 10M. Cost: {_fmt_cost(lc.get('normal'))}",
+        f"{indent}🧪 Exotic: <b>{_fmt_cost(lc.get('exotic'))}</b>",
+    ]
 
 
 def _fmt_ts(ts: Optional[float]) -> str:
@@ -2490,10 +2582,9 @@ def fmt_daily_snapshot(snap: dict) -> str:
     cost_note     = f"  <i>(cost as of {_fmt_ts(snap.get('costs_ts'))})</i>" if snap.get("costs_stale") else ""
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(
-        f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Cost: <b>${total_cost:.4f}</b> / ${DAILY_LIMIT:.2f}{cost_note}\n"
-        f"   ⭐ Premium (1M): <b>{_fmt_tokens(total_premium)}</b> / 1M"
-        f"   •   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M"
+        f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Cost: <b>${total_cost:.4f}</b> / ${DAILY_LIMIT:.2f}{cost_note}"
     )
+    lines.extend(_fmt_lane_lines(total_premium, total_normal, snap.get("lane_costs")))
     return "\n".join(lines)
 
 
@@ -2891,10 +2982,9 @@ def cmd_tokens(usage: UsageStore, name: str = "Bach") -> str:
     total_normal  = snap.get("total_normal_tokens",  0)
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(
-        f"🔢 Total: <b>{_fmt_tokens(total_tok)}</b>  •  {total_req:,} requests\n"
-        f"   ⭐ Premium (1M): <b>{_fmt_tokens(total_premium)}</b> / 1M"
-        f"   •   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M"
+        f"🔢 Total: <b>{_fmt_tokens(total_tok)}</b>  •  {total_req:,} requests"
     )
+    lines.extend(_fmt_lane_lines(total_premium, total_normal, snap.get("lane_costs")))
     return "\n".join(lines)
 
 
@@ -3193,6 +3283,7 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
 
     n_tok = snap.get("total_normal_tokens",  0)
     p_tok = snap.get("total_premium_tokens", 0)
+    lane_costs = snap.get("lane_costs") or {}
 
     lines = [f"🗃️ <b>Archive — {snap.get('date', today_str())}</b>\n"]
 
@@ -3210,7 +3301,9 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
         else:
             tag = "✅ active"
         lines.append(f"  • <b>{track}</b>: {_fmt_tokens(consumed)} / {_fmt_tokens(cap)} "
-                     f"({pct:.1f}%)  —  {tag}")
+                     f"({pct:.1f}%). Cost: {_fmt_cost(lane_costs.get(track))}  —  {tag}")
+    lines.append(f"  • <b>exotic</b>: {_fmt_cost(lane_costs.get('exotic'))} "
+                 f"(off-watchlist spend — no free allowance)")
     lines.append("")
 
     lines.append("<b>Projects</b>")
@@ -3251,6 +3344,8 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
         # Propagate the live cost back onto the snap so spend checks see fresh data
         # (snap from fetch_today_usage() has total_cost=0.0 — costs are overlaid here).
         snap["total_cost"] = total
+        if enriched.get("lane_costs") is not None:
+            snap["lane_costs"] = enriched["lane_costs"]
         for pid, p in enriched.get("projects", {}).items():
             if pid in snap.get("projects", {}):
                 snap["projects"][pid]["cost_usd"] = p.get("cost_usd", 0.0)
@@ -3319,8 +3414,7 @@ def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = Non
         lines = [
             "🔄 <b>Data refreshed.</b>",
             f"Tokens today: <b>{_fmt_tokens(total_tok)}</b>",
-            f"   ⭐ Premium (1M):  <b>{_fmt_tokens(total_premium)}</b> / 1M",
-            f"   📦 Normal (10M): <b>{_fmt_tokens(total_normal)}</b> / 10M",
+            *_fmt_lane_lines(total_premium, total_normal, enriched.get("lane_costs")),
             f"Spend today:  <b>${total:.4f}</b>{stale_note}",
             f"<i>Intelligence updated, Monarch {name}.</i>",
         ]
@@ -3619,7 +3713,8 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 #   {}   — no spend today → real zero (DON'T fall back to cache, or
                 #          we'd never see the day's spend drop to zero at rollover)
                 # The distinction is what catches off-watchlist anomalies cleanly.
-                costs    = _fetch_costs()
+                breakdown = _fetch_costs_breakdown()
+                costs, lane_costs = breakdown if breakdown is not None else (None, None)
                 org_cost = 0.0
                 if costs is not None:
                     # Successful fetch (may be empty)
@@ -3627,6 +3722,7 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                     for pid, p in snap.get("projects", {}).items():
                         p["cost_usd"] = round(costs.get(pid, 0.0), 6)
                     snap["total_cost"] = round(sum(costs.values()) + org_cost, 6)
+                    snap["lane_costs"] = {l: round(v, 6) for l, v in lane_costs.items()}
                 else:
                     # API failure — preserve last known cost picture
                     cached_costs = usage.get_costs_cache()
@@ -3635,10 +3731,11 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                         for pid, p in snap.get("projects", {}).items():
                             p["cost_usd"] = round(per_proj.get(pid, 0.0), 6)
                         snap["total_cost"] = cached_costs.get("total", 0.0)
+                        snap["lane_costs"] = dict(cached_costs.get("per_lane", {}))
 
                 usage.update(snap)   # auto-resets daily state on day rollover
                 if costs is not None:
-                    usage.update_costs(costs, snap["total_cost"], org_cost)
+                    usage.update_costs(costs, snap["total_cost"], org_cost, lane_costs)
 
                 # If yesterday's sealed tracks were just moved to pending_track_unseal
                 # by the daily reset, restore them via the API now. Failures stay in
@@ -3650,13 +3747,17 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                 n_str    = _color(f"{_fmt_tokens(normal_tok)}/10M",  _tok_color(normal_tok,  TOKEN_HARD_CAP))
                 p_str    = _color(f"{_fmt_tokens(premium_tok)}/1M",  _tok_color(premium_tok, PREMIUM_TOKEN_HARD_CAP))
                 cost_str = f"  cost=${snap.get('total_cost', 0.0):.4f}" if snap.get("total_cost") else ""
+                exotic = (snap.get("lane_costs") or {}).get("exotic") or 0.0
+                if exotic:
+                    cost_str += f"  exotic=${exotic:.4f}"
                 print(f"[poll/{usage.get_mode()}] {snap.get('date')}  normal={n_str}  premium={p_str}{cost_str}")
 
                 # Intel log: one entry per poll where the totals actually moved.
                 cur = (snap.get("date"), normal_tok, premium_tok,
                        round(snap.get("total_cost", 0.0), 4))
                 if cur != last_logged:
-                    _log_event("poll", date=cur[0], normal=cur[1], premium=cur[2],
+                    _log_event("poll", lanes=snap.get("lane_costs"),
+                               date=cur[0], normal=cur[1], premium=cur[2],
                                cost=cur[3], mode=usage.get_mode())
                     last_logged = cur
 

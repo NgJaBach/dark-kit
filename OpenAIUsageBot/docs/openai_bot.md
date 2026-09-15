@@ -376,6 +376,15 @@ audio — all model rows accept 0), healthy originals captured under
   quarantine — restores all rows and exempts the project from re-quarantine for
   the rest of the UTC day (`track_exemptions[pid] ⊇ ["full"]`). Off-watchlist
   spend after a release is a deliberate human decision.
+  - ⚠️ **"Both" also exempts the token caps.** The gesture runs the normal and
+    premium manual-unseal too, which *pre-exempt* the project from those auto-seals
+    for the day even when neither was sealed — so a release yields
+    `track_exemptions[pid] = ["normal", "premium", "full"]`. On 2026-09-15
+    namvuong-project was released for audio use and was then skipped by the normal
+    mass-seal, burning 3.72M normal tokens past the cap. Kept deliberately
+    (Bach's call, 2026-09-16): a release is treated as full trust for the day. To
+    release a quarantine *without* waiving the caps, re-seal the lanes afterwards
+    via archive → Seal.
 - **Midnight**: the `"full"` entry flows through the standard rollover →
   `pending_track_unseal` → restore path, like any track seal.
 - **Rows already at 0** (e.g. track-sealed earlier the same day) are throttled
@@ -407,6 +416,39 @@ back-to-back" restart flood.
 **Cost-fetch latency** — OpenAI's `costs` endpoint has a 5–10 min ingestion lag. Spend
 alerts may arrive that delayed, but that's far better than the previous "wait until the
 wallet is empty" detection window.
+
+### 7.5b Per-lane cost + the Exotic lane
+
+Every token report shows **billed cost per lane** next to the token counter, plus a
+third lane — **Exotic** — for all spend outside the two free-tier lanes:
+
+```
+   ⭐ Premium (1M): 0 / 1M. Cost: 0.00$
+   📦 Normal (10M): 11.39M / 10M. Cost: 0.21$
+   🧪 Exotic: 0.12$
+Spend today:  $0.3283
+```
+
+Rendered by `_fmt_lane_lines()` in `@bot refresh`, `@bot tokens`, the daily
+snapshot, and the archive status; the console poll line appends `exotic=$X` when
+non-zero, and every intel-log `poll` event records the split under `lanes`.
+
+**Attribution is exact, not estimated.** `_fetch_costs_breakdown()` makes one
+costs-API call grouped by `project_id` **and** `line_item`. Line items look like
+`gpt-audio-mini-2025-12-15 audio, input` — `_lane_for_line_item()` takes the model
+token before the comma and classifies it with `_track_for_model()`. Anything that
+is not a normal/premium model — including non-model items such as web search or
+storage — is **exotic**, so the three lanes always sum to the total (verified live
+2026-09-15: 0.206513 + 0 + 0.121780 = 0.328293).
+
+- **Free lanes read `0.00$` until their allowance is exhausted** — the costs API
+  reports actual billing, so only overage appears.
+- **Exotic shows cost only** — it has no free allowance to count tokens against.
+- **`_fmt_cost()` never renders real spend as zero**: sub-cent amounts keep four
+  decimals (`0.0043$`), since surfacing small off-watchlist spend is the Exotic
+  lane's whole purpose. `—` means no cost data yet (before the first fetch).
+- The split is cached in `costs_cache.per_lane`, so a failed costs fetch still
+  shows the last known lanes (marked stale).
 
 ### 7.6 Concurrent Project Alerts
 **Condition:** ≥ 3 projects active simultaneously in the last 5 minutes.
@@ -455,7 +497,16 @@ all 13 projects sealed and zero failures* — proof the leak is reporting lag, n
 seal failure. Premium therefore seals at **80% (200k buffer)**, clearing the worst
 observed blind spot by 34k. This costs nothing in practice: across 14 days no day
 ever ended between 800k and 850k, and every day that reached 850k blew past 1M
-anyway. Normal keeps 95% — its 500k absolute headroom has never been outrun.
+anyway.
+
+**Normal keeps 95% — but its buffer has now been outrun once.** On 2026-09-15 the
+usage API jumped **8.88M → 10.08M in a single reporting interval** (~1.2M tokens in
+~7 min, ~2,900 tok/s — 26× the premium wave). The first reading past the 9.5M
+threshold was already past the 10M cap, so the 500k buffer never got a chance; the
+day ended at 11.39M. It cost only **$0.21** because normal-lane overage is cheap.
+The threshold is unchanged for now: it is a single data point, and namvuong-project
+was exempt that day (see the §7.5 release note), so its burn contaminates the
+post-seal blind-spot measurement. **Resize if it recurs.**
 
 **If overshoot recurs**, re-derive the blind spot from the intel log
 (`day_rollover.final_premium` vs the `mass_seal.consumed` of the same day) and
@@ -845,3 +896,4 @@ On startup the bot:
 - **Per-band overcap filtering** — `_fetch_recent_activity_by_band()` groups recent requests by both project and model. `_handle_overcap()` then keeps only projects with activity on the EXCEEDED band(s). A project using premium models cannot trigger the normal-cap alarm and vice versa.
 - **Activity fetch failure** — `_fetch_recent_activity*` return `None` on API failure (distinguished from `{}` meaning "no activity"). Callers preserve the previous mode/state rather than acting on missing data.
 - **Telegram poll backoff** — `_get_updates()` sleeps 5 s on network error before returning to avoid a tight reconnect loop. Successful long-polls return immediately without added sleep.
+- **Network retry on OpenAI calls** — every Admin API request goes through `_openai_call()`, which retries DNS / connection / timeout errors twice (1 s, then 2 s backoff) before re-raising. HTTP error *responses* are never retried — they are answers, not blips. Motivation: this host logged 67 DNS resolution failures in ~18 h on 2026-09-15, and one of them failed an entire quarantine sweep (a full seal aborts and rolls back on its first failed POST). Retries only mask the symptom; the machine's resolver is the root cause.

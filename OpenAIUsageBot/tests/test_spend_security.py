@@ -874,6 +874,168 @@ def test_repair_detects_seal_drift():
     print("  ✅ Drift detected and re-sealed; existing captures preserved by merge")
 
 
+# ─── Lane costs + Exotic lane (2026-09-16) ──────────────────────────────────
+
+def test_lane_for_line_item():
+    """Costs-API line items map to lanes by their model token. Real line items
+    observed live on 2026-09-15."""
+    cases = {
+        "gpt-4o-mini-2024-07-18, input":             "normal",
+        "gpt-5.4-mini-2026-03-17, cached input":     "normal",
+        "gpt-5.4-2026-03-05, output":                "premium",
+        "gpt-5.6-sol, input":                        "premium",
+        "gpt-audio-mini-2025-12-15 audio, input":    "exotic",   # modality word
+        "gpt-audio-mini-2025-12-15 text, output":    "exotic",
+        "text-embedding-3-small, input":             "exotic",
+        "o1-pro, output":                            "exotic",   # paid lookalike
+        "web search tool calls":                     "exotic",   # non-model item
+        None:                                        "exotic",
+        "":                                          "exotic",
+    }
+    for li, want in cases.items():
+        got = bot._lane_for_line_item(li)
+        assert got == want, f"{li!r} -> {got}, want {want}"
+    print(f"  \u2705 {len(cases)} line-item shapes map to the right lane")
+
+
+def test_lane_costs_reconcile_with_total():
+    """The three lanes must always sum to the org total — reproduces the real
+    2026-09-15 breakdown ($0.328293 across 10 line items)."""
+    items = [
+        ("proj_fvkY21dJ0ripiOIA2jCC86f3", "gpt-4o-mini-2024-07-18, input",           0.196282),
+        ("proj_fvkY21dJ0ripiOIA2jCC86f3", "gpt-audio-mini-2025-12-15 audio, input",  0.045370),
+        ("proj_fvkY21dJ0ripiOIA2jCC86f3", "gpt-audio-mini-2025-12-15 text, input",   0.043676),
+        ("proj_fvkY21dJ0ripiOIA2jCC86f3", "gpt-audio-mini-2025-12-15 text, output",  0.032734),
+        ("proj_fEboQnaVm4tQCk8kFy0h8s08", "gpt-5.4-mini-2026-03-17, output",         0.005162),
+        ("proj_fEboQnaVm4tQCk8kFy0h8s08", "gpt-5.4-mini-2026-03-17, input",          0.004293),
+        ("proj_fvkY21dJ0ripiOIA2jCC86f3", "gpt-4o-mini-2024-07-18, output",          0.000776),
+        ("proj_fEboQnaVm4tQCk8kFy0h8s08", "gpt-5.4-mini-2026-03-17, cached input",   0.0),
+    ]
+    class R:
+        ok = True
+        def json(s):
+            return {"has_more": False, "data": [{"results": [
+                {"project_id": pid, "line_item": li, "amount": {"value": v}}
+                for pid, li, v in items]}]}
+    with mock.patch.object(bot, "_openai_call", return_value=R()):
+        per_project, per_lane = bot._fetch_costs_breakdown()
+    total = sum(v for _, _, v in items)
+    assert abs(sum(per_lane.values()) - total) < 1e-9, "lanes must sum to total"
+    assert abs(sum(per_project.values()) - total) < 1e-9, "projects must sum to total"
+    assert abs(per_lane["normal"]  - 0.206513) < 1e-6, per_lane
+    assert abs(per_lane["exotic"]  - 0.121780) < 1e-6, per_lane
+    assert per_lane["premium"] == 0.0, per_lane
+    print(f"  \u2705 Lanes reconcile: normal {per_lane['normal']:.6f} + exotic "
+          f"{per_lane['exotic']:.6f} + premium 0 = {total:.6f}")
+
+
+def test_fmt_cost_never_hides_real_spend():
+    assert bot._fmt_cost(None)    == "\u2014"
+    assert bot._fmt_cost(0)       == "0.00$"
+    assert bot._fmt_cost(0.21)    == "0.21$"
+    assert bot._fmt_cost(4.6209)  == "4.62$"
+    # sub-cent must NOT round to zero — that is the Exotic lane's whole job
+    assert bot._fmt_cost(0.0043)  == "0.0043$"
+    assert bot._fmt_cost(0.00004) != "0.00$"
+    print("  \u2705 _fmt_cost: x.y$ format, sub-cent spend never shown as zero")
+
+
+def test_lane_lines_in_every_report():
+    """Every token report shows the Cost: suffix on both lanes plus Exotic."""
+    usage, subs, names, _ = _fresh_stores()
+    usage._data.update({
+        "date": "2026-09-15", "total_normal_tokens": 11_387_193,
+        "total_premium_tokens": 0, "total_cost": 0.328293,
+        "lane_costs": {"normal": 0.206513, "premium": 0.0, "exotic": 0.12178},
+        "projects": {"proj_fvkY21dJ0ripiOIA2jCC86f3": {
+            "name": "namvuong-project", "total_tokens": 100, "input_tokens": 50,
+            "output_tokens": 50, "num_requests": 1, "cost_usd": 0.3,
+            "models": {"gpt-4o-mini": {"input": 50, "output": 50, "requests": 1}}}},
+    })
+    snap = usage.get()
+    reports = {
+        "tokens":   bot.cmd_tokens(usage),
+        "snapshot": bot.fmt_daily_snapshot(snap),
+        "archive":  bot._fmt_archive_status(usage),
+    }
+    for name, out in reports.items():
+        assert "0.21$" in out, f"{name}: normal lane cost missing"
+        assert "0.12$" in out, f"{name}: exotic cost missing"
+    for name in ("tokens", "snapshot"):
+        out = reports[name]
+        assert "/ 1M. Cost: 0.00$" in out, f"{name}: premium Cost suffix missing"
+        assert "/ 10M. Cost: 0.21$" in out, f"{name}: normal Cost suffix missing"
+        assert "\U0001f9ea Exotic" in out, f"{name}: Exotic lane missing"
+
+    # Before the first costs fetch there is no lane data: show a dash, never crash
+    usage2, _, _, _ = _fresh_stores()
+    usage2._data.update({"date": "2026-09-15", "projects": {"p": {
+        "name": "p", "total_tokens": 1, "models": {}}}})
+    assert "Cost: \u2014" in bot.cmd_tokens(usage2)
+    print("  \u2705 Cost suffix + Exotic lane render in tokens, snapshot, archive")
+
+
+# ─── Network retry (2026-09-16) ─────────────────────────────────────────────
+
+def test_network_errors_are_retried():
+    """A DNS blip must not fail the call outright — it used to abort an entire
+    186-row quarantine sweep (67 DNS failures in 18 h on 2026-09-15)."""
+    import requests as rq
+    calls = []
+    class OK: ok = True
+    def flaky(url, **kw):
+        calls.append(url)
+        if len(calls) < 3:
+            raise rq.exceptions.ConnectionError("Failed to resolve 'api.openai.com'")
+        return OK()
+    with mock.patch.object(bot.requests, "post", side_effect=flaky), \
+         mock.patch.object(bot.time, "sleep"):
+        r = bot._openai_call("post", "https://api.openai.com/x", json={})
+    assert r.ok and len(calls) == 3, f"expected 2 retries then success, got {len(calls)} calls"
+
+    # Persistent failure: re-raises after 3 attempts so callers' except still fires
+    calls.clear()
+    def dead(url, **kw):
+        calls.append(url); raise rq.exceptions.ConnectionError("down")
+    with mock.patch.object(bot.requests, "get", side_effect=dead), \
+         mock.patch.object(bot.time, "sleep"):
+        try:
+            bot._openai_call("get", "https://api.openai.com/x")
+            assert False, "must re-raise after exhausting retries"
+        except rq.exceptions.ConnectionError:
+            pass
+    assert len(calls) == 3, len(calls)
+
+    # HTTP error RESPONSES are answers, not blips — never retried
+    calls.clear()
+    class Bad: ok = False; status_code = 400
+    with mock.patch.object(bot.requests, "get", side_effect=lambda u, **k: (calls.append(u), Bad())[1]):
+        assert bot._openai_call("get", "https://api.openai.com/x").ok is False
+    assert len(calls) == 1, "HTTP errors must not be retried"
+    print("  \u2705 DNS/connection errors retried x2; persistent failure re-raises; HTTP 4xx not retried")
+
+
+def test_seal_survives_single_dns_blip():
+    """End-to-end: one DNS failure mid-sweep no longer fails the full seal."""
+    import requests as rq
+    usage, _, _, _ = _fresh_stores()
+    rows = [{"id": f"r{i}", "model": "gpt-4o", "max_requests_per_1_minute": 5000,
+             "max_tokens_per_1_minute": 400000} for i in range(5)]
+    n = {"posts": 0}
+    class OK: ok = True
+    def post(url, **kw):
+        n["posts"] += 1
+        if n["posts"] == 3:   # the third POST hits a DNS blip
+            raise rq.exceptions.ConnectionError("Temporary failure in name resolution")
+        return OK()
+    with mock.patch.object(bot, "_fetch_project_rate_limits", return_value=rows), \
+         mock.patch.object(bot.requests, "post", side_effect=post), \
+         mock.patch.object(bot.time, "sleep"):
+        assert bot._full_seal_project("proj_X", usage) == "sealed"
+    assert n["posts"] == 6, f"5 rows + 1 retried = 6 POSTs, got {n['posts']}"
+    print("  \u2705 Full seal survives a mid-sweep DNS blip (retried in place, no rollback)")
+
+
 # ─── Local intel log ────────────────────────────────────────────────────────
 
 def test_intel_log_captures_broadcasts():
@@ -964,6 +1126,12 @@ if __name__ == "__main__":
         ("Quarantine + track seal, no 0/0 cascade",      test_quarantine_and_track_seal_coexist_without_cascade),
         ("Org-ceiling clamp on restore",                 test_org_ceiling_clamp_on_restore),
         ("Repair detects seal drift",                    test_repair_detects_seal_drift),
+        ("Line item -> lane mapping",                    test_lane_for_line_item),
+        ("Lane costs reconcile with total",              test_lane_costs_reconcile_with_total),
+        ("_fmt_cost never hides real spend",             test_fmt_cost_never_hides_real_spend),
+        ("Lane lines render in every report",            test_lane_lines_in_every_report),
+        ("Network errors retried",                       test_network_errors_are_retried),
+        ("Seal survives a DNS blip",                     test_seal_survives_single_dns_blip),
         ("Intel log captures broadcasts",                test_intel_log_captures_broadcasts),
         ("Intel log failure never breaks bot",           test_intel_log_failure_never_breaks_bot),
         ("Mode change logged once per transition",       test_mode_change_logged_once),
