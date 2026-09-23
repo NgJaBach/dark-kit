@@ -159,7 +159,7 @@ Platform → Organization → API Keys → Create Admin Key
 
 **Source of truth** — re-check whenever OpenAI updates the offer:
 <https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai>
-(section *"What models are included in this offer?"*). **Last synced: 2026-08-21.**
+(section *"What models are included in this offer?"*). **Last synced: 2026-09-22** — reverified, no models added/removed/moved between groups since 2026-08-21.
 
 `_track_for_model(model)` is the single source of truth in code: it returns
 `"normal"`, `"premium"`, or `None` (unlisted). A model matches a listed name only
@@ -896,4 +896,4 @@ On startup the bot:
 - **Per-band overcap filtering** — `_fetch_recent_activity_by_band()` groups recent requests by both project and model. `_handle_overcap()` then keeps only projects with activity on the EXCEEDED band(s). A project using premium models cannot trigger the normal-cap alarm and vice versa.
 - **Activity fetch failure** — `_fetch_recent_activity*` return `None` on API failure (distinguished from `{}` meaning "no activity"). Callers preserve the previous mode/state rather than acting on missing data.
 - **Telegram poll backoff** — `_get_updates()` sleeps 5 s on network error before returning to avoid a tight reconnect loop. Successful long-polls return immediately without added sleep.
-- **Network retry on OpenAI calls** — every Admin API request goes through `_openai_call()`, which retries DNS / connection / timeout errors twice (1 s, then 2 s backoff) before re-raising. HTTP error *responses* are never retried — they are answers, not blips. Motivation: this host logged 67 DNS resolution failures in ~18 h on 2026-09-15, and one of them failed an entire quarantine sweep (a full seal aborts and rolls back on its first failed POST). Retries only mask the symptom; the machine's resolver is the root cause.
+- **Network retry on OpenAI *and* Telegram calls** — every Admin API request (`_openai_call`) and every Telegram Bot API request (`_telegram_call`) goes through the same shared `_retrying_call()`, which retries DNS / connection / timeout errors twice (1 s, then 2 s backoff) before re-raising. HTTP error *responses* are never retried — they are answers, not blips. Motivation: this host logged 67 DNS resolution failures in ~18 h on 2026-09-15, and one of them failed an entire quarantine sweep (a full seal aborts and rolls back on its first failed POST). On 2026-09-22 the same flakiness dropped a `sendMessage` alert with no retry on that path (it survived only because `_broadcast` mirrors every alert to the local intel log first) — Telegram calls were brought under the same retry umbrella that day. `_fetch_bot_username` keeps its own separate 5-attempt/10 s-delay retry, since it's a one-shot startup call with different needs. Retries only mask the symptom; the machine's resolver is the root cause.

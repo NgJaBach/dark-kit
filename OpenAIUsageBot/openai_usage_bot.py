@@ -47,11 +47,11 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-09-16"
+BOT_UPDATED = "2026-09-22"
 BOT_CHANGES = (
+    "Telegram sends/edits/polls now retry network blips too, not just OpenAI",
     "New \U0001f9ea Exotic lane: $ spent on models outside the free lanes",
     "Each lane now shows its billed cost, e.g. \"/ 1M. Cost: 0.00$\"",
-    "Network blips (DNS/timeouts) are retried — no more half-finished seals",
     "Premium seals at 80%; seals are verified against the API each poll",
 )
 
@@ -370,7 +370,8 @@ OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 # SOURCE OF TRUTH — re-check when OpenAI updates the offer:
 #   https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai
 #   (section: "What models are included in this offer?")
-# Last synced: 2026-08-21.
+# Last synced: 2026-09-22 (verified against a fresh pull of the article — no
+# model added, removed, or moved between groups since 2026-08-21).
 #
 # OpenAI lists DATED SNAPSHOTS (e.g. "gpt-5.4-2026-03-05"). We store the BASE
 # name; _is_listed_variant accepts the exact name or base + a -YYYY-MM-DD
@@ -528,13 +529,18 @@ def _openai_headers() -> dict:
 # sweep (the seal aborts and rolls back on the first failed POST), leaving the
 # project unthrottled until the next poll. Retry those in place. HTTP error
 # RESPONSES are deliberately not retried — they are answers, not blips.
+#
+# 2026-09-22: the same DNS flakiness dropped a mass-seal alert to Telegram
+# (sendMessage) with no retry on that path — the alert survived only because
+# _broadcast mirrors it to the local intel log first. Telegram calls now share
+# this same retry loop.
 _NET_RETRY_BACKOFF = (1, 2)   # seconds before attempts 2 and 3
 
 
-def _openai_call(method: str, url: str, **kwargs):
-    """requests.get/post to the OpenAI Admin API, retrying DNS / connection /
-    timeout errors up to twice. Re-raises the last error if every attempt fails,
-    so every caller's existing `except Exception` handling still applies."""
+def _retrying_call(method: str, url: str, **kwargs):
+    """requests.get/post to a remote API, retrying DNS / connection / timeout
+    errors up to twice. Re-raises the last error if every attempt fails, so
+    every caller's existing `except Exception` handling still applies."""
     for attempt in range(len(_NET_RETRY_BACKOFF) + 1):
         try:
             return getattr(requests, method)(url, **kwargs)
@@ -542,6 +548,10 @@ def _openai_call(method: str, url: str, **kwargs):
             if attempt == len(_NET_RETRY_BACKOFF):
                 raise
             time.sleep(_NET_RETRY_BACKOFF[attempt])
+
+
+_openai_call    = _retrying_call   # OpenAI Admin API call sites
+_telegram_call  = _retrying_call   # Telegram Bot API call sites
 
 
 LANES = ("normal", "premium", "exotic")
@@ -1635,8 +1645,10 @@ def _send_animation(path: Path, chat_id: str = None, thread_id: int = None) -> N
     if thread_id:
         data["message_thread_id"] = str(thread_id)
     try:
-        with path.open("rb") as f:
-            r = requests.post(url, data=data, files={"animation": f}, timeout=30)
+        # Read the bytes once, outside the retry loop: a file handle re-passed
+        # into a retried attempt would already be at EOF and upload 0 bytes.
+        content = path.read_bytes()
+        r = _telegram_call("post", url, data=data, files={"animation": content}, timeout=30)
         if not r.ok:
             print(f"[telegram anim {r.status_code}] chat={target_chat} | {r.text[:400]}")
     except Exception as e:
@@ -1659,7 +1671,8 @@ def _send(text: str, chat_id: str = None, thread_id: int = None,
     if keyboard is not None:
         payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
     try:
-        r = requests.post(
+        r = _telegram_call(
+            "post",
             url,
             data=payload,
             timeout=REQUEST_TIMEOUT,
@@ -1684,7 +1697,7 @@ def _send(text: str, chat_id: str = None, thread_id: int = None,
                 except Exception as e:
                     print(f"[telegram migration-cb error] {e}")
             payload["chat_id"] = new_id
-            r2 = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
+            r2 = _telegram_call("post", url, data=payload, timeout=REQUEST_TIMEOUT)
             if not r2.ok:
                 print(f"[telegram send retry {r2.status_code}] chat={new_id} | {r2.text[:300]}")
             return
@@ -1703,7 +1716,7 @@ def _edit_message(text: str, chat_id: str, message_id: int,
     if keyboard is not None:
         payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
     try:
-        r = requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
+        r = _telegram_call("post", url, data=payload, timeout=REQUEST_TIMEOUT)
         if not r.ok and "message is not modified" not in r.text:
             print(f"[telegram edit {r.status_code}] chat={chat_id} | {r.text[:300]}")
     except Exception as e:
@@ -1718,7 +1731,7 @@ def _answer_callback(callback_id: str, text: str = None) -> None:
     if text:
         payload["text"] = text[:200]
     try:
-        requests.post(url, data=payload, timeout=REQUEST_TIMEOUT)
+        _telegram_call("post", url, data=payload, timeout=REQUEST_TIMEOUT)
     except Exception as e:
         print(f"[telegram answerCallback error] {e}")
 
@@ -1756,7 +1769,8 @@ def _broadcast(fmt_fn, subs: SubscriberStore, names: NameStore = None) -> None:
 def _get_updates(offset: int) -> list[dict]:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     try:
-        r = requests.get(
+        r = _telegram_call(
+            "get",
             url,
             params={
                 "offset":          offset,
@@ -1782,18 +1796,18 @@ def _discard_pending_updates() -> int:
     everything ≤ that id from the queue."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
     try:
-        r = requests.get(url, params={"offset": -1, "timeout": 0,
-                                       "allowed_updates": json.dumps([])},
-                          timeout=REQUEST_TIMEOUT)
+        r = _telegram_call("get", url, params={"offset": -1, "timeout": 0,
+                                                "allowed_updates": json.dumps([])},
+                            timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         updates = r.json().get("result", [])
         if not updates:
             return 0
         next_offset = updates[-1]["update_id"] + 1
         # ACK so Telegram drops these from the queue.
-        requests.get(url, params={"offset": next_offset, "timeout": 0,
-                                   "allowed_updates": json.dumps([])},
-                      timeout=REQUEST_TIMEOUT)
+        _telegram_call("get", url, params={"offset": next_offset, "timeout": 0,
+                                            "allowed_updates": json.dumps([])},
+                        timeout=REQUEST_TIMEOUT)
         print(f"[telegram] Discarded {len(updates)} stale update(s); next offset={next_offset}")
         return next_offset
     except Exception as e:
