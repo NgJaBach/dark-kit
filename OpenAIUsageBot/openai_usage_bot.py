@@ -47,12 +47,12 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-09-22"
+BOT_UPDATED = "2026-09-29"
 BOT_CHANGES = (
+    "Fixed: a poll crossing UTC midnight no longer seals on yesterday's usage",
+    "Unsealing is ~4x faster (projects restored in parallel, like sealing)",
     "Telegram sends/edits/polls now retry network blips too, not just OpenAI",
     "New \U0001f9ea Exotic lane: $ spent on models outside the free lanes",
-    "Each lane now shows its billed cost, e.g. \"/ 1M. Cost: 0.00$\"",
-    "Premium seals at 80%; seals are verified against the API each poll",
 )
 
 OPENAI_ADMIN_KEY = os.environ.get("OPENAI_ADMIN_KEY", "")
@@ -475,8 +475,8 @@ def _track_for_model(model: str) -> Optional[str]:
 
 # ── Time helpers ───────────────────────────────────────────────────────────
 
-def today_window() -> tuple[int, int]:
-    now   = datetime.now(timezone.utc)
+def today_window(now: datetime = None) -> tuple[int, int]:
+    now   = now or datetime.now(timezone.utc)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end   = max(int(start.timestamp()) + 1, int(now.timestamp()))
     return int(start.timestamp()), end
@@ -627,12 +627,12 @@ def _fetch_costs() -> Optional[dict[str, float]]:
     return None if res is None else res[0]
 
 
-def _fetch_tokens() -> Optional[dict[str, dict]]:
+def _fetch_tokens(window: tuple[int, int] = None) -> Optional[dict[str, dict]]:
     """Today's token usage per project, broken down by model and band.
     Returns None on API failure (distinguished from {} = no usage today). The
     distinction matters: empty-day must NOT block polling — that creates a window
     where the first request of the day goes undetected."""
-    start, end = today_window()
+    start, end = window or today_window()
     params = [
         ("start_time",   start),
         ("end_time",     end),
@@ -1016,9 +1016,19 @@ def fetch_today_usage() -> Optional[dict]:
     yields a valid snap with an empty `projects` map — so the bot stays in its normal
     poll cadence and catches the first request the moment it appears, instead of
     sitting in backoff for hours on a quiet day."""
-    tokens = _fetch_tokens()
-    if tokens is None:
-        return None   # API genuinely failed
+    # The date label must come from the same instant as the query window. A
+    # fetch that starts at 23:59:5x and pages past midnight returns the OLD day's
+    # totals; stamping it with a post-fetch today_str() carried yesterday's 24.88M
+    # into the new day and fired a spurious mass seal (2026-09-29; also 09-02 and
+    # 09-08 for premium). If midnight passed mid-fetch, re-fetch for the new day.
+    for _ in range(2):
+        now    = datetime.now(timezone.utc)
+        date   = now.strftime("%Y-%m-%d")
+        tokens = _fetch_tokens(today_window(now))
+        if tokens is None:
+            return None   # API genuinely failed
+        if today_str() == date:
+            break
     projects: dict[str, dict] = {}
     for pid, tok in tokens.items():
         projects[pid] = {
@@ -1035,7 +1045,7 @@ def fetch_today_usage() -> Optional[dict]:
     total_premium = sum(p["premium_tokens"] for p in projects.values())
     total_normal  = sum(p["normal_tokens"]  for p in projects.values())
     return {
-        "date":                 today_str(),
+        "date":                 date,
         "projects":             projects,
         "total_cost":           0.0,
         "total_premium_tokens": total_premium,
@@ -1195,14 +1205,22 @@ class UsageStore:
             self._data.pop(legacy, None)
         self._data.pop("costs_cache", None)
 
-    def update(self, snapshot: dict):
+    def update(self, snapshot: dict) -> bool:
         """Merge new snapshot, preserving all alert-control fields.
         Auto-resets daily state if the snapshot's date is newer than the persisted date.
         Day rollover handled here closes the race where the Telegram thread runs /refresh
-        on a new day before the poll loop notices."""
+        on a new day before the poll loop notices.
+
+        Returns False (and changes nothing) for a snapshot OLDER than the stored
+        day — one thread's pre-midnight fetch landing after another thread rolled
+        over. Treating that as a "rollover" would reset today's state backward and
+        queue every live seal for restore. Callers must skip acting on it."""
         with self._lock:
             new_date = snapshot.get("date")
             old_date = self._data.get("date")
+            if new_date and old_date and new_date < old_date:
+                print(f"[store] Stale snapshot for {new_date} (store is on {old_date}) — ignored")
+                return False
             if new_date and old_date and new_date != old_date:
                 print(f"[store] Day rollover {old_date} → {new_date} — daily state reset")
                 _log_event("day_rollover", from_date=old_date, to_date=new_date,
@@ -1214,6 +1232,7 @@ class UsageStore:
             self._data = snapshot
             self._data.update(preserved)
             self._save()
+            return True
 
     def seed_state(self, normal_thresholds: list, premium_thresholds: list) -> bool:
         """Atomic check-and-mark. Returns True if THIS caller is the one that seeded
@@ -2272,6 +2291,25 @@ def _mass_seal_track(track: str, usage: UsageStore, subs: SubscriberStore,
         f=len(failed): fmt_seal_batch_done(t, th, ex, f, n), subs, names)
 
 
+def _run_per_project(label: str, fn, pids: list[str]) -> dict[str, str]:
+    """Run `fn(pid)` for each project on SEAL_SWEEP_WORKERS threads. A worker
+    exception counts as 'failed'. Restores were sequential long after the seal
+    sweep went parallel: 13 projects × ~19 rows took 5–10 min to unseal vs ~1.5
+    min to seal (2026-09-28/29). Same safety argument as the seal: each worker
+    only touches its own project's rows; store methods are lock-guarded."""
+    results: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=SEAL_SWEEP_WORKERS) as ex:
+        futs = {ex.submit(fn, pid): pid for pid in pids}
+        for fut in as_completed(futs):
+            pid = futs[fut]
+            try:
+                results[pid] = fut.result()
+            except Exception as e:
+                print(f"[{label}] worker error {KNOWN_PROJECTS.get(pid, pid)}: {e}")
+                results[pid] = "failed"
+    return results
+
+
 def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
                        names: NameStore, *, reason: str = "manual") -> None:
     """Restore `track` across every currently-sealed project to the canonical
@@ -2284,14 +2322,16 @@ def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
     _broadcast(lambda n, t=track: fmt_unseal_batch_begin(t, n), subs, names)
 
     baseline = _compute_canonical_baseline(usage)
-    restored, failed = 0, 0
-    for pid in pids:
+
+    def _one(pid: str) -> str:
         result = _restore_track_for_project(pid, track, usage, baseline)
         if result == "restored":
             usage.add_track_exemption(pid, track)
-            restored += 1
-        elif result == "failed":
-            failed += 1
+        return result
+
+    results  = _run_per_project("mass-unseal", _one, pids)
+    restored = sum(1 for r in results.values() if r == "restored")
+    failed   = sum(1 for r in results.values() if r == "failed")
     print(f"[mass-unseal] {track} → restored={restored} failed={failed} ({reason})")
     _log_event("mass_unseal", track=track, restored=restored, failed=failed, reason=reason)
     _broadcast(lambda n, t=track, r=restored, f=failed:
@@ -2478,19 +2518,26 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
         baseline = _compute_canonical_baseline(usage)
         restored, failed_p = 0, 0
         for track, info in pending.items():
-            obp = info.get("originals_by_project", {})
+            # Snapshot: this is the store's live dict, and workers pop from it.
+            obp = dict(info.get("originals_by_project", {}))
             print(f"[pending-track-unseal] {track} → {len(obp)} project(s)")
-            for pid, originals in list(obp.items()):
+
+            def _one(pid: str, track=track, obp=obp) -> str:
+                originals = obp[pid]
                 if not originals:
-                    usage.pop_pending_track_project(track, pid); continue
+                    usage.pop_pending_track_project(track, pid)
+                    return "noop"
                 failed = _restore_rate_limits(pid, originals, baseline=baseline)
                 if failed:
-                    failed_p += 1
                     print(f"[pending-track-unseal] {KNOWN_PROJECTS.get(pid, pid)}/{track}: "
                           f"{failed}/{len(originals)} failed — will retry next poll")
-                    continue
+                    return "failed"
                 usage.pop_pending_track_project(track, pid)
-                restored += 1
+                return "restored"
+
+            results   = _run_per_project("pending-track-unseal", _one, list(obp))
+            restored += sum(1 for r in results.values() if r == "restored")
+            failed_p += sum(1 for r in results.values() if r == "failed")
 
         _log_event("pending_unseal", tracks=tracks_str, restored=restored, failed=failed_p)
         _broadcast(lambda n, r=restored, f=failed_p, t=tracks_str:
@@ -3344,8 +3391,13 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach") -> str:
 
 def cmd_refresh(usage: UsageStore, subs: SubscriberStore, names: NameStore = None, name: str = "Bach") -> str:
     snap = fetch_today_usage()
+    if snap and not usage.update(snap):
+        # Pre-midnight snapshot landed after the poll loop rolled over — refetch
+        # for the new day; never act on yesterday's totals.
+        snap = fetch_today_usage()
+        if snap and not usage.update(snap):
+            snap = None
     if snap:
-        usage.update(snap)
         # If the scheduled poll loop hasn't run its first seed yet, seed now.
         # Only the highest already-crossed milestone fires (no flood).
         if not usage.has_seeded():
@@ -3747,7 +3799,12 @@ def usage_poll_loop(usage: UsageStore, subs: SubscriberStore, names: NameStore =
                         snap["total_cost"] = cached_costs.get("total", 0.0)
                         snap["lane_costs"] = dict(cached_costs.get("per_lane", {}))
 
-                usage.update(snap)   # auto-resets daily state on day rollover
+                # Auto-resets daily state on day rollover. False = snapshot older
+                # than the store's day (another thread already rolled over): acting
+                # on it would fire yesterday's milestones/seals into today.
+                if not usage.update(snap):
+                    time.sleep(5)
+                    continue
                 if costs is not None:
                     usage.update_costs(costs, snap["total_cost"], org_cost, lane_costs)
 

@@ -537,6 +537,13 @@ Three trigger paths, all idempotent via the per-day `mass_sealed_tracks` flag:
 independent, 50 ms inter-POST spacing preserved within each project) — ~1 min for
 13 projects instead of ~5. Failed projects get one **in-sweep sequential retry**.
 
+Restores use the same pool via `_run_per_project()`: both the manual
+`_mass_unseal_track()` and the midnight `_process_pending_track_unseals()`. They
+stayed sequential long after the seal went parallel, so unsealing 13 projects × ~19
+rows took 5–10 min against ~1.5 min to seal (measured 2026-09-28/29: 5 min, 5 min,
+10.5 min). Each worker exempts its project immediately after restoring it, so the
+restore-then-exempt window is no wider than it was sequentially.
+
 **`_repair_seal_gaps()`** runs on every poll while a track is mass-sealed and over
 threshold, and heals **two** distinct failure modes:
 
@@ -682,6 +689,20 @@ clears `mass_sealed_tracks` and `track_exemptions`. The next poll calls
 restoring every project to the canonical baseline. Failures stay queued and retry
 on subsequent polls, so a midnight outage never leaves anything throttled forever.
 
+**Midnight-straddling polls.** `fetch_today_usage()` takes the date label from the
+**same instant** as the query window. The old code computed the window when the fetch
+started and stamped `today_str()` after pagination finished. A fetch that began at
+23:59:5x therefore returned the old day's totals under the new date. On 2026-09-29
+that carried 09-28's 24.88M into the new day, and the bot "crossed 249%" and
+mass-sealed all 13 projects for the whole day. The same shape appears on 09-02 and
+09-08 (≈1M premium, no seal). If midnight passes mid-fetch, the fetch now re-runs
+for the new day. Separately, `UsageStore.update()` **refuses a snapshot older than
+the stored day** and returns `False`. Previously any date difference counted as a
+rollover, so a late pre-midnight snapshot from another thread would have reset the
+day *backward* and queued every live seal for restore. The poll loop and `/refresh`
+both check that return value and never act on a refused snapshot (`/refresh`
+refetches once).
+
 #### State schema
 
 ```jsonc
@@ -714,7 +735,7 @@ The legacy per-project-full-seal fields (`sealed_projects`, `pending_unseal`,
 - **Detection latency**: up to one poll cycle, clamped to 60 s inside the watch zone (an unsealed track within 10% of cap below its threshold). Milestones flip mode to urgent well before any threshold.
 - **Per-project throttle cost**: ~50–80 track rows × ~50 ms ≈ a few seconds per project per track.
 - **`@bot refresh` never blocks**: `cmd_refresh` runs on the Telegram thread, so the quarantine sweep and any mass seal it triggers are handed to daemon workers via `_spawn_bg()`. Running them inline froze every command for minutes (fixed 2026-08-22).
-- **Full mass sweep**: 13 projects with 4 parallel workers ≈ ~1 min per track (observed ~5 min sequential on 2026-08-13 — that gap is what let the wave crest during the sweep). Auto-sweep & midnight restore block the **poll** thread for that duration; manual button-driven sweeps run in a daemon worker thread so the Telegram poll thread stays free.
+- **Full mass sweep**: 13 projects with 4 parallel workers ≈ ~1 min per track (observed ~5 min sequential on 2026-08-13 — that gap is what let the wave crest during the sweep). Restores (manual "Unseal → All" and the midnight queue) use the same 4-worker pool since 2026-09-29; before that they were sequential and took 5–10 min. Auto-sweep & midnight restore block the **poll** thread for that duration; manual button-driven sweeps run in a daemon worker thread so the Telegram poll thread stays free.
 - **Inflight window**: a brief gap between detection and full throttle where running requests complete. Unavoidable — bounded by sweep wall-time, absorbed by the per-track buffer.
 
 ---

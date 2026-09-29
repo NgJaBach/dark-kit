@@ -1084,6 +1084,174 @@ def test_mode_change_logged_once():
 
 # ─── Run ────────────────────────────────────────────────────────────────────
 
+# ─── Midnight straddle + parallel unseal (2026-09-29 incident) ─────────────
+
+def test_midnight_straddle_fetch_labels_correct_day():
+    """Replays 2026-09-29: a fetch starting 23:59:58 pages past midnight and gets
+    the OLD day's 24.88M. It was stamped with the new date and mass-sealed all 13
+    projects. The snapshot must carry the new day's data (re-fetch), never the
+    old day's totals under the new date."""
+    from datetime import datetime as real_dt, timezone as tz
+    clock = {"now": real_dt(2026, 9, 28, 23, 59, 58, tzinfo=tz.utc)}
+
+    class FakeDT(real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+
+    nam = "proj_fvkY21dJ0ripiOIA2jCC86f3"
+    windows = []
+
+    def straddling_fetch(window=None):
+        windows.append(window)
+        if len(windows) == 1:   # midnight passes mid-pagination
+            clock["now"] = real_dt(2026, 9, 29, 0, 0, 3, tzinfo=tz.utc)
+            return {nam: {"normal_tokens": 24_882_107, "total_tokens": 24_882_107}}
+        return {nam: {"normal_tokens": 3_000, "total_tokens": 3_000}}
+
+    with mock.patch.object(bot, "datetime", FakeDT), \
+         mock.patch.object(bot, "_fetch_tokens", side_effect=straddling_fetch):
+        snap = bot.fetch_today_usage()
+    assert snap["date"] == "2026-09-29", snap["date"]
+    assert snap["total_normal_tokens"] == 3_000, "old day's 24.88M leaked into the new day"
+    assert len(windows) == 2, f"expected one re-fetch, got {len(windows)} fetches"
+    new_midnight = int(real_dt(2026, 9, 29, tzinfo=tz.utc).timestamp())
+    assert windows[1][0] == new_midnight, "re-fetch must query the NEW day's window"
+
+    # No straddle: exactly one fetch, labelled with its own window's day.
+    clock["now"] = real_dt(2026, 9, 29, 12, 0, tzinfo=tz.utc)
+    windows.clear()
+    with mock.patch.object(bot, "datetime", FakeDT), \
+         mock.patch.object(bot, "_fetch_tokens",
+                           side_effect=lambda window=None: windows.append(window) or {}):
+        snap = bot.fetch_today_usage()
+    assert snap["date"] == "2026-09-29" and len(windows) == 1
+    print("  ✅ Midnight-straddling fetch re-fetches the new day; stale totals never relabelled")
+
+
+def test_store_ignores_older_snapshot():
+    """A snapshot OLDER than the store's day must be refused, not treated as a
+    rollover — that would reset today's state and queue live seals for restore."""
+    usage, _, _, _ = _fresh_stores()
+    usage.update({"date": "2026-09-29", "projects": {}, "total_normal_tokens": 3_000})
+    usage.add_track_originals("normal", "proj_x", [
+        {"id": "r1", "model": "gpt-4o-mini", "max_requests_per_1_minute": 5000}])
+    usage.mark_mass_sealed("normal")
+
+    applied = usage.update({"date": "2026-09-28", "projects": {},
+                            "total_normal_tokens": 24_882_107})
+    assert applied is False, "stale snapshot must be refused"
+    assert usage._data["date"] == "2026-09-29"
+    assert usage._data.get("total_normal_tokens") == 3_000, "stale totals overwrote today's"
+    assert "proj_x" in usage.get_sealed_tracks()["normal"]["originals_by_project"], \
+        "live seal wiped by a backward 'rollover'"
+    assert usage.is_mass_sealed("normal")
+    assert not usage.get_pending_track_unseal(), "today's seals queued for restore"
+
+    assert usage.update({"date": "2026-09-30", "projects": {}}) is True, "forward rollover broken"
+    assert "proj_x" in usage.get_pending_track_unseal()["normal"]["originals_by_project"]
+    print("  ✅ Older snapshot refused (state intact); forward rollover still works")
+
+
+def test_refresh_never_acts_on_stale_snapshot():
+    """/refresh on the Telegram thread: if its fetch is pre-midnight but the poll
+    loop already rolled the store over, it must refetch — not seal on 24.88M."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    usage.update({"date": "2026-09-29", "projects": {}})
+    usage._data["spend_seeded"] = True
+    stale = {"date": "2026-09-28", "total_cost": 0.0, "total_premium_tokens": 0,
+             "total_normal_tokens": 24_882_107, "projects": {}}
+    fresh = {"date": "2026-09-29", "total_cost": 0.0, "total_premium_tokens": 0,
+             "total_normal_tokens": 3_000, "projects": {}}
+    spawned, sent = [], []
+    with mock.patch.object(bot, "fetch_today_usage", side_effect=[stale, fresh]), \
+         mock.patch.object(bot, "_enrich_costs", side_effect=lambda s, *a, **k: s), \
+         mock.patch.object(bot, "_fetch_recent_activity_by_band", return_value={}), \
+         mock.patch.object(bot, "_spawn_bg",
+                           side_effect=lambda label, fn, *a: spawned.append(label)), \
+         mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: sent.append(t)):
+        bot.cmd_refresh(usage, subs, names, "Bach")
+    assert not [s for s in spawned if s.startswith("track-seal")], f"stale data sealed: {spawned}"
+    assert not [t for t in sent if "Exhausted" in t], "stale milestone broadcast"
+    assert usage._data.get("total_normal_tokens") == 3_000
+    print("  ✅ /refresh refetches past a stale snapshot — no seal, no bogus milestone")
+
+
+def _seal_state(usage, pids, rows=2):
+    for pid in pids:
+        usage.add_track_originals("normal", pid, [
+            {"id": f"rl-{i}", "model": "gpt-4o-mini", "max_requests_per_1_minute": 5000,
+             "max_tokens_per_1_minute": 4_000_000} for i in range(rows)])
+
+
+class _ConcurrencyProbe:
+    """Fake _update_project_rate_limit that records peak parallelism."""
+    def __init__(self, fail_pids=(), delay=0.05):
+        self.lock, self.live, self.peak, self.calls = threading.Lock(), 0, 0, []
+        self.fail_pids, self.delay = set(fail_pids), delay
+
+    def __call__(self, pid, rid, payload, **kw):
+        with self.lock:
+            self.live += 1; self.peak = max(self.peak, self.live); self.calls.append(pid)
+        time.sleep(self.delay)
+        with self.lock:
+            self.live -= 1
+        return pid not in self.fail_pids
+
+
+def test_mass_unseal_parallel_restores_and_exempts():
+    """Manual 'Unseal → All' used to restore one project at a time (10.5 min on
+    2026-09-29). It must now run SEAL_SWEEP_WORKERS projects in parallel, exempt
+    every restored project, and leave a failed one sealed and non-exempt."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    pids = list(bot.KNOWN_PROJECTS)
+    _seal_state(usage, pids)
+    bad = pids[3]
+    probe = _ConcurrencyProbe(fail_pids={bad})
+    with mock.patch.object(bot, "_update_project_rate_limit", side_effect=probe), \
+         mock.patch.object(bot, "_compute_canonical_baseline", return_value={}), \
+         mock.patch.object(bot, "_send"):
+        assert bot._try_claim_busy()
+        try:
+            t0 = time.time()
+            bot._mass_unseal_track("normal", usage, subs, names, reason="manual all")
+            elapsed = time.time() - t0
+        finally:
+            bot._release_busy()
+    left = usage.get_sealed_tracks().get("normal", {}).get("originals_by_project", {})
+    assert set(left) == {bad}, f"expected only the failed project still sealed, got {set(left)}"
+    assert all(usage.is_exempt(p, "normal") for p in pids if p != bad)
+    assert not usage.is_exempt(bad, "normal"), "failed restore must not be exempted"
+    assert 1 < probe.peak <= bot.SEAL_SWEEP_WORKERS, f"peak parallelism {probe.peak}"
+    print(f"  ✅ {len(pids)-1}/{len(pids)} restored + exempt, failure stays sealed; "
+          f"peak {probe.peak} workers, {elapsed:.2f}s")
+
+
+def test_pending_unseal_parallel_keeps_failures_queued():
+    """Midnight auto-restore: same parallel path; a failed project must stay in
+    pending_track_unseal for the next poll, successes must leave the queue."""
+    usage, subs, names, _ = _fresh_stores()
+    bot._release_busy()
+    pids = list(bot.KNOWN_PROJECTS)
+    usage.update({"date": "2026-09-28", "projects": {}})
+    _seal_state(usage, pids)
+    usage.update({"date": "2026-09-29", "projects": {}})   # rollover → pending queue
+    bad = pids[0]
+    probe = _ConcurrencyProbe(fail_pids={bad})
+    with mock.patch.object(bot, "_update_project_rate_limit", side_effect=probe), \
+         mock.patch.object(bot, "_compute_canonical_baseline", return_value={}), \
+         mock.patch.object(bot, "_send"):
+        bot._process_pending_track_unseals(usage, subs, names)
+    queue = usage.get_pending_track_unseal().get("normal", {}).get("originals_by_project", {})
+    assert set(queue) == {bad}, f"queue should hold only the failure, got {set(queue)}"
+    assert 1 < probe.peak <= bot.SEAL_SWEEP_WORKERS, f"peak parallelism {probe.peak}"
+    assert bot._try_claim_busy(), "busy claim leaked after the restore"
+    bot._release_busy()
+    print(f"  ✅ Midnight restore parallel (peak {probe.peak}); failure stays queued for retry")
+
+
 if __name__ == "__main__":
     tests = [
         ("HTML escape + length cap in setname",          test_name_html_escape),
@@ -1135,6 +1303,11 @@ if __name__ == "__main__":
         ("Intel log captures broadcasts",                test_intel_log_captures_broadcasts),
         ("Intel log failure never breaks bot",           test_intel_log_failure_never_breaks_bot),
         ("Mode change logged once per transition",       test_mode_change_logged_once),
+        ("Midnight-straddle fetch labels correct day",   test_midnight_straddle_fetch_labels_correct_day),
+        ("Store ignores older snapshot",                 test_store_ignores_older_snapshot),
+        ("/refresh never acts on stale snapshot",        test_refresh_never_acts_on_stale_snapshot),
+        ("Mass unseal parallel + exempts",               test_mass_unseal_parallel_restores_and_exempts),
+        ("Pending unseal parallel, failures queued",     test_pending_unseal_parallel_keeps_failures_queued),
     ]
     passes, fails = 0, []
     for name, fn in tests:
