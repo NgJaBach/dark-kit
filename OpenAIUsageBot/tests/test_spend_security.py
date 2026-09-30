@@ -758,8 +758,8 @@ def test_model_names_escaped_in_alerts():
     usage._data.update({"date": "2026-08-22", "projects": {"p": {
         "name": "p", "total_tokens": 10, "input_tokens": 5, "output_tokens": 5,
         "num_requests": 1, "models": {evil: {"input": 5, "output": 5, "requests": 1}}}}})
-    for out in (bot.cmd_tokens(usage), bot.cmd_models(usage)):
-        assert "&lt;b&gt;" in out and "<code>gpt-<b>" not in out, out[:200]
+    out = bot.cmd_usage(usage)
+    assert "&lt;b&gt;" in out and "<code>gpt-<b>" not in out, out[:200]
     print("  ✅ Model names HTML-escaped in every alert and report path")
 
 
@@ -968,14 +968,14 @@ def test_lane_lines_in_every_report():
     })
     snap = usage.get()
     reports = {
-        "tokens":   bot.cmd_tokens(usage),
+        "usage":    bot.cmd_usage(usage),
         "snapshot": bot.fmt_daily_snapshot(snap, LAB2),
         "archive":  bot._fmt_archive_status(usage),
     }
     for name, out in reports.items():
         assert "0.21$" in out, f"{name}: normal lane cost missing"
         assert "0.12$" in out, f"{name}: exotic cost missing"
-    for name in ("tokens", "snapshot"):
+    for name in ("usage", "snapshot"):
         out = reports[name]
         assert "/ 1M. Cost: 0.00$" in out, f"{name}: premium Cost suffix missing"
         assert "/ 10M. Cost: 0.21$" in out, f"{name}: normal Cost suffix missing"
@@ -985,18 +985,18 @@ def test_lane_lines_in_every_report():
     usage2, _, _, _ = _fresh_stores()
     usage2._data.update({"date": "2026-09-15", "projects": {"p": {
         "name": "p", "total_tokens": 1, "models": {}}}})
-    assert "Cost: \u2014" in bot.cmd_tokens(usage2)
+    assert "Cost: \u2014" in bot.cmd_usage(usage2)
 
     # Lab 3 renders its own (4x smaller) allowances, never Lab 2's.
     usage3, _, _, _ = _fresh_stores(LAB3)
     usage3._data.update({k: v for k, v in usage.get().items()})
-    for name, out in (("tokens", bot.cmd_tokens(usage3)),
+    for name, out in (("usage", bot.cmd_usage(usage3)),
                       ("snapshot", bot.fmt_daily_snapshot(usage3.get(), LAB3))):
         assert "/ 250K. Cost:" in out and "/ 2.5M. Cost:" in out, f"lab3 {name}: {out[-300:]}"
         assert "/ 10M" not in out and "/ 1M." not in out, f"lab3 {name} shows Lab 2 caps"
     arch3 = bot._fmt_archive_status(usage3)
     assert "/ 2.5M" in arch3 and "/ 250K" in arch3 and "Business AI Lab 3" in arch3, arch3[:300]
-    print("  \u2705 Cost suffix + Exotic lane render in tokens, snapshot, archive (per-org caps)")
+    print("  \u2705 Cost suffix + Exotic lane render in usage, snapshot, archive (per-org caps)")
 
 
 # ─── Network retry (2026-09-16) ─────────────────────────────────────────────
@@ -1680,16 +1680,25 @@ def test_telegram_startup_retries_until_ready():
 # ─── Multi-org: Business AI Lab 2 + Lab 3 (2026-09-29) ──────────────────────
 
 def test_org_config():
-    """Lab 2 keeps exactly its old caps, seal points, milestone ladders and state
-    files; Lab 3 gets the same shape at its tier-1-2 caps (2.5M / 250K)."""
+    """Lab 2 keeps exactly its old caps, seal points, milestone ladders, spend
+    alarm and state files. Lab 3: milestones on its tier-1-2 free allowance
+    (2.5M / 250K), but it seals at Lab 2's levels — it pays past its allowance
+    on purpose, to climb the usage tiers — and its spend alarm is $10."""
     assert (LAB2.normal_cap, LAB2.premium_cap) == (10_000_000, 1_000_000)
     assert (LAB2.normal_threshold, LAB2.premium_threshold) == (9_500_000, 800_000)
     assert LAB2.normal_milestones == [(1_000_000, "casual"), (4_000_000, "casual"),
         (7_000_000, "casual"), (8_000_000, "urgent"), (9_000_000, "urgent"), (10_000_000, "cap")]
     assert LAB2.premium_milestones == [(200_000, "casual"), (500_000, "casual"),
         (800_000, "urgent"), (1_000_000, "cap")]
+    assert (LAB2.normal_ceiling, LAB2.premium_ceiling) == (10_000_000, 1_000_000)
+    assert LAB2.daily_limit == 2.00 and LAB2.spend_milestones == bot.SPEND_MILESTONES
+    assert (LAB2.spend_overcap_step, LAB2.project_spend_thresholds) == (0.50, (0.25, 0.50, 1.00))
+    assert not LAB2.pays_past_free("normal") and not LAB2.pays_past_free("premium")
     assert (LAB3.normal_cap, LAB3.premium_cap) == (2_500_000, 250_000)
-    assert (LAB3.normal_threshold, LAB3.premium_threshold) == (2_375_000, 200_000)
+    assert (LAB3.normal_ceiling, LAB3.premium_ceiling) == (10_000_000, 1_000_000)
+    assert (LAB3.normal_threshold, LAB3.premium_threshold) == (9_500_000, 800_000)
+    assert LAB3.pays_past_free("normal") and LAB3.pays_past_free("premium")
+    assert LAB3.daily_limit == 10.00 and [t for t, _ in LAB3.spend_milestones] == [0.5, 2.5, 5.0, 7.5, 10.0]
     assert [t for t, _ in LAB3.normal_milestones] == [250_000, 1_000_000, 1_750_000,
                                                       2_000_000, 2_250_000, 2_500_000]
     assert [t for t, _ in LAB3.premium_milestones] == [50_000, 125_000, 200_000, 250_000]
@@ -1699,7 +1708,7 @@ def test_org_config():
     assert "proj_zo1iaAChFX81OMGwxRStD76g" in LAB3.projects
     assert not set(LAB2.projects) & set(LAB3.projects), "project ids overlap across orgs"
     assert LAB2.key != LAB3.key and LAB2.poll_now is not LAB3.poll_now
-    print("  ✅ Lab 2 unchanged (10M/1M, 9.5M/800k); Lab 3 at 2.5M/250K (2.375M/200k)")
+    print("  ✅ Lab 2 unchanged (10M/1M, 9.5M/800k, $2); Lab 3 free 2.5M/250K, seals 9.5M/800k, $10")
 
 
 def test_busy_claims_and_rollover_independent():
@@ -1722,26 +1731,27 @@ def test_busy_claims_and_rollover_independent():
 
 
 def test_poll_cycle_uses_its_orgs_caps():
-    """2.4M normal tokens is 96% of Lab 3's cap (seal) but 24% of Lab 2's (no
-    seal). Each poll loop must query and seal with ITS org."""
-    for org, expect_seal in ((LAB3, True), (LAB2, False)):
-        usage, subs, names, _ = _fresh_stores(org)
-        bot._release_busy(org)
-        snap = {"date": bot.today_str(), "total_cost": 0.0, "total_premium_tokens": 0,
-                "total_normal_tokens": 2_400_000, "projects": {}}
-        sealed, fetched_for = [], []
-        ev = _OneCycle()
-        with mock.patch.object(org, "poll_now", ev), \
-             mock.patch.object(bot, "fetch_today_usage",
-                               side_effect=lambda o: (fetched_for.append(o), snap)[1]), \
-             mock.patch.object(bot, "_handle_track_seal",
-                               side_effect=lambda t, *a, **k: sealed.append(t)), \
-             mock.patch.object(bot, "_fetch_costs_breakdown", return_value=None), \
-             mock.patch.object(bot, "_sync_projects", return_value=[]), \
-             mock.patch.object(bot, "_send"):
-            _run_cycle(usage, subs, names, ev)
-        assert fetched_for == [org], f"{org.id} loop fetched with {fetched_for}"
-        assert (sealed == ["normal"]) == expect_seal, f"{org.id}: sealed={sealed}"
+    """Each poll loop must query and seal with ITS org. With Lab 3's seal point
+    pinned at 2.375M, 2.4M normal tokens seals Lab 3 but not Lab 2 (9.5M)."""
+    snap = {"date": bot.today_str(), "total_cost": 0.0, "total_premium_tokens": 0,
+            "total_normal_tokens": 2_400_000, "projects": {}}
+    with mock.patch.object(LAB3, "normal_threshold", 2_375_000):
+        for org, expect_seal in ((LAB3, True), (LAB2, False)):
+            usage, subs, names, _ = _fresh_stores(org)
+            bot._release_busy(org)
+            sealed, fetched_for = [], []
+            ev = _OneCycle()
+            with mock.patch.object(org, "poll_now", ev), \
+                 mock.patch.object(bot, "fetch_today_usage",
+                                   side_effect=lambda o: (fetched_for.append(o), snap)[1]), \
+                 mock.patch.object(bot, "_handle_track_seal",
+                                   side_effect=lambda t, *a, **k: sealed.append(t)), \
+                 mock.patch.object(bot, "_fetch_costs_breakdown", return_value=None), \
+                 mock.patch.object(bot, "_sync_projects", return_value=[]), \
+                 mock.patch.object(bot, "_send"):
+                _run_cycle(usage, subs, names, ev)
+            assert fetched_for == [org], f"{org.id} loop fetched with {fetched_for}"
+            assert (sealed == ["normal"]) == expect_seal, f"{org.id}: sealed={sealed}"
     print("  ✅ Each org's poll loop fetches + seals against its own caps")
 
 
@@ -1831,17 +1841,18 @@ def test_reports_cover_both_orgs():
                                                                           "requests": 1}}}}})
     fetched = []
     with mock.patch.object(bot, "_fetch_monthly_costs",
-                           side_effect=lambda org, y, m: (fetched.append(org.id), {})[1]):
-        for cmd in ("tokens", "models", "rank", "active", "spending"):
+                           side_effect=lambda org, y, m: (fetched.append(org.id), {})[1]), \
+         mock.patch.object(bot, "_fetch_recent_usage", return_value=(123_000, 45)):
+        for cmd in ("usage", "spending", "tokens", "models", "rank", "recent"):
             out, _ = bot.dispatch(f"@botx {cmd}", [s2, s3], subs, "botx", "test_primary", names)
             i2, i3 = out.find("Business AI Lab 2"), out.find("Business AI Lab 3")
             assert 0 <= i2 < i3, f"{cmd}: missing a per-org section"
     assert sorted(set(fetched)) == ["lab2", "lab3"], fetched
-    out, _ = bot.dispatch("@botx tokens", [s2, s3], subs, "botx", "test_primary", names)
+    out, _ = bot.dispatch("@botx usage", [s2, s3], subs, "botx", "test_primary", names)
     assert "/ 10M" in out[:out.find("Business AI Lab 3")] and "/ 2.5M" in out[out.find("Business AI Lab 3"):]
     help_text, _ = bot.dispatch("@botx help", [s2, s3], subs, "botx", "test_primary", names)
     assert "Business AI Lab 3" in help_text
-    print("  ✅ tokens/models/rank/active/spending: one labelled section per org")
+    print("  ✅ usage/spending (+ old aliases): one labelled section per org")
 
 
 def test_quarantine_and_baseline_stay_in_their_org():
@@ -1897,8 +1908,8 @@ def test_unknown_project_synced_before_seal():
     usage, subs, names, _ = _fresh_stores(LAB3)
     bot._release_busy(LAB3)
     snap = {"date": bot.today_str(), "total_cost": 0.0, "total_premium_tokens": 0,
-            "total_normal_tokens": 2_400_000,
-            "projects": {"proj_alice": {"normal_tokens": 2_400_000, "total_tokens": 2_400_000}}}
+            "total_normal_tokens": 9_600_000,
+            "projects": {"proj_alice": {"normal_tokens": 9_600_000, "total_tokens": 9_600_000}}}
     order = []
     ev = _OneCycle()
     with mock.patch.object(LAB3, "poll_now", ev), \
@@ -1979,8 +1990,10 @@ def test_archive_ux_fixes():
         assert done.wait(5)
     assert edits[1].endswith("PROMPT-LINE"), edits[1][-60:]
 
-    text = bot.fmt_seal_batch_begin("normal", 300_000, 2_500_000, LAB3, manual=True)
+    text = bot.fmt_seal_batch_begin("normal", 1_200_000, 10_000_000, LAB2, manual=True)
     assert "hit 100%" not in text and "Manual seal" in text and "12%" in text, text
+    text = bot.fmt_seal_batch_begin("normal", 300_000, LAB3.normal_ceiling, LAB3, manual=True)
+    assert "Manual seal" in text and "at 300.0k (seal point 9.50M)" in text, text
     print("  ✅ ☣️ in Unseal→Both, picker prompt kept, honest manual-seal wording")
 
 
@@ -2011,7 +2024,8 @@ def test_costs_cache_is_dated():
 def test_unguarded_org_is_announced():
     """A rejected key (401) alerts at once; transient failures after 5 polls; a
     recovery notice follows. Reports say 'unknown, NOT zero' instead of $0."""
-    org = bot.Org("labx", "Business AI Lab X", "k", 1_000_000, 100_000, "x.json", "xp.json", {})
+    org = bot.Org(dict(id="labx", label="Business AI Lab X", key_env="X", free=(1_000_000, 100_000),
+                       state="x.json", cache="xp.json"), "k", {})
     sent = []
     with mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: sent.append(t)):
         _, subs, names, _ = _fresh_stores()
@@ -2030,9 +2044,11 @@ def test_unguarded_org_is_announced():
         bot._note_api_failure(org, 1, subs, names)
         assert len(sent) == 1 and "key rejected" in sent[0], sent
     s2, _, _, _ = _fresh_stores()
-    with mock.patch.object(bot, "_fetch_monthly_costs", return_value=None):
+    with mock.patch.object(bot, "_fetch_monthly_costs", return_value=None), \
+         mock.patch.object(bot, "_fetch_recent_usage", return_value=None):
         out = bot.cmd_spending(s2)
     assert "NOT zero" in out and "No spend recorded" not in out, out
+    assert out.count("NOT zero") == 3, "the 31-day line must say unknown too"
     print("  ✅ Rejected key / sustained failure / recovery announced; errors never read as $0")
 
 
@@ -2052,6 +2068,134 @@ def test_setname_reply_escaped():
     out = bot.cmd_setname("c1", "<3 Bach", names)
     assert "<3" not in out and "&lt;3 Bach" in out, out
     print("  ✅ setname confirmation is HTML-escaped")
+
+
+# ─── Command surface + Lab 3 paid headroom (2026-09-30) ─────────────────────
+
+def test_command_surface():
+    """13 commands became refresh · usage · spending · archive (+ help and chat
+    setup). Old names route to their replacement; /slash forms work; a bare
+    /command that isn't ours (another bot's) is ignored; help and refresh carry
+    the tap menu; an unknown command is echoed escaped."""
+    s2, subs, names, _ = _fresh_stores()
+    s2._data.update({"date": bot.today_str(), "projects": {"p": {
+        "name": "p", "total_tokens": 5, "input_tokens": 5, "output_tokens": 0, "num_requests": 1,
+        "cost_usd": 0.0, "models": {"gpt-4o-mini": {"input": 5, "output": 0, "requests": 1}}}}})
+    m = bot._match_prefix
+    assert m("@botx usage", "botx") == "usage"
+    assert m("/usage", "botx") == "usage" and m("/usage@BotX extra", "botx") == "usage extra"
+    assert m("/usage@otherbot", "botx") is None, "a command for another bot was taken"
+    assert m("/shrug", "botx") is None, "a bare unknown /command must be ignored"
+    assert m("/shrug@botx", "botx") == "shrug", "an addressed unknown command must get the hint"
+    assert m("@botxyz usage", "botx") is None, "@botxyz is a different bot"
+    assert m("@botx", "botx") == ""
+    assert m("/setname\nBach  Two", "botx") == "setname Bach  Two" and m("/", "botx") is None
+    for old, new in (("tokens", "usage"), ("projects", "usage"), ("rank", "usage"),
+                     ("models", "usage"), ("recent", "spending"), ("active", "refresh"),
+                     ("start", "help")):
+        assert bot._canonical(old) == new, (old, bot._canonical(old))
+    a, _ = bot.dispatch("@botx tokens", [s2], subs, "botx", "test_primary", names)
+    b, _ = bot.dispatch("/usage", [s2], subs, "botx", "test_primary", names)
+    assert a == b and "Usage" in a and "gpt-4o-mini" in a, a[:200]
+    text, kb = bot.dispatch("@botx", [s2], subs, "botx", "test_primary", names)
+    assert kb == bot._kb_menu() and "/refresh" in text and "/usage" in text
+    for gone in ("tokens</code>", "rank</code>", "models</code>", "recent</code>", "active</code>"):
+        assert gone not in text, f"help still lists {gone}"
+    labels = [b["callback_data"] for row in kb for b in row]
+    assert labels == ["cmd:refresh", "cmd:usage", "cmd:spending", "cmd:archive"], labels
+    with mock.patch.object(bot, "fetch_today_usage", return_value=None):
+        _, kb = bot.dispatch("/refresh", [s2], subs, "botx", "test_primary", names)
+    LAB2.poll_now.clear()
+    assert kb == bot._kb_menu(), "refresh must carry the tap menu"
+    out, _ = bot.dispatch("@botx <b>x", [s2], subs, "botx", "test_primary", names)
+    assert "&lt;b&gt;x" in out and "<code><b>" not in out, out
+    print("  ✅ 5 commands + aliases, /slash forms, tap menu, escaped unknown")
+
+
+def test_menu_button_runs_command():
+    """A menu button runs its command and posts the reply as a new message —
+    subscribed chats only, known commands only."""
+    s2, subs, names, _ = _fresh_stores()
+    s2._data.update({"date": bot.today_str(), "projects": {}})
+    sent, answered = [], []
+    cq = lambda data, chat="test_primary": {"id": "q", "data": data, "message": {
+        "chat": {"id": chat}, "message_id": 7, "message_thread_id": 3}}
+    with mock.patch.object(bot, "_send", side_effect=lambda t, c, th=None, keyboard=None: sent.append((t, c, th))), \
+         mock.patch.object(bot, "_answer_callback", side_effect=lambda i, t=None: answered.append(t)), \
+         mock.patch.object(bot, "_edit_message"):
+        bot._handle_callback_update(cq("cmd:usage"), {"lab2": s2}, subs, names, "botx")
+        assert len(sent) == 1 and "No usage today" in sent[0][0] and sent[0][1:] == ("test_primary", 3), sent
+        bot._handle_callback_update(cq("cmd:dismiss"), {"lab2": s2}, subs, names, "botx")
+        bot._handle_callback_update(cq("cmd:usage", chat="stranger"), {"lab2": s2}, subs, names, "botx")
+    assert len(sent) == 1, f"non-menu command or stranger ran: {sent}"
+    assert "This channel isn't subscribed." in answered
+    print("  ✅ Menu buttons run refresh/usage/spending/archive for subscribers only")
+
+
+def test_lab3_pays_past_free_allowance():
+    """Lab 3 pays its way up the tiers: past its free 2.5M / 250K it keeps
+    running (no seal, no overcap alarm) until Lab 2's seal points; the
+    allowance-exhausted alert says so; its $ alarms scale to $10."""
+    for tok, expect_seal, expect_overcap in ((3_000_000, [], False), (9_600_000, ["normal"], False),
+                                             (10_100_000, ["normal"], True)):
+        usage, subs, names, _ = _fresh_stores(LAB3)
+        bot._release_busy(LAB3)
+        snap = {"date": bot.today_str(), "total_cost": 0.0, "total_premium_tokens": 300_000,
+                "total_normal_tokens": tok, "projects": {}}
+        sealed, overcap = [], []
+        ev = _OneCycle()
+        with mock.patch.object(LAB3, "poll_now", ev), \
+             mock.patch.object(bot, "fetch_today_usage", return_value=snap), \
+             mock.patch.object(bot, "_handle_track_seal", side_effect=lambda t, *a, **k: sealed.append(t)), \
+             mock.patch.object(bot, "_handle_overcap", side_effect=lambda *a, **k: overcap.append(a[3:])), \
+             mock.patch.object(bot, "_fetch_costs_breakdown", return_value=None), \
+             mock.patch.object(bot, "_sync_projects", return_value=[]), \
+             mock.patch.object(bot, "_send"):
+            _run_cycle(usage, subs, names, ev)
+        assert sealed == expect_seal, f"{tok:,}: sealed={sealed}"
+        assert bool(overcap) == expect_overcap, f"{tok:,}: overcap={overcap}"
+
+    # Allowance-exhausted alert: Lab 3 says the paid run is by design; Lab 2 doesn't.
+    msgs = {}
+    for org, tok in ((LAB3, 2_500_000), (LAB2, 10_000_000)):
+        usage, subs, names, _ = _fresh_stores(org)
+        usage._data["milestones_seeded"] = True
+        got = []
+        with mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: got.append(t)):
+            bot.check_milestones({"total_normal_tokens": tok, "total_premium_tokens": 0}, usage, subs, names)
+        msgs[org.id] = "\n".join(got)
+    assert "By design this org keeps running" in msgs["lab3"] and "9.50M seal point" in msgs["lab3"], msgs["lab3"][-400:]
+    assert "By design" not in msgs["lab2"]
+
+    # Spend: $3 is a casual milestone on Lab 3 ($10 alarm) but past Lab 2's $2 cap.
+    for org, expect_cap in ((LAB3, False), (LAB2, True)):
+        usage, subs, names, _ = _fresh_stores(org)
+        got = []
+        with mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: got.append(t)):
+            hit, cap = bot.check_spend({"total_cost": 3.00, "projects": {}}, usage, subs, names)
+        assert hit and cap == expect_cap, (org.id, hit, cap)
+        if org is LAB3:
+            assert any("$2.50" in t and "of $10.00" in t for t in got), got
+
+    # Seal message reports tokens vs the seal point, not "hit 324%" of the allowance.
+    begin = bot.fmt_seal_batch_begin("premium", 812_000, LAB3.premium_ceiling, LAB3)
+    assert "seal point 800.0k" in begin and "%" not in begin, begin
+    assert "hit 81%" in bot.fmt_seal_batch_begin("premium", 812_000, LAB2.premium_ceiling, LAB2)
+    usage, _, _, _ = _fresh_stores(LAB3)
+    assert "seals at 9.50M" in bot._fmt_archive_status(usage)
+    print("  ✅ Lab 3 runs past 2.5M/250K to 9.5M/800k; alerts + $10 ladder scale")
+
+
+def test_bot_token_redacted_from_console():
+    """A Telegram network error's text carries the request URL — and with it the
+    bot token. Console lines (the stdout log) must never contain the token."""
+    import io, contextlib
+    buf = io.StringIO()
+    with mock.patch.object(bot, "BOT_TOKEN", "123:SECRET"), contextlib.redirect_stdout(buf):
+        bot.print("[poll error] HTTPSConnectionPool(host='api.telegram.org'): /bot123:SECRET/getUpdates")
+    out = buf.getvalue()
+    assert "SECRET" not in out and "/bot<bot-token>/getUpdates" in out, out
+    print("  ✅ Bot token redacted from console / stdout log")
 
 
 if __name__ == "__main__":
@@ -2139,6 +2283,10 @@ if __name__ == "__main__":
         ("Unguarded org announced",                     test_unguarded_org_is_announced),
         ("Split prefers block boundaries",              test_split_prefers_block_boundaries),
         ("setname reply escaped",                       test_setname_reply_escaped),
+        ("Command surface: 5 commands + aliases",       test_command_surface),
+        ("Menu buttons run commands",                   test_menu_button_runs_command),
+        ("Lab 3 pays past its free allowance",          test_lab3_pays_past_free_allowance),
+        ("Bot token redacted from console",             test_bot_token_redacted_from_console),
     ]
     passes, fails = 0, []
     for name, fn in tests:

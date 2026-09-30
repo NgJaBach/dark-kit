@@ -50,11 +50,24 @@ for all). Main thread sleeps until `KeyboardInterrupt`.
 |---|---|---|
 | Admin key (`.env`) | `OPENAI_ADMIN_KEY` | `OPENAI_ADMIN_KEY_LAB3` |
 | Usage tier | 3+ | 1-2 (new org, created 2026-09-29) |
-| Normal allowance / seal point | 10M / 9.5M (95%) | 2.5M / 2.375M (95%) |
-| Premium allowance / seal point | 1M / 800k (80%) | 250K / 200k (80%) |
-| Milestone ladders | 1M 4M 7M 8M 9M 10M · 200k 500k 800k 1M | same fractions: 250k … 2.5M · 50k 125k 200k 250k |
+| Normal: free allowance / ceiling / seal point | 10M / 10M / 9.5M | 2.5M / **10M / 9.5M** |
+| Premium: free allowance / ceiling / seal point | 1M / 1M / 800k | 250K / **1M / 800k** |
+| Milestone ladders (on the free allowance) | 1M 4M 7M 8M 9M 10M · 200k 500k 800k 1M | same fractions: 250k … 2.5M · 50k 125k 200k 250k |
 | State / project cache | `usage_state.json` / `projects.json` (unchanged) | `usage_state_lab3.json` / `projects_lab3.json` |
-| Spend alarm | $2.00/day | $2.00/day |
+| Spend alarm (ladders scale with it) | $2.00/day · $0.10 0.50 1.00 1.50 2.00 | **$10.00/day** · $0.50 2.50 5.00 7.50 10.00 |
+
+**Lab 3 pays past its free allowance on purpose** (Bach, 2026-09-30): it has to spend
+its way up the usage tiers to reach Lab 2's allowance, so usage beyond 2.5M / 250K is
+wanted, up to the same daily room as Lab 2. Each org therefore has two numbers per track:
+the **free allowance** (`Org.cap()`: milestones, the "allowance exhausted" alert — which
+for Lab 3 adds "by design this org keeps running on paid usage until the seal point" —
+and the lane lines) and the **ceiling** (`Org.ceiling()`: seal point = ceiling minus the
+track buffer, the wave guard, the watch zone and the overcap "ILLEGAL ACTIVITY" alarm).
+For Lab 2 they are equal. Paid usage at both Lab 3 ceilings costs roughly $2–6/day
+(Lab 2's measured overage prices: normal ≈ $0.18/M, premium ≈ $1.5–4.6/M), so the $10
+alarm still means "something unplanned is billing". To change the policy, edit
+`ceiling` / `daily_limit` in `ORG_SPECS`; setting Lab 3's ceiling back to its `free`
+values restores the strict free-only seal (2.375M / 200k).
 
 Models, prices, classification and quarantine rules are identical for both orgs.
 An org is monitored only if its admin key is set, so removing `OPENAI_ADMIN_KEY_LAB3`
@@ -92,13 +105,18 @@ per-org and passed **explicitly**, never inferred:
 - **Commands** render one labelled section per org (`_per_org`); `/refresh` wakes every
   org's poll loop; the archive menu asks for the org (§7.7).
 
-**Lab 3 seal points are a proportional starting guess, not a measurement.** Lab 2's
-premium buffer was sized to a measured ingestion blind spot of up to 166k tokens;
-Lab 3's 80% leaves 50k. Lab 3's per-model limits reach 500k tokens/min, so a single
-saturating client could exhaust its 250K premium allowance within a minute, before the
-usage API (5–15 min lag) even shows it — on Lab 3 the seal is best-effort against a
-burst. Re-derive the buffers from Lab 3's own intel log (`"org": "lab3"` events) once
-it has real usage.
+**Seals take effect late on OpenAI's side.** A zeroed rate-limit row reads 0 at once,
+but the API gateway enforces it unevenly for minutes. Measured with real traffic:
+- Lab 3, 2026-09-30 (first real seal, 7 × 33k-token `gpt-5.1` requests → 231,257
+  premium tokens): the bot saw the whole burst on its first poll ~2 min after it ended
+  and sealed in 47 s; yet 5–15 min later a zero-limit model still answered most probes
+  (`gpt-5.1`, `gpt-5.4`, `o3`, `gpt-4o`, `gpt-4.1` alternated between 200 and 429).
+- Lab 2, 2026-09-26: namvuong-project was blocked for 5 min after its seal, then served
+  2,795 `gpt-4o-mini` requests in minutes 5–10, then stopped — no bot action in between.
+  The other Lab 2 seals checked (09-23, 09-24, 09-28) cut traffic within 1–2 min.
+So the track buffers absorb enforcement lag as well as reporting lag, and nothing the
+bot can do shortens it (zeroing the rows is the only reversible lever the Admin API
+offers). With Lab 3's ceiling at Lab 2's levels its buffers are Lab 2's measured ones.
 
 ---
 
@@ -191,11 +209,11 @@ its own guesses — it used to show "Poll: 60 min" while the bot polled every mi
 
 | Constant | Default | Purpose |
 |---|---|---|
-| `ORG_SPECS` | lab2, lab3 | Per org: id, label, admin-key env var, normal/premium caps, state + cache files (§2b) |
-| `DAILY_LIMIT` | $2.00 | Daily spend alarm per org (alerts + AGGRESSIVE mode) |
-| `SPEND_MILESTONES` | $0.10/0.50/1.00/1.50/2.00 | Org-wide spend alert thresholds |
-| `PROJECT_SPEND_THRESHOLDS` | $0.25/0.50/1.00 | Per-project spend alert thresholds |
-| `SPEND_OVERCAP_STEP` | $0.50 | Extra spend per escalation alert past the cap |
+| `ORG_SPECS` | lab2, lab3 | Per org: id, label, admin-key env var, `free` allowance, enforcement `ceiling`, `daily_limit`, state + cache files (§2b) |
+| `DAILY_LIMIT` | $2.00 | Base spend alarm (Lab 2's); each org's `daily_limit` scales the three ladders below |
+| `SPEND_MILESTONES` | $0.10/0.50/1.00/1.50/2.00 | Base org-wide spend alert ladder (× daily_limit / $2) |
+| `PROJECT_SPEND_THRESHOLDS` | $0.25/0.50/1.00 | Base per-project spend thresholds (Lab 3: $1.25/2.50/5.00) |
+| `SPEND_OVERCAP_STEP` | $0.50 | Base escalation step past the cap (Lab 3: $2.50) |
 | `NORMAL_MILESTONE_FRACTIONS` | .1 .4 .7 .8 .9 1.0 | Normal milestone ladder as fractions of the org's cap |
 | `PREMIUM_MILESTONE_FRACTIONS` | .2 .5 .8 1.0 | Premium milestone ladder as fractions of the org's cap |
 | `PASSIVE_INTERVAL_SECS` | 30 min | Passive-mode poll interval (`POLL_INTERVAL_MINS`; production: 1 min) |
@@ -211,8 +229,8 @@ its own guesses — it used to show "Poll: 60 min" while the bot polled every mi
 | `OVERCAP_WINDOW_MINS` | 20 | Activity window for overcap detection (wider, accounts for ingestion lag) |
 | `NORMAL_SEAL_REMAINING_PCT` | 0.05 | Normal-band buffer → seals at 95% |
 | `PREMIUM_SEAL_REMAINING_PCT` | 0.20 | Premium-band buffer → seals at 80% (sized to the measured blind spot — §7.7) |
-| `Org.normal_threshold` | 9.5M / 2.375M | Derived per org: cap × (1 − remaining_pct), normal band |
-| `Org.premium_threshold` | 800k / 200k | Derived per org: cap × (1 − remaining_pct), premium band |
+| `Org.normal_threshold` | 9.5M / 9.5M | Derived per org: ceiling × (1 − remaining_pct), normal band |
+| `Org.premium_threshold` | 800k / 800k | Derived per org: ceiling × (1 − remaining_pct), premium band |
 | `WAVE_LOOKAHEAD_SECS` | 1200 | Predictive-seal projection horizon (ingestion lag + sweep) |
 | `WAVE_RATE_WINDOW_SECS` | 600 | Sliding window for burn-rate measurement (dilutes ingestion chunks) |
 | `WAVE_MIN_UTILIZATION_PCT` | 0.60 | Predictive seal armed only above this fraction of cap |
@@ -473,7 +491,7 @@ audio — all model rows accept 0), healthy originals captured under
   60 s poll, i.e. a GET plus up to ~190 POSTs a minute for a persistently failing
   project), even if its write-ahead captures left it recorded; a `noop` (no rows) is
   memoized in-memory per day.
-- **Release**: `@bot archive` → Unseal → **Both** → project (or ALL) also lifts the
+- **Release**: `/archive` → Unseal → **Both** → project (or ALL) also lifts the
   quarantine — restores all rows and exempts the project from re-quarantine for
   the rest of the UTC day (`track_exemptions[pid] ⊇ ["full"]`). Off-watchlist
   spend after a release is a deliberate human decision.
@@ -500,7 +518,7 @@ audio — all model rows accept 0), healthy originals captured under
 - does **NOT** auto-mass-seal at the org level: off-watchlist culprits are already
   handled per-project by the quarantine above, and an org-wide seal would throttle
   legitimate listed-model use without adding protection. Manual
-  `@bot archive` → Seal → Both → ALL remains one click away.
+  `/archive` → Seal → Both → ALL remains one click away.
 
 **Overcap escalation** — past the cap, a fresh cap-level alert fires every extra
 `SPEND_OVERCAP_STEP` ($0.50): at $2.50, $3.00, $3.50, … Dynamic thresholds share the
@@ -530,7 +548,7 @@ third lane — **Exotic** — for all spend outside the two free-tier lanes:
 Spend today:  $0.3283
 ```
 
-Rendered by `_fmt_lane_lines()` in `@bot refresh`, `@bot tokens`, the daily
+Rendered by `_fmt_lane_lines()` in `/refresh`, `/usage`, the daily
 snapshot, and the archive status; the console poll line appends `exotic=$X` when
 non-zero, and every intel-log `poll` event records the split under `lanes`.
 
@@ -758,7 +776,7 @@ stuck with no buttons). This closes two older bugs:
 `arch:<org>:<action>:<mode>:<target>` payload against an enum set before using it:
 
 - exactly 5 fields — a 4-field button from before the org step
-  (`arch:seal:normal:3`) returns "This menu is outdated — send @bot archive again."
+  (`arch:seal:normal:3`) returns "This menu is outdated — send /archive again."
   It is never mapped to a guessed org: the two orgs' project indices overlap.
 - `org`    ∈ `{-}` ∪ monitored org ids — anything else returns "Unknown org."
 - `action` ∈ `{cancel, menu, seal, unseal}` — anything else returns "Unknown action."
@@ -778,13 +796,13 @@ Some rate-limit rows returned by GET aren't actually updatable. The bot treats t
 - `rate_limit_not_updatable` — fine-tune / batch-only rows.
 - `invalid_rate_limit_type` — model doesn't expose that field (e.g. `sora-2` has no `max_tokens_per_1_minute`).
 
-#### Manual control — `@bot archive` (interactive buttons)
+#### Manual control — `/archive` (interactive buttons)
 
 The command takes **no arguments**. It posts the live status plus an inline keyboard
 and drives a small button state machine (messages are edited in place, not re-sent):
 
 ```
-@bot archive
+/archive
    → status of every org + [🔒 Seal] [🔓 Unseal] [✖ Cancel]
         → Seal/Unseal → [🏢 Lab 2] [🏢 Lab 3] [✖ Cancel]          (skipped with one org)
              → org → [📦 Normal] [⭐ Premium] [🔱 Both] [✖ Cancel]
@@ -890,7 +908,8 @@ The legacy per-project-full-seal fields (`sealed_projects`, `pending_unseal`,
 
 - **Detection latency**: up to one poll cycle, clamped to 60 s inside the watch zone (an unsealed track within 10% of cap below its threshold). Milestones flip mode to urgent well before any threshold.
 - **Per-project throttle cost**: ~50–80 track rows × ~50 ms ≈ a few seconds per project per track.
-- **`@bot refresh` never blocks**: `cmd_refresh` runs on the Telegram thread, so the quarantine sweep and any mass seal it triggers are handed to daemon workers via `_spawn_bg()`. Running them inline froze every command for minutes (fixed 2026-08-22).
+- **`/refresh` never blocks**: it only reads (both orgs in parallel) and wakes each org's poll loop (`poll_now`); every seal, quarantine and alert happens there. It used to run that pipeline on the Telegram thread and froze every command for minutes (fixed 2026-08-22, removed 2026-09-29).
+- **Enforcement lag (OpenAI side)**: a zeroed row reads 0 at once but the gateway can keep serving that model for minutes (up to ~10 min on Lab 2, 15+ min on the brand-new Lab 3 — §2b). The buffers absorb it.
 - **Full mass sweep**: 13 projects with 4 parallel workers ≈ ~1 min per track (observed ~5 min sequential on 2026-08-13 — that gap is what let the wave crest during the sweep). Restores (manual "Unseal → All" and the midnight queue) use the same 4-worker pool since 2026-09-29; before that they were sequential and took 5–10 min. Auto-sweep & midnight restore block the **poll** thread for that duration; manual button-driven sweeps run in a daemon worker thread so the Telegram poll thread stays free.
 - **Inflight window**: a brief gap between detection and full throttle where running requests complete. Unavoidable — bounded by sweep wall-time, absorbed by the per-track buffer.
 
@@ -898,7 +917,11 @@ The legacy per-project-full-seal fields (`sealed_projects`, `pending_unseal`,
 
 ## 8. Command Reference
 
-Trigger: message must start with `@BachsSlave2Bot` (case-insensitive) followed by a command.
+Trigger: `/command`, `/command@BachsSlave2Bot`, or a message starting with
+`@BachsSlave2Bot` (case-insensitive) followed by the command — or a tap on the menu
+buttons under `help` and `refresh`. The main commands are registered with Telegram
+(`setMyCommands` at startup), so they appear in the chat's "/" menu. A bare `/command`
+the bot doesn't have is ignored (it may belong to another bot in the group).
 In groups/topics, the bot respects `message_thread_id` — replies stay in the originating thread.
 Non-subscribed chats can only use `arise`, and **only if allowlisted**: the primary
 chat (`TELEGRAM_CHAT_ID`) or a chat listed in `TELEGRAM_ALLOWED_CHAT_IDS`. Subscribers
@@ -911,21 +934,23 @@ logged (`arise_refused`), never broadcast. Chats already subscribed are unaffect
 Telegram's 4096-character limit are split into several messages on line boundaries
 (`_send` → `_split_message`); the keyboard rides on the last part.
 
-| Command | Description |
-|---|---|
-| `refresh` | Fresh numbers for every org now, and an immediate full poll cycle in each (alerts/seals follow in chat). |
-| `tokens` | Per-project token breakdown with per-model detail. |
-| `models` | Aggregate model usage across all projects today. |
-| `projects` | Project roster with token bar chart and costs. |
-| `rank` | Rankings by token consumption and daily spend. |
-| `recent` | Last 31 days: per-project cost, total tokens & requests. |
-| `spending` | Monthly bill — current + previous month (live fetch). |
-| `active` | Projects with API activity in the last 5 min + concurrency status. |
-| `archive` | Show, seal, unseal projects via interactive buttons (no arguments — see §7.7). |
-| `arise` | Subscribe this chat to all alerts (allowlisted chats only). Plays the Beru GIF on first subscribe. |
-| `dismiss` | Unsubscribe this chat (primary chat cannot be dismissed). |
-| `setname Name` | Set the name the bot uses to address you in this chat. |
-| `help` | Full command registry. |
+Since 2026-09-30 the 13 commands are 4 reports + help + chat setup. The old names
+still work as silent aliases (`COMMAND_ALIASES`), so habits and pinned messages keep
+working.
+
+| Command | Description | Old names |
+|---|---|---|
+| `refresh` | Fresh numbers for every org (tokens per lane, spend), a "Guard:" line (seals, quarantines, pending restores), the projects active in the last 5 min, and an immediate full poll cycle in each org. Carries the menu buttons. | `active`, `status` |
+| `usage` | Today per project, busiest first: tokens, requests, spend and per-model lines (🧪 = off-watchlist model), a by-model total, the lane lines. | `tokens`, `projects`, `rank`, `models` |
+| `spending` | Live money view: this month and last month per project, plus the last 31 days' tokens and requests. | `recent`, `bill` |
+| `archive` | Show, seal, unseal projects via interactive buttons (see §7.7). | — |
+| `help` | The registry plus the menu buttons (`@BachsSlave2Bot` alone shows it too). | `start`, `menu` |
+| `arise` | Subscribe this chat to all alerts (allowlisted chats only). Plays the Beru GIF on first subscribe. | — |
+| `dismiss` | Unsubscribe this chat (primary chat cannot be dismissed). | — |
+| `setname Name` | Set the name the bot uses to address you in this chat. | — |
+
+Menu buttons send `cmd:<name>` callbacks; the reply is posted as a new message in the
+same chat/topic. Only subscribed chats, and only the four menu commands, are accepted.
 
 ---
 
@@ -1141,7 +1166,7 @@ On startup the bot:
 - **HTML injection in display names** — `NameStore.set()` runs the name through `html.escape()` and caps to 48 chars. Names are interpolated into many Telegram-HTML messages; without escaping, a `setname </b><a href='...'>` would break the rendering of every subsequent broadcast.
 - **UTC alignment** — All dates use UTC. If running in Vietnam (UTC+7), "today" in UTC starts 7 hours behind local midnight. This matches OpenAI's billing day.
 - **Aggressive mode no-cooldown** — Overcap active-project broadcasts fire every poll (3–10 min) with no cooldown by design. This is intentional: the situation is a financial emergency and the team must be continuously reminded until action is taken.
-- **Concurrency loop is independent** — `concurrency_check_loop` runs every 5 minutes regardless of the current poll mode. It has its own 15-minute cooldown and is a separate concern from budget caps. On API failure it preserves the last known active-projects snapshot instead of overwriting with `{}`, so a brief network blip doesn't make the `/active` command show "no activity" misleadingly.
+- **Concurrency loop is independent** — `concurrency_check_loop` runs every 5 minutes regardless of the current poll mode. It has its own 15-minute cooldown and is a separate concern from budget caps. On API failure it preserves the last known active-projects snapshot instead of overwriting with `{}`, so a brief network blip doesn't make `/refresh`'s "Active" line show "none" misleadingly.
 - **Per-band overcap filtering** — `_fetch_recent_activity_by_band()` groups recent requests by both project and model. `_handle_overcap()` then keeps only projects with activity on the EXCEEDED band(s). A project using premium models cannot trigger the normal-cap alarm and vice versa.
 - **Activity fetch failure** — `_fetch_recent_activity*` return `None` on API failure (distinguished from `{}` meaning "no activity"). Callers preserve the previous mode/state rather than acting on missing data.
 - **Telegram poll backoff** — `_get_updates()` sleeps 5 s on network error before returning to avoid a tight reconnect loop. Successful long-polls return immediately without added sleep.

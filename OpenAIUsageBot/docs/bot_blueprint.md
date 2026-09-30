@@ -283,6 +283,11 @@ Resets at UTC midnight via `reset_day()`.
 
 ## 8. Command System
 
+> **Superseded 2026-09-30.** The live command set is `refresh · usage · spending ·
+> archive` + `help` / chat setup, with `/slash` forms and tap-menu buttons; the old
+> names below survive only as aliases. Current reference: `docs/openai_bot.md` §8.
+> The table below is the original (March 2026) design, kept for history.
+
 Trigger: message must start with `@BachsSlave2Bot` (case-insensitive match on prefix).
 
 | Command | Handler | What it returns |
