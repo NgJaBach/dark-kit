@@ -53,7 +53,7 @@ telegram_poll_loop()
 
 usage_poll_loop()
   └── every POLL_INTERVAL seconds:
-       ├── _fetch_costs()   → /v1/organization/costs
+       ├── _fetch_costs_breakdown() → /v1/organization/costs
        ├── _fetch_tokens()  → /v1/organization/usage/completions
        ├── UsageStore.update(snapshot)
        └── if total_cost ≥ DAILY_LIMIT and not alert_sent → _send_all(alert)
@@ -354,7 +354,7 @@ Monarch Bach, your war chest demands attention.
 
 | What to change | Where |
 |---|---|
-| Add new project | Add to `KNOWN_PROJECTS` dict (get ID from Platform → Projects → Export CSV) |
+| Add new project | Nothing to do — each org's projects are discovered from the Admin API hourly; optionally add it to `SEED_PROJECTS` (offline seed) |
 | Add per-user tracking | Add `("group_by[]", "user_id")` to `_fetch_tokens` params, update data model |
 | Add token alert | Add `DAILY_TOKEN_LIMIT` env var, check in `usage_poll_loop` alongside cost check |
 | Historical query | New `cmd_history(date)` — call `_fetch_tokens` with custom `start_time`/`end_time` |
