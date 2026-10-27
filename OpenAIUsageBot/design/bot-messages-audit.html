@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="claude /design">
+<title>Shadow Ledger Message Audit</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Serif:wght@500;600&display=swap">
+<style>
+/* System — layout: a ranked findings list, then one band per message type with four equal
+   phone panes (Now · A · B · C) side by side; panes stack to 2 then 1 column.
+   Type scale 32 / 20 / 15 / 13 / 12 px. Backgrounds: page paper + chat wallpaper only.
+   Section header pattern: serif name, kind chip, one-line evidence, source line. */
+:root {
+  --paper: #eceff1; --ink: #182026; --muted: #5a6670; --rule: #cfd6db;
+  --wall: #d5dfda; --bubble: #ffffff; --mine: #dcf3d1; --key: #c2cec9; --key-ink: #1f3e5e;
+  --accent: #1d6b66; --warn: #9a5b00; --crit: #a3262a; --pre: #eef2f0;
+  --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+  --sans: "IBM Plex Sans", "Helvetica Neue", Helvetica, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --paper: #121619; --ink: #e3e8ec; --muted: #94a1ab; --rule: #2a3238;
+  --wall: #18211f; --bubble: #222c2a; --mine: #2a4631; --key: #2b3836; --key-ink: #a8c7e8;
+  --accent: #6cc0b8; --warn: #e3a64b; --crit: #ef7b7e; --pre: #1a2321; color-scheme: dark } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); font: 15px/1.5 var(--sans); }
+.page { max-width: 1560px; margin: 0 auto; padding-block: 32px 64px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-direction: column; gap: 40px; }
+h1 { font: 600 32px/1.15 var(--serif); margin: 0; text-wrap: balance; }
+h2 { font: 600 20px/1.3 var(--serif); margin: 0; }
+.lede { max-width: 72ch; margin: 8px 0 0; color: var(--muted); }
+.key4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 20px; }
+.key4 div { border-top: 2px solid var(--ink); padding-top: 8px; font-size: 13px; color: var(--muted); }
+.key4 b { display: block; color: var(--ink); font-size: 15px; }
+.findings { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 40px; margin: 0; padding: 0; list-style: none; counter-reset: f; }
+.findings li { counter-increment: f; display: grid; grid-template-columns: 2.2em 1fr; gap: 4px 8px; padding: 12px 0; border-top: 1px solid var(--rule); min-width: 0; }
+.findings li::before { content: counter(f); font: 600 20px/1.2 var(--serif); color: var(--accent); grid-row: span 3; }
+.findings b { font-weight: 600; }
+.findings .ev { color: var(--muted); font-size: 13px; }
+.findings .fix { font-size: 13px; }
+.findings .fix::before { content: "Fix · "; font-weight: 600; color: var(--accent); }
+.band { display: flex; flex-direction: column; gap: 14px; }
+.band header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px; border-top: 2px solid var(--ink); padding-top: 12px; }
+.chip { font: 600 12px var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); border: 1px solid var(--rule); border-radius: 4px; padding: 1px 6px; }
+.band .why { flex-basis: 100%; margin: 0; }
+.band .src { flex-basis: 100%; margin: 0; font: 12px var(--mono); color: var(--muted); }
+.panes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; align-items: stretch; }
+.pane { display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; background: var(--wall); }
+.pane > .lab { display: flex; justify-content: space-between; gap: 8px; padding: 8px 12px; background: var(--paper); border-bottom: 1px solid var(--rule); font-size: 13px; }
+.pane > .lab b { font-weight: 600; }
+.pane > .lab span { color: var(--muted); font: 12px var(--mono); white-space: nowrap; }
+.chat { padding: 12px 10px 16px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.me { align-self: flex-end; background: var(--mine); border-radius: 12px 12px 3px 12px; padding: 4px 10px; font-size: 14px; }
+.msg { align-self: flex-start; max-width: 100%; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.bubble { position: relative; background: var(--bubble); border-radius: 12px 12px 12px 3px; padding: 7px 10px 18px; font-size: 14.5px; line-height: 1.42;
+  white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; box-shadow: 0 1px 1px rgba(0,0,0,.07); }
+.bubble .meta { position: absolute; right: 8px; bottom: 3px; font-size: 11px; color: var(--muted); white-space: nowrap; }
+.bubble code { font: 13px var(--mono); color: var(--accent); }
+.bubble i { color: var(--muted); }
+.bubble pre { margin: 4px 0; padding: 6px 8px; background: var(--pre); border-radius: 6px; font: 12.5px/1.45 var(--mono); white-space: pre; overflow-x: auto; }
+.bubble blockquote { margin: 4px 0; padding: 4px 8px 4px 10px; border-left: 3px solid var(--accent); background: var(--pre); border-radius: 4px; }
+.bubble blockquote.fold { max-height: 3.1em; overflow: hidden; cursor: pointer; position: relative; }
+.bubble blockquote.fold::after { content: "▾ tap to expand"; position: absolute; right: 6px; bottom: 2px; font-size: 11px; color: var(--accent); background: var(--pre); padding-left: 6px; }
+.bubble blockquote.open { max-height: none; }
+.bubble blockquote.open::after { content: none; }
+.kb { display: grid; gap: 3px; }
+.kb .row { display: flex; gap: 3px; }
+.kb .k { flex: 1 1 0; min-width: 0; background: var(--key); color: var(--key-ink); border-radius: 8px; padding: 6px 4px; text-align: center; font: 600 13px var(--sans); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tags { display: flex; flex-wrap: wrap; gap: 4px; }
+.tag { font: 600 11px var(--sans); letter-spacing: .03em; padding: 1px 6px; border-radius: 3px; background: var(--paper); color: var(--muted); border: 1px solid var(--rule); }
+.tag.rep { color: var(--crit); border-color: currentColor; }
+.tag.edit { color: var(--accent); border-color: currentColor; }
+footer { font-size: 13px; color: var(--muted); max-width: 90ch; }
+footer code { font: 12px var(--mono); }
+.next { border: 2px solid var(--ink); padding: 14px 18px; max-width: 90ch; }
+.next p { margin: 6px 0 0; }
+@media (max-width: 1240px) { .panes, .key4 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) { .panes, .key4, .findings { grid-template-columns: minmax(0, 1fr); } h1 { font-size: 26px; } }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="page">
+  <section>
+    <h1>Shadow Ledger message audit</h1>
+    <p class="lede">What @BachsSlave2Bot sends today, measured against its own intel log (1 Sep – 27 Oct 2026: 424 alerts, 326 commands), and three ways to send the same facts. Every number below is real: today's state, or the logged incident it comes from. Pick a variant per message type, or one for all.</p>
+    <div class="key4">
+      <div><b>Now</b>What the current code sends, rendered from the same data.</div>
+      <div><b>A · Tidy</b>Same structure and voice. One money format, numbers first, shorter sign-off, calm alerts sent silently.</div>
+      <div><b>B · Ledger</b>Numbers in an aligned fixed-width table, like a ledger page. Terse, no persona on alerts.</div>
+      <div><b>C · Gauge + fold</b>One verdict line with meters; details folded into a tap-to-expand quote. Repeats update one message.</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Findings, ranked by how often they reach the chat</h2>
+    <ol class="findings">
+      <li><b>The over-budget alarm repeats on every poll.</b><span class="ev">85 alarms in 16 incidents. On 29 Sep it fired 16 times in 20 minutes for 3–4 requests from duyanh-project, which you had unsealed by hand at 03:39.</span><span class="fix">One alarm per incident, updated in place; a new ping only when another project starts billing, or after 15 minutes. Softer wording for a project you unsealed yourself.</span></li>
+      <li><b>Calm milestones ring every phone.</b><span class="ev">143 milestone pings; 65 are the 10% / 40% / 70% kind that need no action.</span><span class="fix">Send calm milestones and spend notes with Telegram's silent flag; seals, used-up quotas and alarms still ring.</span></li>
+      <li><b>Seals and restores arrive as begin + done pairs.</b><span class="ev">87 begin/done messages ("begin sealing…", "Done sealing", "Begin unsealing…", "Done unsealing").</span><span class="fix">Post one message and edit it from "sealing…" to "sealed".</span></li>
+      <li><b>Bursts carry stale and duplicate alerts.</b><span class="ev">4 Oct, 08:32–08:35: six messages in three minutes. The 9.00M warning came after the seal; the $0.10 org alert and khonlanh-project's $0.25 alert described the same $0.26.</span><span class="fix">Skip milestones below the seal point once the group is sealed; report org and project spend in one line.</span></li>
+      <li><b>Typos get "Unknown command".</b><span class="ev">6 of 326 commands failed: peojects, archieve, archives, refersh, unseal and a pasted bot link.</span><span class="fix">Answer the nearest command ("did you mean /usage?"); let seal / unseal open the archive.</span></li>
+      <li><b>Numbers are written several ways.</b><span class="ev">/refresh shows "Cost: 0.00$" on the group lines and "Spend today: $0.0000" below them; /usage puts four-decimal dollars on every project; the used-up alert says "10.00M-token".</span><span class="fix">One money format everywhere (x.xx$, four decimals only under one cent); quotas written 10M / 250K.</span></li>
+      <li><b>Headers and sign-offs take a fifth of short replies.</b><span class="ev">/refresh opens with "Data refreshed." and ends with two italic lines.</span><span class="fix">A: one short line. B: a signature. C: none on routine replies.</span></li>
+      <li><b>Snapshot dates widen model lines.</b><span class="ev">gpt-4.1-mini-2025-04-14 wraps on a phone.</span><span class="fix">Show the base name; keep the full name in folded detail.</span></li>
+      <li><b>One org's error blanks the whole reply.</b><span class="ev">Reports render both orgs together with no per-org guard (<code>_per_org</code>), so an exception in one loses both.</span><span class="fix">Render the failing org as an error line and still show the other.</span></li>
+    </ol>
+  </section>
+
+  <main id="bands" class="page" style="padding:0;gap:48px"></main>
+
+  <section class="next">
+    <h2>Your pick</h2>
+    <p>Reply with a variant per message type (for example "A for commands, C for alerts") or one for everything, and which fixes 1–9 to build. Fixes 1–5 and 9 change behaviour; 6–8 only change wording and layout.</p>
+  </section>
+
+  <footer>
+    <p>Sources. Today's numbers: <code>bot_data/usage_state.json</code> and <code>usage_state_lab3.json</code>, copied 2026-10-27 05:32 UTC. Incidents, counts and command usage: <code>bot_data/logs/events-2026-09.jsonl</code> and <code>events-2026-10.jsonl</code>. "Now" columns are rendered by the bot's current code. Telegram facts (silent messages, fixed-width blocks, expandable quotes, editing in place): <code>product-facts.md</code>, from core.telegram.org/bots/api.</p>
+    <p>Approximation. Telegram's own fonts, bubble width and spacing differ slightly by device; fixed-width lines are kept within 30 characters so they should fit a phone, but that was not checked on one.</p>
+  </footer>
+</div>
+<script>
+const DATA = {"generated": "2026-10-27", "surfaces": [{"id": "refresh", "name": "/refresh", "kind": "Command reply", "why": "The most-used command: 87 typed + 66 button taps since 1 Sep.", "source": "today's state, bot_data/usage_state*.json copied 2026-10-27 05:32 UTC", "current": [{"text": "🔄 <b>Data refreshed.<\/b>\n\n🏢 <b>Business AI Lab 2<\/b>\nTokens today: <b>169.9k<\/b>\n   ⭐ 1M group: <b>0<\/b> / 1M. Cost: 0.00$\n   📦 10M group: <b>169.9k<\/b> / 10M. Cost: 0.00$\n   🧪 Exotic: <b>0.00$<\/b>\nSpend today:  <b>$0.0000<\/b>\n⚡ Active (last 5 min): none\n\n🏢 <b>Business AI Lab 3<\/b>\nTokens today: <b>0<\/b>\n   ⭐ 1M group: <b>0<\/b> / 250K. Cost: 0.00$\n   📦 10M group: <b>0<\/b> / 2.5M. Cost: 0.00$\n   🧪 Exotic: <b>0.00$<\/b>\nSpend today:  <b>$0.0000<\/b>\n⚡ Active (last 5 min): none\n\n<i>A full check is running now — any alert or seal follows in chat.<\/i>\n<i>Intelligence updated, Monarch Bach.<\/i>", "kb": [[{"text": "🔄 Refresh", "callback_data": "cmd:refresh"}, {"text": "📊 Usage", "callback_data": "cmd:usage"}], [{"text": "💰 Spending", "callback_data": "cmd:spending"}, {"text": "🗃️ Archive", "callback_data": "cmd:archive"}]], "tags": [], "edited": 0, "mine": "/refresh", "at": null}], "A": [{"text": "🔄 <b>Status<\/b> · 27 Oct, 05:32 UTC\n\n🏢 <b>Lab 2<\/b>\n⭐ 1M group: <b>0<\/b> / 1M\n📦 10M group: <b>169.9k<\/b> / 10M (2%)\n💵 Spend <b>0.00$<\/b> · exotic 0.00$\n⚡ Active now: none\n\n🏢 <b>Lab 3<\/b> · Build tier\n⭐ 1M group: <b>0<\/b> / 250K\n📦 10M group: <b>0<\/b> / 2.5M\n💵 Spend <b>0.00$<\/b> · exotic 0.00$\n⚡ Active now: none\n\n<i>Full check running. The ledger is current, Monarch Bach.<\/i>", "kb": [[{"text": "🔄 Refresh", "callback_data": "cmd:refresh"}, {"text": "📊 Usage", "callback_data": "cmd:usage"}], [{"text": "💰 Spending", "callback_data": "cmd:spending"}, {"text": "🗃️ Archive", "callback_data": "cmd:archive"}]], "tags": [], "edited": 0, "mine": "/refresh", "at": null}], "B": [{"text": "🔄 <b>Ledger<\/b> · 05:32 UTC\n<pre>            used   free     $\nLAB 2\n1M grp         0     1M  0.00\n10M grp   169.9k  9.83M  0.00\nexotic                   0.00\nLAB 3 · Build\n1M grp         0   250K  0.00\n10M grp        0   2.5M  0.00\nexotic                   0.00<\/pre>\n⚡ No one active · 🔒 nothing sealed\n<i>— Shadow Ledger<\/i>", "kb": [[{"text": "🔄 Refresh", "callback_data": "cmd:refresh"}, {"text": "📊 Usage", "callback_data": "cmd:usage"}], [{"text": "💰 Spending", "callback_data": "cmd:spending"}, {"text": "🗃️ Archive", "callback_data": "cmd:archive"}]], "tags": [], "edited": 0, "mine": "/refresh", "at": null}], "C": [{"text": "✅ <b>All quiet<\/b> · 05:32 UTC\n<b>Lab 2<\/b>  10M ▱▱▱▱▱ 2% · 1M ▱▱▱▱▱ 0%\n<b>Lab 3<\/b>  10M ▱▱▱▱▱ 0% · 1M ▱▱▱▱▱ 0%\n💵 0.00$ today · ⚡ no one active\n<blockquote expandable><b>Lab 2<\/b> — 10M group 169.9k / 10M · 1M group 0 / 1M · exotic 0.00$\nSeals at 9.50M / 800.0k\n<b>Lab 3<\/b> (Build) — 10M group 0 / 2.5M · 1M group 0 / 250K · exotic 0.00$\nPaid use allowed up to the seal points 9.50M / 800.0k\nA full check is running now.<\/blockquote>", "kb": [[{"text": "🔄 Refresh", "callback_data": "cmd:refresh"}, {"text": "📊 Usage", "callback_data": "cmd:usage"}], [{"text": "💰 Spending", "callback_data": "cmd:spending"}, {"text": "🗃️ Archive", "callback_data": "cmd:archive"}]], "tags": [], "edited": 0, "mine": "/refresh", "at": null}]}, {"id": "usage", "name": "/usage", "kind": "Command reply", "why": "Second most-wanted view: 58 'projects' + 9 'usage' requests since 1 Sep (projects now opens usage).", "source": "today's state, bot_data/usage_state*.json copied 2026-10-27 05:32 UTC", "current": [{"text": "🏢 <b>Business AI Lab 2<\/b>\n📊 <b>Usage — 2026-10-27<\/b>\n\n🔹 <b>oduong-project<\/b>  146.7k  ·  83 reqs  ·  $0.0000\n   <code>gpt-4.1-mini-2025-04-14<\/code>  145.1k in / 1.6k out  (83 reqs)\n\n🔹 <b>khonlanh-project<\/b>  23.2k  ·  8 reqs  ·  $0.0000\n   <code>gpt-5-mini-2025-08-07<\/code>  12.2k in / 10.9k out  (8 reqs)\n\n<b>By model<\/b>\n   <code>gpt-4.1-mini-2025-04-14<\/code>  146.7k  (86%)\n   <code>gpt-5-mini-2025-08-07<\/code>  23.2k  (13%)\n\n━━━━━━━━━━━━━━━━━━━━\n🔢 Total: <b>169.9k<\/b>  •  91 requests  •  💰 <b>$0.0000<\/b>\n   ⭐ 1M group: <b>0<\/b> / 1M. Cost: 0.00$\n   📦 10M group: <b>169.9k<\/b> / 10M. Cost: 0.00$\n   🧪 Exotic: <b>0.00$<\/b>\n\n🏢 <b>Business AI Lab 3<\/b>\nNo usage today, Monarch Bach.", "kb": [], "tags": [], "edited": 0, "mine": "/usage", "at": null}], "A": [{"text": "📊 <b>Usage<\/b> · 27 Oct\n\n🏢 <b>Lab 2<\/b>\n<b>oduong-project<\/b> · 146.7k · 83 reqs · 0.00$\n   <code>gpt-4.1-mini<\/code> 145.1k in / 1.6k out\n<b>khonlanh-project<\/b> · 23.2k · 8 reqs · 0.00$\n   <code>gpt-5-mini<\/code> 12.2k in / 10.9k out\nTotal 169.9k · 10M group 2% · spend 0.00$\n\n🏢 <b>Lab 3<\/b>\nNo usage today.\n\n<i>All accounted for, Monarch Bach.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": "/usage", "at": null}], "B": [{"text": "📊 <b>Usage<\/b> · 27 Oct\n<pre>LAB 2       tokens reqs    $\noduong-proj 146.7k   83 0.00\nkhonlanh-pr  23.2k    8 0.00\ntotal       169.9k   91 0.00\nLAB 3       no usage<\/pre>\nModels: <code>gpt-4.1-mini<\/code> 146.7k · <code>gpt-5-mini<\/code> 23.2k\n<i>— Shadow Ledger<\/i>", "kb": [], "tags": [], "edited": 0, "mine": "/usage", "at": null}], "C": [{"text": "📊 <b>Lab 2<\/b> · 2 projects · 169.9k · 0.00$\n▰▰▰▰▰▰▰▱ oduong-project 86%\n▰▱▱▱▱▱▱▱ khonlanh-project 13%\n<b>Lab 3<\/b> · no usage today\n<blockquote expandable><b>oduong-project<\/b> — <code>gpt-4.1-mini<\/code> 145.1k in / 1.6k out (83 reqs)\n<b>khonlanh-project<\/b> — <code>gpt-5-mini<\/code> 12.2k in / 10.9k out (8 reqs)\n10M group 169.9k / 10M · 1M group 0 / 1M · exotic 0.00$<\/blockquote>", "kb": [], "tags": [], "edited": 0, "mine": "/usage", "at": null}]}, {"id": "milestone", "name": "Token milestone", "kind": "Alert", "why": "The most frequent alert class: 143 milestone pings since 1 Sep; 65 of them the calm 10%/40%/70% kind.", "source": "poll event 2026-10-26 08:09:08 (normal 7,084,659), events-2026-10.jsonl", "current": [{"text": "🏢 <b>Business AI Lab 2<\/b>\n📊 <b>10M group — 7.00M tokens reached<\/b>\n\nToday's 10M-group usage stands at <b>7.08M tokens<\/b>.\nOperations remain within acceptable parameters.\n<i>Monitoring continues, Monarch Bach.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:09"}], "A": [{"text": "📊 <b>Lab 2 · 10M group at 7.08M<\/b> (71%)\nSeals at 9.50M. <i>Monitoring continues, Monarch Bach.<\/i>", "kb": [], "tags": ["silent"], "edited": 0, "mine": null, "at": "08:09"}], "B": [{"text": "📊 <b>Lab 2 · 10M group<\/b>\n<pre>used  7.08M ▰▰▰▰▰▰▰▱▱▱\nseal  9.50M  free 10M<\/pre>", "kb": [], "tags": ["silent"], "edited": 0, "mine": null, "at": "08:09"}], "C": [{"text": "📊 Lab 2 · 10M ▰▰▰▰▰▰▰▱▱▱ 71% · seals at 9.50M", "kb": [], "tags": ["silent"], "edited": 0, "mine": null, "at": "08:09"}]}, {"id": "seal", "name": "Seal day", "kind": "Alert burst", "why": "One Lab 2 seal on 2026-10-04 produced 6 messages in 3 minutes; the 9.00M warning arrived after the seal.", "source": "broadcasts + mass_seal + poll events 2026-10-04 08:32–08:35 UTC, events-2026-10.jsonl", "current": [{"text": "🏢 <b>Business AI Lab 2<\/b>\n🛑 <b>10M group hit 96% — begin sealing all projects…<\/b>\n<i>Throttling 10M group rate limits to 0. Stand by, Monarch Bach.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:32"}, {"text": "🏢 <b>Business AI Lab 2<\/b>\n🔒 <b>Done sealing 10M group.<\/b> 14 project(s) throttled.\n<i>Auto-restore at UTC midnight. Exempt one: /archive → Unseal → Lab 2 → 10M group → project.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:34"}, {"text": "🏢 <b>Business AI Lab 2<\/b>\n⚠️ <b>10M group — High Usage — 9.00M<\/b>\n\nToday's 10M-group usage has reached <b>9.56M tokens<\/b>.\nThe daily free tokens are running out.\nYour attention is advised, My Liege Bach.", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:34"}, {"text": "🏢 <b>Business AI Lab 2<\/b>\n💰 <b>Spend Milestone — $0.10<\/b>\n\nCumulative outlay today: <b>$0.2593<\/b> of $2.00.\n<i>The treasury is monitored, Monarch Bach.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:34"}, {"text": "🏢 <b>Business AI Lab 2<\/b>\n💸 <b>Project Spend — khonlanh-project<\/b>\n\n<b>khonlanh-project<\/b> has crossed <b>$0.25<\/b> today (now $0.2593).\n<i>Single-project anomaly threshold tripped. The wallet is watched, Monarch Bach.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:34"}, {"text": "🏢 <b>Business AI Lab 2<\/b>\n🚨 <b>10M group — Free Tokens Used Up — 10.20M<\/b>\n\nThe 10.00M-token daily free quota of the 10M group is spent.\n10M-group models (gpt-5-mini, gpt-4.1-mini, gpt-4o-mini, o4-mini, …) now bill at standard rates.\n\nMonarch Bach, the operation requires your oversight.", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:35"}], "A": [{"text": "🔒 <b>Lab 2 · 10M group sealed<\/b> at 9.56M\n14 projects throttled · 0 failed · 90 s\nAuto-restore 00:00 UTC. Exempt one: /archive", "kb": [], "tags": [], "edited": 1, "mine": null, "at": "08:34"}, {"text": "💵 <b>Lab 2 spend 0.26$<\/b> · khonlanh-project 0.26$ (past 0.25$)\n<i>The wallet is watched.<\/i>", "kb": [], "tags": ["silent"], "edited": 0, "mine": null, "at": "08:34"}, {"text": "🚨 <b>Lab 2 · 10M free tokens used up<\/b> at 10.20M\nAll 10M-group models now bill at standard rates.\n<i>Your oversight is required, Monarch Bach.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "08:35"}], "B": [{"text": "🔒 <b>Lab 2 · 10M group sealed<\/b>\n<pre>used   10.20M  free 10M\nsealed     14  failed 0\nspend    0.26$ khonlanh<\/pre>\nRestores 00:00 UTC · exempt: /archive", "kb": [], "tags": [], "edited": 3, "mine": null, "at": "08:35"}], "C": [{"text": "🔒 <b>Lab 2 sealed<\/b> · 10M ▰▰▰▰▰▰▰▰▰▰+ 102% · 08:35 UTC\n14 projects throttled, 0 failed · paid so far 0.26$\n<blockquote expandable>08:32 seal started at 9.56M (seal point 9.50M)\n08:34 all 14 projects throttled\n08:34 spend 0.26$, all from khonlanh-project\n08:35 the 10M free tokens are used up (10.20M)\nAuto-restore at 00:00 UTC. Exempt one: /archive → Unseal → Lab 2 → 10M group<\/blockquote>", "kb": [], "tags": [], "edited": 3, "mine": null, "at": "08:35"}]}, {"id": "overcap", "name": "Over-budget alarm", "kind": "Alert repeat", "why": "85 alarms in 16 incidents since 1 Sep. On 2026-09-29 it fired 16 times in 20 min for 3–4 requests from a project you had unsealed by hand.", "source": "broadcasts 2026-09-29 17:30–17:50 UTC + manual_unseal 03:39:46, events-2026-09.jsonl", "current": [{"text": "🏢 <b>Business AI Lab 2<\/b>\n🔴 <b>‼️ BUDGET BREACHED — ILLEGAL ACTIVITY DETECTED ‼️<\/b>\n\nThe <b>10M group daily free quota<\/b> is <b>exhausted<\/b>.\nThese projects are <b>still burning the exhausted band<\/b> — every request now bills:\n\n🚨 <b>duyanh-project<\/b>  —  3 10M-group reqs in the last 20 min\n\n<b>HALT ALL NON-ESSENTIAL OPERATIONS IMMEDIATELY.<\/b>\n<i>(Activity window: last 20 min — accounts for API ingestion lag)<\/i>\n<i>Monarch Bach — the treasury is bleeding. Your command is required at once.<\/i>", "kb": [], "tags": ["repeated ×16 in 20 min"], "edited": 0, "mine": null, "at": "17:30"}], "A": [{"text": "🔴 <b>Lab 2 · billing past the 10M free tokens<\/b>\n<b>duyanh-project<\/b> — 3 requests in 20 min (unsealed by hand at 03:39)\nSeal it again: /archive → Seal → Lab 2 → 10M group\n<i>Next reminder in 15 min if it continues.<\/i>", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "17:30"}, {"text": "🔴 <b>Still billing<\/b> · duyanh-project — 4 requests in 20 min", "kb": [], "tags": [], "edited": 0, "mine": null, "at": "17:45"}], "B": [{"text": "🔴 <b>Lab 2 · billing past 10M<\/b>\n<pre>duyanh-project  4 reqs/20 min\nsince 17:30 · checked 17:50<\/pre>\nUnsealed by hand at 03:39 · re-seal: /archive", "kb": [], "tags": [], "edited": 15, "mine": null, "at": "17:50"}], "C": [{"text": "🟠 <b>Paid use<\/b> · Lab 2 · duyanh-project, 4 requests in 20 min\nUnsealed by hand at 03:39 — billing at standard rates.\n<blockquote expandable>Watching since 17:30, checked 17:50 (16 polls).\nThis message updates in place; a new alert comes only if another project starts billing.\nRe-seal: /archive → Seal → Lab 2 → 10M group → duyanh-project<\/blockquote>", "kb": [], "tags": [], "edited": 15, "mine": null, "at": "17:50"}]}]};
+const COLS = [["current", "Now"], ["A", "A · Tidy"], ["B", "B · Ledger"], ["C", "C · Gauge + fold"]];
+const OK = new Set(["b", "i", "u", "s", "code", "pre", "blockquote"]);
+function tg(src) {   // Telegram HTML subset; anything else is shown as text
+  return src.replace(/<(\/?)([a-zA-Z]+)([^>]*)>/g, (m, sl, tag, rest) => {
+    tag = tag.toLowerCase();
+    if (!OK.has(tag)) return m.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    if (tag === "blockquote" && !sl && /expandable/.test(rest)) return '<blockquote class="fold" tabindex="0" role="button" aria-expanded="false">';
+    return `<${sl}${tag}>`;
+  });
+}
+function el(t, c, txt) { const e = document.createElement(t); if (c) e.className = c; if (txt != null) e.textContent = txt; return e; }
+function pane(list, label) {
+  const p = el("div", "pane");
+  const lab = el("div", "lab");
+  const b = el("b", null, label); lab.append(b);
+  const n = list.length, chars = list.reduce((a, m) => a + m.text.replace(/<[^>]+>/g, "").length, 0);
+  lab.append(el("span", null, `${n} msg · ${chars} chars`));
+  p.append(lab);
+  const chat = el("div", "chat");
+  list.forEach(m => {
+    if (m.mine) chat.append(el("div", "me", m.mine));
+    const box = el("div", "msg");
+    const bub = el("div", "bubble"); bub.innerHTML = tg(m.text);
+    const meta = el("span", "meta", (m.at || "05:32") + (m.edited ? " · edited" : "")); bub.append(meta);
+    box.append(bub);
+    if (m.kb && m.kb.length) { const kb = el("div", "kb");
+      m.kb.forEach(r => { const row = el("div", "row"); r.forEach(k => row.append(el("div", "k", k.text))); kb.append(row); });
+      box.append(kb); }
+    const tags = el("div", "tags");
+    (m.tags || []).forEach(t => tags.append(el("span", "tag" + (t.startsWith("repeated") ? " rep" : ""), t === "silent" ? "🔕 sent silently" : t)));
+    if (m.edited) tags.append(el("span", "tag edit", `one message, updated ${m.edited}×`));
+    if (tags.children.length) box.append(tags);
+    chat.append(box);
+  });
+  p.append(chat);
+  return p;
+}
+const bands = document.getElementById("bands");
+DATA.surfaces.forEach(s => {
+  const sec = el("section", "band");
+  const h = el("header");
+  h.append(el("h2", null, s.name), el("span", "chip", s.kind), el("p", "why", s.why), el("p", "src", "source: " + s.source));
+  sec.append(h);
+  const panes = el("div", "panes");
+  COLS.forEach(([k, label]) => panes.append(pane(s[k], label)));
+  sec.append(panes);
+  bands.append(sec);
+});
+document.addEventListener("click", e => { const q = e.target.closest("blockquote.fold");
+  if (q) { q.classList.toggle("open"); q.setAttribute("aria-expanded", q.classList.contains("open")); } });
+document.addEventListener("keydown", e => { const q = e.target.closest && e.target.closest("blockquote.fold");
+  if (q && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); q.click(); } });
+</script>
+</body>
+</html>

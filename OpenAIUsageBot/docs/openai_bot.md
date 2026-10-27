@@ -49,7 +49,7 @@ for all). Main thread sleeps until `KeyboardInterrupt`.
 | | Business AI Lab 2 (`lab2`) | Business AI Lab 3 (`lab3`) |
 |---|---|---|
 | Admin key (`.env`) | `OPENAI_ADMIN_KEY` | `OPENAI_ADMIN_KEY_LAB3` |
-| Usage tier | 3+ | 1-2 (new org, created 2026-09-29) |
+| Tier (OpenAI's names) | Launch / Grow | Build (new org, created 2026-09-29) |
 | Normal: free allowance / ceiling / seal point | 10M / 10M / 9.5M | 2.5M / **10M / 9.5M** |
 | Premium: free allowance / ceiling / seal point | 1M / 1M / 800k | 250K / **1M / 800k** |
 | Milestone ladders (on the free allowance) | 1M 4M 7M 8M 9M 10M · 200k 500k 800k 1M | same fractions: 250k … 2.5M · 50k 125k 200k 250k |
@@ -254,10 +254,17 @@ Platform → Organization → API Keys → Create Admin Key
 
 **Source of truth** — re-check whenever OpenAI updates the offer:
 <https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai>
-(section *"What models are included in this offer?"*). **Last synced: 2026-09-22** — reverified, no models added/removed/moved between groups since 2026-08-21.
+(section *"What models are included in this offer?"*). **Last synced: 2026-10-27** — four models joined the 1M group (`gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`); the 10M group is unchanged. The article blocks scripted fetches (Cloudflare 403), so sync from a paste of the section or a real browser.
+
+**Names.** OpenAI calls the groups the **1M token group** and the **10M token group**
+(sized for the Launch and Grow tiers; Build gets 250K / 2.5M). Everything the bot shows
+uses those names (`GROUP_NAMES`, `_group()`, `_band_label()` → "1M group", or
+"1M group (250K)" on a Build org). In code, state files, intel-log events and button
+data the groups keep their original track ids: `"premium"` = 1M group, `"normal"` =
+10M group.
 
 `_track_for_model(model)` is the single source of truth in code: it returns
-`"normal"`, `"premium"`, or `None` (unlisted). A model matches a listed name only
+`"normal"` (10M group), `"premium"` (1M group), or `None` (not in the offer). A model matches a listed name only
 if it is (a) the **exact name**, or (b) the name plus a **`-YYYY-MM-DD` snapshot
 suffix** — `_is_listed_variant`.
 
@@ -266,21 +273,24 @@ OpenAI publishes **dated snapshots** (`gpt-5.4-2026-03-05`); the tuples store th
 same-prefix paid products stay unlisted. Bare aliases resolve too, because the
 usage API sometimes reports `gpt-4o` rather than `gpt-4o-2024-08-06`.
 
-| Group | Cap (tier 3+) | Cap (tiers 1-2) | Models |
+| Group | Launch / Grow | Build | Models |
 |---|---|---|---|
-| **Premium** | 1M/day | 250K/day | `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.4`, `gpt-5.2`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5-codex`, `gpt-5`, `gpt-5-chat-latest`, `gpt-4.5-preview`¹, `gpt-4.1`, `gpt-4o`, `o3`, `o1-preview`, `o1` |
-| **Normal** | 10M/day | 2.5M/day | `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.1-codex-mini`, `gpt-5-mini`, `gpt-5-nano`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o-mini`, `o4-mini`, `o1-mini`, `codex-mini-latest` |
+| **1M group** (`premium`) | 1M/day | 250K/day | `gpt-6.1-sol`, `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`², `gpt-5.6-sol`, `gpt-5.5`, `gpt-5.4`, `gpt-5.2`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5-codex`, `gpt-5`, `gpt-5-chat-latest`, `gpt-4.5-preview`¹, `gpt-4.1`, `gpt-4o`, `o3`, `o1-preview`, `o1` |
+| **10M group** (`normal`) | 10M/day | 2.5M/day | `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.1-codex-mini`, `gpt-5-mini`, `gpt-5-nano`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o-mini`, `o4-mini`, `o1-mini`, `codex-mini-latest` |
 
 ¹ deprecated and shut down 2025-07-14; kept for completeness.
+² `gpt-6-luna` is in the **1M** group, while `gpt-5.6-luna` is in the 10M group.
+`o3-mini` (shown in a Lab 3 platform banner on 2026-09-29) is still not on the page,
+so it stays off-list.
 
 Quota is **shared across each group**. OpenAI excludes from the offer regardless
 of model name: **fine-tuned models, fine-tuning training, evals, and tool use** —
 so `ft:*` classifies as unlisted (and therefore triggers quarantine).
 
-> **Tier caveat**: allowances depend on the org's usage tier — 10M / 1M on tier 3+,
-> 2.5M / 250K on tiers 1-2. They are set per org in `ORG_SPECS` (Lab 2 is tier 3+,
-> Lab 3 is tier 1-2). If an org changes tier, update its caps there, or the bot will
-> seal it at the wrong point (4× too late on a tier-1-2 org set to 10M / 1M).
+> **Tier caveat**: free tokens depend on the org's tier — 10M / 1M on Launch and Grow,
+> 2.5M / 250K on Build. They are set per org in `ORG_SPECS` (`free`; Lab 2 is
+> Launch/Grow, Lab 3 is Build). When Lab 3 moves up, set its `free` to 10M / 1M — its
+> `ceiling` already is.
 
 **Any other suffix means a different paid product and classifies as `None`**:
 `o1-pro` ($150/$600 per 1M), `gpt-5.5-pro`, `gpt-5.4-pro`, `o3-pro`,
@@ -339,10 +349,15 @@ seal was followed ~1 min later by a false "ILLEGAL ACTIVITY — HALT ALL OPERATI
 naming projects that had just been sealed (09-26, 09-28, 09-29). After the window,
 activity from a sealed project is a real leak and does alert.
 **Poll interval:** Same 3→10 min progression as urgent mode (capped at passive).
-**Behaviour:** On every poll, fetches banded recent activity, filters to projects with
-usage on the exceeded band(s), and broadcasts an urgent red-tone alert listing each
-project with its per-band request counts. No cooldown — broadcasts fire every poll
-while illegal activity is detected.
+**Behaviour:** On every poll, fetches banded recent activity and filters to projects
+with usage on the exceeded group(s). The first such poll sends the alarm; later polls
+**edit that message** (tally, "checked" time, poll count). A new, ringing alarm goes
+out only when another project starts billing or every `OVERCAP_REPING_SECS` (15 min)
+while it continues; a poll with no such activity (20 min without requests) ends the
+incident. Until 2026-10-27 it broadcast on every poll: 85 alarms in 16 incidents
+(Sep–Oct), 16 in 20 min on 2026-09-29 for 3–4 requests. A project unsealed by hand
+today gets a calm orange "Paid use" note; anything else is the red alarm with the
+re-seal path.
 **Revert condition:** 1 hour passes since the last poll that found active illegal-band activity.
 
 ### Mode Transition Summary
@@ -373,6 +388,33 @@ nothing left to drift.
 
 ## 7. Notification System
 
+### 7.0 How messages are sent (since 2026-10-27)
+
+Chosen from the message audit (`OpenAIUsageBot/design/bot-messages-audit.html`,
+built from the intel log: 424 alerts and 326 commands in Sep–Oct 2026). Command
+replies use layout **A** (same structure and voice, tidied); alerts use layout **C**
+(a verdict line with a gauge, details folded, repeats updated in place).
+
+- **Alerts name the org inline** ("Lab 2 · …", `_org_tag`) instead of a header line
+  (`_broadcast(…, header=False)`); older alert types keep the 🏢 header.
+- **Calm steps are silent** (`_broadcast(…, silent=True)` → Telegram's
+  `disable_notification`): 10/40/70% token steps (20/50% on the 1M group), spend
+  steps below the urgent level, and the off-list-model note when a quarantine
+  follows. Urgent steps, used-up quotas, seals, quarantines and alarms ring.
+- **One message per event, edited in place** (`_broadcast` returns `{chat: message
+  id}`, `_broadcast_edit` rewrites it): a seal goes "sealing…" → "sealed" (gauge,
+  count, seconds, details folded); a restore "restoring…" → "restored"; the
+  over-budget alarm keeps one message per incident (§6). A chat whose message can't
+  be edited gets the text as a new silent message.
+- **One message per poll**: several milestone steps crossed at once send only the
+  highest; org and project spend crossings share one message (`fmt_spend_update`).
+- **No stale steps**: once a group is mass-sealed, steps below the seal point are
+  recorded but not sent (on 2026-10-04 a 9.00M warning arrived after the seal had
+  reported 9.56M). The used-up alert still goes out.
+- **Folded details** use `<blockquote expandable>`; gauges are `_meter()` (10 blocks,
+  rounded down, `+` past full). Times in alerts are UTC (`_fmt_utc`). Money is always
+  `_fmt_cost` (x.xx$, four decimals only under one cent).
+
 ### 7.1 Startup Milestone Seeding
 On the **first poll of each UTC day** (including after a bot restart), `seed_milestones()` runs.
 It fires **exactly one notification per track** — the highest threshold already crossed — so the
@@ -391,7 +433,7 @@ thread runs `/refresh` before the usage poll thread's first iteration: whichever
 first does the seed; the second is a no-op. The flag is reset by day rollover (handled
 inside `UsageStore.update()` and on stale-date load in `UsageStore.__init__`).
 
-### 7.2 Normal-Band Token Milestones (10M/day free on Lab 2 · 2.5M on Lab 3)
+### 7.2 10M-Group Token Milestones (10M/day free on Lab 2 · 2.5M on Lab 3)
 Applies to OpenAI's listed normal-band models:
 `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.1-codex-mini`, `gpt-5-mini`, `gpt-5-nano`,
 `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o-mini`, `o1-mini`, `o3-mini`, `o4-mini`,
@@ -408,7 +450,7 @@ Each threshold fires **once per UTC day**. Crossing the cap milestone arms the
 overcap detector — subsequent polls broadcast aggressive alerts as long as
 projects keep burning normal-band tokens.
 
-### 7.3 Premium-Band Token Milestones (1M/day free on Lab 2 · 250K on Lab 3)
+### 7.3 1M-Group Token Milestones (1M/day free on Lab 2 · 250K on Lab 3)
 Applies to OpenAI's listed premium-band models:
 `gpt-5.4`, `gpt-5.2`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5`, `gpt-5-codex`,
 `gpt-5-chat-latest`, `gpt-4.1`, `gpt-4o`, `o1`, `o3`.
@@ -823,8 +865,8 @@ org, the id must belong to it, and the operation claims **that org's** busy flag
   baseline and marks it exempt for the rest of the UTC day (the auto-sweep skips it).
 - A manual **seal** clears any exemption and throttles the project's track rows to 0.
 - **Exempt projects still get the overcap alarm** — if an unsealed project keeps
-  burning post-cap tokens, `_handle_overcap` keeps broadcasting the red-tone alert.
-  The user is responsible for the bill.
+  billing past the group's limit, `_handle_overcap` reports it, as the calm orange
+  "Paid use" note (one message per incident, §6). The user is responsible for the bill.
 
 #### Uniform restore (canonical baseline)
 
@@ -857,8 +899,9 @@ drain the queue to the canonical baseline:
   row's track, or quarantined), yesterday's capture for that row is held back:
   restoring it would silently reopen a row today's seal zeroed (and never captured,
   since it was already at 0). Held rows go out after today's seal lifts.
-- **Quiet retries** — begin/done broadcasts go out on the day's first pass, and
-  afterwards only when a retry actually restores something.
+- **Quiet retries** — the day's first pass posts one "new day — restoring
+  yesterday's seals" message and edits it to "restored"; afterwards a message goes
+  out only when a retry actually restores something.
 
 **Midnight-straddling polls.** `fetch_today_usage()` takes the date label from the
 **same instant** as the query window. The old code computed the window when the fetch
@@ -940,10 +983,10 @@ working.
 
 | Command | Description | Old names |
 |---|---|---|
-| `refresh` | Fresh numbers for every org (tokens per lane, spend), a "Guard:" line (seals, quarantines, pending restores), the projects active in the last 5 min, and an immediate full poll cycle in each org. Carries the menu buttons. | `active`, `status` |
-| `usage` | Today per project, busiest first: tokens, requests, spend and per-model lines (🧪 = off-watchlist model), a by-model total, the lane lines. | `tokens`, `projects`, `rank`, `models` |
-| `spending` | Live money view: this month and last month per project, plus the last 31 days' tokens and requests. | `recent`, `bill` |
-| `archive` | Show, seal, unseal projects via interactive buttons (see §7.7). | — |
+| `refresh` | "Status · date, time UTC", then per org (🏢 Lab 2, 🏢 Lab 3 · Build tier): the three lane lines (group used / quota (%) · cost, exotic), spend today, a 🛡 Guard line (seals, quarantines, pending restores) when there are any, and who is active now. Runs a full poll cycle in each org. Carries the menu buttons. | `active`, `status` |
+| `usage` | "Usage · date", then per org: every project busiest first (tokens · requests · spend), a line per model (base name, 🧪 = off-list), the total and the lane lines. | `tokens`, `projects`, `rank`, `models` |
+| `spending` | Live money view per org: this month so far and last month (total, then per project), and the last 31 days' tokens and requests. | `recent`, `bill` |
+| `archive` | Show, seal, unseal projects via interactive buttons (see §7.7). | `seal`, `unseal`, `archives` |
 | `help` | The registry plus the menu buttons (`@BachsSlave2Bot` alone shows it too). | `start`, `menu` |
 | `arise` | Subscribe this chat to all alerts (allowlisted chats only). Plays the Beru GIF on first subscribe. | — |
 | `dismiss` | Unsubscribe this chat (primary chat cannot be dismissed). | — |
@@ -952,48 +995,64 @@ working.
 Menu buttons send `cmd:<name>` callbacks; the reply is posted as a new message in the
 same chat/topic. Only subscribed chats, and only the four menu commands, are accepted.
 
+**Typos** (6 of 326 commands in Sep–Oct 2026: peojects, archieve, refersh, …): a
+near-miss of a read-only command (refresh, usage, spending, archive, help) runs it,
+prefixed "Read “peojects” as /usage." (`_guess`, difflib, cutoff 0.75); a bare
+`/typo` is accepted the same way. A near-miss of arise, dismiss or setname only gets
+"did you mean /arise?". Each org's section of a reply is rendered on its own: one
+that raises becomes "⚠️ This section failed" and the other org still shows.
+
 ---
 
 ## 9. Known Projects
 
-**Business AI Lab 2** (seed `SEED_PROJECTS["lab2"]`)
+**Business AI Lab 2** (seed `SEED_PROJECTS["lab2"]`, active as of 2026-10-27)
 
 | Name | Project ID |
 |---|---|
 | Default project | `proj_Gkm7qFbBFgmW11VFtO13Uw3F` |
 | cngvng-project | `proj_9su0tGI8NsaLE7LHqikCw8VE` |
-| hoangha-project | `proj_4VPu8UTHzBpZiHFQVaYG923d` |
 | namvuong-project | `proj_fvkY21dJ0ripiOIA2jCC86f3` |
 | khonlanh-project | `proj_fEboQnaVm4tQCk8kFy0h8s08` |
 | phongnguyen-project | `proj_zRWDq4YWIDEkxbgMAjX0xy79` |
 | ngjabach-project | `proj_J4rNEXilII2l889OotmE7YNW` |
 | oduong-project | `proj_OWrxxJaWk5MXHBi3HIdPxBDh` |
-| duyanh-project | `proj_C51oeo4LjmiQefinVfoI8Rs0` |
-| minhphung-project | `proj_cEHeqXeLfsJ6jrQhOXDlt9wH` |
-| kong-project | `proj_wmeni3BelwvPUahovs5wQy3i` |
-| ngocvo-project | `proj_E8F4KEaZSMfBuaPhE3Y69BzM` |
-| tubel-project | `proj_MIieWaC8hSsgAp4rSaN86BEp` |
 | giaotien-project | `proj_bUTBrctRsITbimsCqGg3VuJR` |
 
-**Business AI Lab 3** (seed `SEED_PROJECTS["lab3"]`)
+Archived on 2026-10-27 05:16–05:17 UTC (dropped by the bot): hoangha-project,
+duyanh-project, minhphung-project, kong-project, ngocvo-project, tubel-project.
 
-| Name | Project ID |
-|---|---|
-| Default project | `proj_zo1iaAChFX81OMGwxRStD76g` |
+**Business AI Lab 3** (seed `SEED_PROJECTS["lab3"]`, active as of 2026-10-27)
+
+| Name | Project ID | Created |
+|---|---|---|
+| Default project | `proj_zo1iaAChFX81OMGwxRStD76g` | 2026-09-29 |
+| phongnguyen-project | `proj_rGMhWD0VsEuP0NGWFu16kPkC` | 2026-10-04 |
+| haianh-project | `proj_IrYMgtMY6ZuaZ0vsCKXWSc0b` | 2026-10-12 |
+| duyduc-project | `proj_GXgcGPGKn1Xe9Qp1rSRPRLOW` | 2026-10-27 |
+
+Both orgs have a "Default project" and a "phongnguyen-project" with different ids —
+every message is headed with its org.
 
 **The tables above are only the offline seeds.** Per org, the bot pulls the live list
-from `GET /v1/organization/projects` with that org's key (active projects only) at
+from `GET /v1/organization/projects` with that org's key (with archived status) at
 startup and every `PROJECT_SYNC_SECS` (1 h; 5 min retry after a failure), merges it
 into `org.projects`, caches it to the org's file (`projects.json` for Lab 2,
 `projects_lab3.json` for Lab 3), and broadcasts "🆕 New project(s) detected" (headed
 with the org) once per new project. Motivation: giaotien-project (created 2026-09-22) went a week outside every
 seal, quarantine and archive button because nobody added it to the hardcoded table.
 
-Merge rules: an org's table and archive-button index (`org.projects`,
-`org.project_index`) are **rebound, never mutated** (other threads iterate them; an in-place insert raises "dictionary
-changed size during iteration" there), and **append-only** (existing button indices
-never shift; renames update the name in place). Names are stripped of `<>&` since
-they land in HTML-mode Telegram messages. Projects are never removed automatically.
+Merge rules: an org's table and archive index (`org.projects`, `org.project_index`)
+are **rebound, never mutated** (other threads iterate them; an in-place insert raises
+"dictionary changed size during iteration" there). New projects are appended; renames
+update the name. Names are stripped of `<>&` since they land in HTML-mode Telegram
+messages. **Archived projects are dropped** (`_fetch_projects` asks with
+`include_archived=true`; `_drop_archived`), announced once as "🗄️ Project(s) archived on
+the platform" and logged as `project_archived` — but only when the API explicitly
+reports `status: archived` (a project merely missing from a reply stays: a short reply
+must never unguard a live one), and only once it holds no seal capture or queued
+restore (it is dropped at a later sync, after midnight's restore). Archive buttons
+carry project ids, so removals never shift another button's target.
 
 Keep the seed current anyway (IDs are case-sensitive) — it is what the bot knows if
 it boots with the network down and no cache.
@@ -1165,7 +1224,7 @@ On startup the bot:
 - **Atomic state writes** — every JSON store (`usage_state.json`, `subscribers.json`, `names.json`) writes via `_atomic_write_json`: write to a `.tmp`, `fsync`, then `os.replace`. A crash mid-write leaves either the old file intact or the new file complete — never a half-written file. If a corrupt state file is found on load it is moved to `<path>.corrupt-<ts>` (loud warning to logs) instead of silently wiped, so the operator can inspect it.
 - **HTML injection in display names** — `NameStore.set()` runs the name through `html.escape()` and caps to 48 chars. Names are interpolated into many Telegram-HTML messages; without escaping, a `setname </b><a href='...'>` would break the rendering of every subsequent broadcast.
 - **UTC alignment** — All dates use UTC. If running in Vietnam (UTC+7), "today" in UTC starts 7 hours behind local midnight. This matches OpenAI's billing day.
-- **Aggressive mode no-cooldown** — Overcap active-project broadcasts fire every poll (3–10 min) with no cooldown by design. This is intentional: the situation is a financial emergency and the team must be continuously reminded until action is taken.
+- **Overcap alarm cadence** — one message per incident, edited each poll; a new ringing alarm only for a new project or every 15 min (§6, §7.0). It used to fire every poll with no cooldown (16 alarms in 20 min on 2026-09-29).
 - **Concurrency loop is independent** — `concurrency_check_loop` runs every 5 minutes regardless of the current poll mode. It has its own 15-minute cooldown and is a separate concern from budget caps. On API failure it preserves the last known active-projects snapshot instead of overwriting with `{}`, so a brief network blip doesn't make `/refresh`'s "Active" line show "none" misleadingly.
 - **Per-band overcap filtering** — `_fetch_recent_activity_by_band()` groups recent requests by both project and model. `_handle_overcap()` then keeps only projects with activity on the EXCEEDED band(s). A project using premium models cannot trigger the normal-cap alarm and vice versa.
 - **Activity fetch failure** — `_fetch_recent_activity*` return `None` on API failure (distinguished from `{}` meaning "no activity"). Callers preserve the previous mode/state rather than acting on missing data.

@@ -117,16 +117,17 @@ def test_callback_validates_inputs():
 # ─── Model classification ──────────────────────────────────────────────────
 
 def test_model_classification():
-    """Mirrors OpenAI's published free-tier lists verbatim (synced 2026-08-21).
+    """Mirrors OpenAI's published free-token lists verbatim (synced 2026-10-27).
     Re-check: help.openai.com article 10306912 -> "What models are included"."""
-    # 1M group (250K for usage tiers 1-2) - OpenAI publishes dated snapshots
-    premium = ["gpt-5.6-sol", "gpt-5.5-2026-04-23", "gpt-5.4-2026-03-05",
+    # 1M group (250K for Build) - OpenAI publishes dated snapshots
+    premium = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+               "gpt-5.6-sol", "gpt-5.5-2026-04-23", "gpt-5.4-2026-03-05",
                "gpt-5.2-2025-12-11", "gpt-5.1-2025-11-13", "gpt-5.1-codex",
                "gpt-5-codex", "gpt-5-2025-08-07", "gpt-5-chat-latest",
                "gpt-4.5-preview-2025-02-27", "gpt-4.1-2025-04-14",
                "gpt-4o-2024-05-13", "gpt-4o-2024-08-06", "gpt-4o-2024-11-20",
                "o3-2025-04-16", "o1-preview-2024-09-12", "o1-2024-12-17"]
-    # 10M group (2.5M for usage tiers 1-2)
+    # 10M group (2.5M for Build)
     normal = ["gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4-mini-2026-03-17",
               "gpt-5.4-nano-2026-03-17", "gpt-5.1-codex-mini",
               "gpt-5-mini-2025-08-07", "gpt-5-nano-2025-08-07",
@@ -152,7 +153,9 @@ def test_model_classification():
         assert bot._track_for_model(m) is None, m
     # OpenAI excludes fine-tuned models from the offer regardless of base model
     assert bot._track_for_model("ft:gpt-4o-mini-2024-07-18:acme::abc123") is None
-    print("  \u2705 Both free-tier lists match OpenAI's published groups (30 models + aliases)")
+    # gpt-6-luna is 1M group although gpt-5.6-luna is 10M group
+    assert bot._track_for_model("gpt-6-luna") == "premium" and bot._track_for_model("gpt-5.6-luna") == "normal"
+    print("  \u2705 Both groups match OpenAI's published lists (34 models + aliases)")
 
 
 def test_same_prefix_paid_products_are_unlisted():
@@ -177,6 +180,8 @@ def test_same_prefix_paid_products_are_unlisted():
         # free tiers on 2026-08-21; their -pro/-codex variants did NOT)
         "gpt-5.5-pro", "gpt-5.6-sol-pro", "gpt-5.3-codex", "gpt-5.3-chat-latest",
         "chat-latest", "gpt-image-2", "gpt-realtime-2.1", "gpt-audio-1.5",
+        # gpt-6 family (2026-10-27): only the four listed names are free
+        "gpt-6", "gpt-6-pro", "gpt-6.1", "gpt-6.1-sol-pro", "gpt-6-astra-mini", "gpt-6-luna-tts",
     ]
     for m in paid_lookalikes:
         got = bot._track_for_model(m)
@@ -201,27 +206,29 @@ def test_daily_limit_is_two_dollars():
 def test_spend_milestones_fire_in_order():
     usage, subs, names, _ = _fresh_stores()
     usage._data["spend_seeded"] = True
-    fired = []
-    with mock.patch.object(bot, "_send", side_effect=lambda text, *a, **kw: fired.append(text)):
-        for total, expect, cap_expected in [
-            (0.30, "$0.10", False),
-            (0.80, "$0.50", False),
-            (1.20, "$1.00", False),
-            (1.70, "$1.50", False),
-            (2.10, "$2.00", True),
+    fired, quiet = [], []
+    with mock.patch.object(bot, "_send", side_effect=lambda text, *a, silent=False, **kw:
+                           (fired.append(text), quiet.append(silent))):
+        for total, icon, cap_expected, silent in [
+            (0.30, "💵", False, True),     # $0.10 casual — no sound
+            (0.80, "💵", False, True),     # $0.50 casual
+            (1.20, "⚠️", False, False),   # $1.00 urgent — rings
+            (1.70, "⚠️", False, False),   # $1.50 urgent
+            (2.10, "🚨", True,  False),    # $2.00 cap
         ]:
             snap = {"total_cost": total, "projects": {}}
             new_spend, cap = bot.check_spend(snap, usage, subs, names)
             assert new_spend, f"new=False at total=${total}"
             assert cap is cap_expected, f"cap={cap} expected={cap_expected} at total=${total}"
-            assert expect in fired[-1], f"expected {expect} in last msg, got {fired[-1][:200]!r}"
+            assert fired[-1].startswith(icon) and f"{total:.2f}$" in fired[-1], f"{total}: {fired[-1][:200]!r}"
+            assert quiet[-1] is silent, f"{total}: silent={quiet[-1]}"
 
         # Re-check — no new alerts when nothing crossed
         before = len(fired)
         new_spend, cap = bot.check_spend({"total_cost": 2.10, "projects": {}},
                                           usage, subs, names)
         assert not new_spend and not cap and len(fired) == before
-    print("  ✅ Spend milestones fire in order; dedup prevents re-spam")
+    print("  ✅ Spend milestones fire in order (calm ones silent); dedup prevents re-spam")
 
 
 def test_per_project_spend_thresholds():
@@ -237,10 +244,7 @@ def test_per_project_spend_thresholds():
         }
         new, _ = bot.check_spend(snap, usage, subs, names)
         assert new
-        proj_msgs = [t for t in fired if "Project Spend" in t]
-        assert proj_msgs, f"expected per-project alert in: {fired}"
-        assert "ngjabach-project" in proj_msgs[-1]
-        assert "$0.25" in proj_msgs[-1]
+        assert len(fired) == 1 and "ngjabach-project 0.30$ (past 0.25$)" in fired[0], fired
     print("  ✅ Per-project spend threshold fires with project name + threshold")
 
 
@@ -274,7 +278,7 @@ def test_unlisted_model_alert_first_touch():
             },
         }
         assert bot.check_unlisted_models(snap, usage, subs, names)
-        unlisted_msgs = [t for t in fired if "Unlisted Model" in t]
+        unlisted_msgs = [t for t in fired if "off-list model" in t]
         assert len(unlisted_msgs) == 1
         assert "text-embedding-3-small" in unlisted_msgs[0]
         assert "gpt-4o-mini" not in unlisted_msgs[0]
@@ -282,7 +286,7 @@ def test_unlisted_model_alert_first_touch():
         # Re-run — dedup
         fired.clear()
         assert not bot.check_unlisted_models(snap, usage, subs, names)
-        assert not [t for t in fired if "Unlisted Model" in t]
+        assert not [t for t in fired if "off-list model" in t]
     print("  ✅ Unlisted-model alert fires once per (pid, model) per day")
 
 
@@ -308,7 +312,7 @@ def test_unlisted_model_per_project_dedup():
             "text-embedding-3-small": {"input": 100, "output": 0, "requests": 1}}}}}
         bot.check_unlisted_models(snap_a, usage, subs, names)
         bot.check_unlisted_models(snap_b, usage, subs, names)
-        unlisted_msgs = [t for t in fired if "Unlisted Model" in t]
+        unlisted_msgs = [t for t in fired if "off-list model" in t]
         assert len(unlisted_msgs) == 2, f"expected 2 alerts (1 per project), got {len(unlisted_msgs)}"
     print("  ✅ Unlisted model dedup is per (pid, model), not just per model")
 
@@ -325,7 +329,7 @@ def test_seed_spend_marks_crossed_silently():
         assert {0.10, 0.50, 1.00, 1.50}.issubset(usage.get_spend_milestones_notified())
         assert 2.00 not in usage.get_spend_milestones_notified()
         # Exactly one catch-up broadcast — the highest crossed
-        catchups = [t for t in fired if "Spend" in t]
+        catchups = [t for t in fired if "spend 1.60$" in t]
         assert len(catchups) == 1, f"expected 1 catch-up broadcast, got {len(catchups)}: {fired}"
         # Next normal poll — no new alerts at the same total
         fired.clear()
@@ -367,15 +371,18 @@ def test_overcap_escalation_keeps_alerting():
         new, cap = bot.check_spend({"total_cost": 2.10, "projects": {}}, usage, subs, names)
         assert not new and not cap and len(fired) == n_after_cap
 
-        # Bleed continues to $3.10 — steps $2.50 and $3.00 both fire, cap=True again
+        # Bleed continues to $3.10 — steps $2.50 and $3.00 both cross: one cap-level
+        # message (one per poll, not one per step), cap=True again
         new, cap = bot.check_spend({"total_cost": 3.10, "projects": {}}, usage, subs, names)
         assert new and cap
-        assert len(fired) == n_after_cap + 2, f"expected 2 escalation alerts, got {len(fired) - n_after_cap}"
+        assert len(fired) == n_after_cap + 1, f"expected 1 escalation message, got {len(fired) - n_after_cap}"
+        assert "3.10$" in fired[-1] and "past the 2.00$ daily alarm" in fired[-1], fired[-1]
+        assert {2.5, 3.0} <= usage.get_spend_milestones_notified()
 
         # Same total — silent again
         new, cap = bot.check_spend({"total_cost": 3.10, "projects": {}}, usage, subs, names)
         assert not new and not cap
-    print("  ✅ Overcap escalation: new cap alert per extra $0.50, deduped")
+    print("  ✅ Overcap escalation: a cap alert per poll that crosses another $0.50, deduped")
 
 
 def test_seed_spend_covers_overcap_steps():
@@ -977,23 +984,23 @@ def test_lane_lines_in_every_report():
         assert "0.12$" in out, f"{name}: exotic cost missing"
     for name in ("usage", "snapshot"):
         out = reports[name]
-        assert "/ 1M. Cost: 0.00$" in out, f"{name}: premium Cost suffix missing"
-        assert "/ 10M. Cost: 0.21$" in out, f"{name}: normal Cost suffix missing"
+        assert "/ 1M · 0.00$" in out, f"{name}: 1M-group cost missing"
+        assert "/ 10M (114%) · 0.21$" in out, f"{name}: 10M-group cost missing"
         assert "\U0001f9ea Exotic" in out, f"{name}: Exotic lane missing"
 
     # Before the first costs fetch there is no lane data: show a dash, never crash
     usage2, _, _, _ = _fresh_stores()
     usage2._data.update({"date": "2026-09-15", "projects": {"p": {
         "name": "p", "total_tokens": 1, "models": {}}}})
-    assert "Cost: \u2014" in bot.cmd_usage(usage2)
+    assert "/ 1M · \u2014" in bot.cmd_usage(usage2)
 
     # Lab 3 renders its own (4x smaller) allowances, never Lab 2's.
     usage3, _, _, _ = _fresh_stores(LAB3)
     usage3._data.update({k: v for k, v in usage.get().items()})
     for name, out in (("usage", bot.cmd_usage(usage3)),
                       ("snapshot", bot.fmt_daily_snapshot(usage3.get(), LAB3))):
-        assert "/ 250K. Cost:" in out and "/ 2.5M. Cost:" in out, f"lab3 {name}: {out[-300:]}"
-        assert "/ 10M" not in out and "/ 1M." not in out, f"lab3 {name} shows Lab 2 caps"
+        assert "/ 250K · " in out and "/ 2.5M (455%) · 0.21$ · seals at 9.50M" in out, f"lab3 {name}: {out[-300:]}"
+        assert "/ 10M" not in out and "/ 1M " not in out, f"lab3 {name} shows Lab 2 caps"
     arch3 = bot._fmt_archive_status(usage3)
     assert "/ 2.5M" in arch3 and "/ 250K" in arch3 and "Business AI Lab 3" in arch3, arch3[:300]
     print("  \u2705 Cost suffix + Exotic lane render in usage, snapshot, archive (per-org caps)")
@@ -1321,8 +1328,8 @@ def test_cmd_refresh_reads_and_wakes_poll_loop():
     assert json.dumps(usage.get(), sort_keys=True, default=str) == before, "/refresh mutated lab2 state"
     assert json.dumps(usage3.get(), sort_keys=True, default=str) == before3, "/refresh mutated lab3 state"
     assert woke, "/refresh must wake BOTH orgs' poll loops"
-    assert elapsed < 1.0 and "Data refreshed" in out and "Cost:" in out
-    i2, i3 = out.find("Business AI Lab 2"), out.find("Business AI Lab 3")
+    assert elapsed < 1.0 and "Status" in out and "Spend today" in out
+    i2, i3 = out.find("<b>Lab 2</b>"), out.find("<b>Lab 3</b>")
     assert 0 <= i2 < i3, "one section per org, in order"
     assert "/ 10M" in out[i2:i3] and "/ 2.5M" in out[i3:], "each section shows its own caps"
     print(f"  ✅ /refresh is read-only ({elapsed*1000:.0f} ms), covers + wakes both orgs")
@@ -1528,7 +1535,7 @@ def test_overcap_skips_just_sealed_projects():
     usage, subs, names, _ = _fresh_stores()
     bot._SEALED_AT.clear()
     usage.update({"date": bot.today_str(), "projects": {}})
-    duyanh, exempt = "proj_C51oeo4LjmiQefinVfoI8Rs0", "proj_cEHeqXeLfsJ6jrQhOXDlt9wH"
+    duyanh, exempt = "proj_OWrxxJaWk5MXHBi3HIdPxBDh", "proj_fEboQnaVm4tQCk8kFy0h8s08"   # oduong, khonlanh
     usage.add_track_originals("normal", duyanh, [{"id": "r", "model": "gpt-4o-mini",
                                                   "max_requests_per_1_minute": 5000}])
     banded = {duyanh: {"normal": 758, "premium": 0}, exempt: {"normal": 50, "premium": 0}}
@@ -1536,17 +1543,17 @@ def test_overcap_skips_just_sealed_projects():
     with mock.patch.object(bot, "_fetch_recent_activity_by_band", return_value=banded), \
          mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: sent.append(t)):
         bot._handle_overcap(usage, subs, names, True, False)
-        assert sent and "minhphung-project" in sent[0] and "duyanh-project" not in sent[0], sent
+        assert sent and "khonlanh-project" in sent[0] and "oduong-project" not in sent[0], sent
         sent.clear()
         usage._data["sealed_tracks"]["normal"]["sealed_at"] -= bot.OVERCAP_WINDOW_MINS * 60
         bot._handle_overcap(usage, subs, names, True, False)
-        assert "duyanh-project" in sent[0], "a sealed project still active after the window is a leak"
+        assert "oduong-project" in sent[0], "a sealed project still active after the window is a leak"
         # The track entry is old (e.g. a morning manual seal), but THIS project's
         # seal just landed (afternoon mass seal) — it still gets the grace window.
         sent.clear()
         bot._SEALED_AT[("normal", duyanh)] = time.time()
         bot._handle_overcap(usage, subs, names, True, False)
-        assert "duyanh-project" not in sent[0], "per-project seal time must grant the grace"
+        assert "oduong-project" not in sent[0], "per-project seal time must grant the grace"
     bot._SEALED_AT.clear()
     usage.set_mode("urgent"); usage.set_last_milestone_ts(time.time() - 2 * bot.URGENT_REVERT_SECS)
     with mock.patch.object(bot, "_fetch_recent_activity_by_band", return_value={}), \
@@ -1609,7 +1616,7 @@ def test_project_discovery_merges_safely():
         with mock.patch.object(LAB2, "cache_path", tmp / "projects.json"), \
              mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: sent.append(t)):
             live = {**orig_known, "proj_NEW": "new-project"}
-            with mock.patch.object(bot, "_fetch_active_projects", return_value=live):
+            with mock.patch.object(bot, "_fetch_projects", return_value=(live, set())):
                 assert bot._sync_projects(usage, subs, names) == ["proj_NEW"]
                 assert bot._sync_projects(usage, subs, names) == [], "second sync must find nothing new"
             assert LAB2.projects is not orig_known and "proj_NEW" not in orig_known, \
@@ -1619,7 +1626,7 @@ def test_project_discovery_merges_safely():
             assert len(sent) == 1 and "new-project" in sent[0], sent
             assert "Business AI Lab 2" in sent[0], "announcement must name the org"
             assert (LAB3.projects, LAB3.project_index) == lab3_before, "Lab 2 discovery touched Lab 3"
-            with mock.patch.object(bot, "_fetch_active_projects", return_value=None):
+            with mock.patch.object(bot, "_fetch_projects", return_value=None):
                 assert bot._sync_projects(usage, subs, names) is None
             assert "proj_NEW" in LAB2.projects, "a failed sync must not drop projects"
             # Restart with the network down: the cache restores it at the same index.
@@ -1638,16 +1645,17 @@ def test_project_discovery_merges_safely():
 
         def fake_call(method, url, **kw):
             assert kw["headers"]["Authorization"] == f"Bearer {LAB2.key}", "wrong org key"
+            assert kw.get("params", {}).get("include_archived") == "true", "archived status needed"
             calls.append(kw.get("params", {}).get("after"))
             return mock.Mock(ok=True, json=lambda: pages[len(calls) - 1])
 
         with mock.patch.object(bot, "_openai_call", side_effect=fake_call):
-            got = bot._fetch_active_projects(LAB2)
-        assert got == {"p1": "abc", "p3": "p3"}, got
+            got = bot._fetch_projects(LAB2)
+        assert got == ({"p1": "abc", "p3": "p3"}, {"p2"}), got
         assert calls == [None, "p2"], calls
     finally:
         LAB2.projects, LAB2.project_index = orig_known, orig_index
-    print("  ✅ Discovery: append-only, rebound, sanitized, announced once, cached")
+    print("  ✅ Discovery: appended, rebound, sanitized, announced once, cached")
 
 
 def test_cached_costs_same_day_only():
@@ -1785,7 +1793,7 @@ def test_memos_are_per_org():
          mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: sent.append(t)), \
          mock.patch.object(bot.time, "sleep"):
         bot._process_pending_track_unseals(s3b, subs, names)
-    assert any("Begin unsealing" in t and "Business AI Lab 3" in t for t in sent), sent
+    assert any("restoring yesterday's seals" in t and "Lab 3" in t for t in sent), sent
     print("  ✅ Drift timers + midnight announcements are keyed per org")
 
 
@@ -1818,7 +1826,7 @@ def test_send_splits_long_messages():
     text = "\n".join(lines)
     sent = []
     with mock.patch.object(bot, "_send_one",
-                           side_effect=lambda t, c=None, th=None, kb=None: sent.append((t, kb))):
+                           side_effect=lambda t, c=None, th=None, kb=None, silent=False: sent.append((t, kb))):
         bot._send(text, "c", keyboard=[["K"]])
     assert len(sent) > 1 and all(len(t) <= bot.TELEGRAM_MAX_CHARS for t, _ in sent)
     assert "\n".join(t for t, _ in sent) == text, "splitting lost or altered content"
@@ -1845,11 +1853,11 @@ def test_reports_cover_both_orgs():
          mock.patch.object(bot, "_fetch_recent_usage", return_value=(123_000, 45)):
         for cmd in ("usage", "spending", "tokens", "models", "rank", "recent"):
             out, _ = bot.dispatch(f"@botx {cmd}", [s2, s3], subs, "botx", "test_primary", names)
-            i2, i3 = out.find("Business AI Lab 2"), out.find("Business AI Lab 3")
+            i2, i3 = out.find("<b>Lab 2</b>"), out.find("<b>Lab 3</b>")
             assert 0 <= i2 < i3, f"{cmd}: missing a per-org section"
     assert sorted(set(fetched)) == ["lab2", "lab3"], fetched
     out, _ = bot.dispatch("@botx usage", [s2, s3], subs, "botx", "test_primary", names)
-    assert "/ 10M" in out[:out.find("Business AI Lab 3")] and "/ 2.5M" in out[out.find("Business AI Lab 3"):]
+    assert "/ 10M" in out[:out.find("<b>Lab 3</b>")] and "/ 2.5M" in out[out.find("<b>Lab 3</b>"):]
     help_text, _ = bot.dispatch("@botx help", [s2, s3], subs, "botx", "test_primary", names)
     assert "Business AI Lab 3" in help_text
     print("  ✅ usage/spending (+ old aliases): one labelled section per org")
@@ -1878,7 +1886,8 @@ def test_quarantine_and_baseline_stay_in_their_org():
     with mock.patch.object(bot, "_fetch_project_rate_limits",
                            side_effect=lambda p, **kw: (fetched.append((p, kw["org"].id)), [])[1]):
         bot._compute_canonical_baseline(s3)
-    assert fetched == [(pid3, "lab3")], f"baseline crossed orgs: {fetched}"
+    assert fetched and {o for _, o in fetched} == {"lab3"}, f"baseline crossed orgs: {fetched}"
+    assert {p for p, _ in fetched} == set(LAB3.projects), f"baseline missed Lab 3 projects: {fetched}"
     print("  ✅ Quarantine + restore baseline never cross org boundaries")
 
 
@@ -1991,9 +2000,7 @@ def test_archive_ux_fixes():
     assert edits[1].endswith("PROMPT-LINE"), edits[1][-60:]
 
     text = bot.fmt_seal_batch_begin("normal", 1_200_000, 10_000_000, LAB2, manual=True)
-    assert "hit 100%" not in text and "Manual seal" in text and "12%" in text, text
-    text = bot.fmt_seal_batch_begin("normal", 300_000, LAB3.normal_ceiling, LAB3, manual=True)
-    assert "Manual seal" in text and "at 300.0k (seal point 9.50M)" in text, text
+    assert "hit 100%" not in text and "sealing the 10M group</b> at 1.20M on your order" in text, text
     print("  ✅ ☣️ in Unseal→Both, picker prompt kept, honest manual-seal wording")
 
 
@@ -2175,12 +2182,13 @@ def test_lab3_pays_past_free_allowance():
             hit, cap = bot.check_spend({"total_cost": 3.00, "projects": {}}, usage, subs, names)
         assert hit and cap == expect_cap, (org.id, hit, cap)
         if org is LAB3:
-            assert any("$2.50" in t and "of $10.00" in t for t in got), got
+            assert any("spend 3.00$" in t and "of 10.00$" in t for t in got), got
 
     # Seal message reports tokens vs the seal point, not "hit 324%" of the allowance.
     begin = bot.fmt_seal_batch_begin("premium", 812_000, LAB3.premium_ceiling, LAB3)
-    assert "seal point 800.0k" in begin and "%" not in begin, begin
-    assert "hit 81%" in bot.fmt_seal_batch_begin("premium", 812_000, LAB2.premium_ceiling, LAB2)
+    assert "at 812.0k (seal point 800.0k)" in begin and "%" not in begin, begin
+    done = bot.fmt_seal_batch_done("premium", 4, 0, 0, LAB3, consumed=812_000, secs=47)
+    assert "81% of 1M" in done and "4 project(s) throttled · 47 s" in done, done
     usage, _, _, _ = _fresh_stores(LAB3)
     assert "seals at 9.50M" in bot._fmt_archive_status(usage)
     print("  ✅ Lab 3 runs past 2.5M/250K to 9.5M/800k; alerts + $10 ladder scale")
@@ -2196,6 +2204,210 @@ def test_bot_token_redacted_from_console():
     out = buf.getvalue()
     assert "SECRET" not in out and "/bot<bot-token>/getUpdates" in out, out
     print("  ✅ Bot token redacted from console / stdout log")
+
+
+def test_openai_terms_in_user_text():
+    """Everything users see names the groups the way OpenAI does ("1M group",
+    "10M group"); internal ids (premium/normal) stay in state and button data."""
+    import re
+    old = re.compile(r"\b(Premium|Normal|premium|normal)\b")
+    s2, subs, names, _ = _fresh_stores()
+    s3, _, _, _ = _fresh_stores(LAB3)
+    pid3 = "proj_zo1iaAChFX81OMGwxRStD76g"
+    s3.add_track_originals("premium", pid3, [{"id": "r", "model": "gpt-5.1", "max_requests_per_1_minute": 5}])
+    texts = {
+        "lanes2": "\n".join(bot._fmt_lane_lines(1, 2, {}, LAB2)),
+        "lanes3": "\n".join(bot._fmt_lane_lines(1, 2, {}, LAB3)),
+        "archive3": bot._fmt_archive_status(s3),
+        "guard3": "\n".join(bot._fmt_guard_lines(s3)),
+        "seal_begin": bot.fmt_seal_batch_begin("premium", 900_000, LAB2.premium_ceiling, LAB2),
+        "seal_done": bot.fmt_seal_batch_done("normal", 3, 0, 0, LAB3),
+        "manual_seal": bot.fmt_manual_seal("p", "premium", LAB3),
+        "overcap": bot.fmt_overcap_active_alert({pid3: {"premium": 3}}, False, True, LAB3),
+        "help": bot.cmd_help("botx"),
+    }
+    for lvl in ("casual", "urgent", "cap"):
+        texts[f"ms_n_{lvl}"] = bot.fmt_group_milestone("normal", 1, 1, lvl, LAB3)
+        texts[f"ms_p_{lvl}"] = bot.fmt_group_milestone("premium", 1, 1, lvl, LAB2)
+    for k, t in texts.items():
+        assert not old.search(t), f"{k}: old track name in {old.search(t).group()!r}: {t[:300]}"
+    kb = bot._kb_archive_mode("seal", LAB3)
+    assert [b["text"] for row in kb for b in row][:2] == ["⭐ 1M group", "📦 10M group"]
+    assert [b["callback_data"] for row in kb for b in row][:2] == ["arch:lab3:seal:premium:-",
+                                                                   "arch:lab3:seal:normal:-"], "button data must keep track ids"
+    assert bot._band_label("premium", LAB2) == "1M group" and bot._band_label("premium", LAB3) == "1M group (250K)"
+    assert bot._band_label("normal", LAB3) == "10M group (2.5M)"
+    assert "⭐ 1M group: <b>1</b> / 250K" in texts["lanes3"] and "🔒1M" in texts["archive3"]
+    assert "1M group free tokens used up" in texts["ms_p_cap"] and "standard rates" in texts["ms_p_cap"]
+    print("  ✅ User-facing text uses OpenAI's 1M / 10M group names; ids unchanged")
+
+
+def test_archived_projects_dropped():
+    """Six Lab 2 projects were archived on 2026-10-27; the append-only table
+    would have kept them in every seal sweep and archive menu. A project the
+    API reports ARCHIVED is dropped and announced; a merely-missing one stays
+    (a short reply must not unguard it); a sealed one stays until restored."""
+    orig = (LAB2.projects, LAB2.project_index)
+    tmp = Path(tempfile.mkdtemp(prefix="projects_"))
+    usage, subs, names, _ = _fresh_stores()
+    keep, gone, sealed, missing = "proj_keep", "proj_gone", "proj_sealed", "proj_missing"
+    LAB2.projects = {keep: "keep-p", gone: "gone-p", sealed: "sealed-p", missing: "missing-p"}
+    LAB2.project_index = list(LAB2.projects)
+    usage.add_track_originals("premium", sealed, [{"id": "r", "model": "gpt-4o", "max_requests_per_1_minute": 5}])
+    sent = []
+    try:
+        with mock.patch.object(LAB2, "cache_path", tmp / "projects.json"), \
+             mock.patch.object(bot, "_send", side_effect=lambda t, *a, **k: sent.append(t)), \
+             mock.patch.object(bot, "_fetch_projects", return_value=({keep: "keep-p"}, {gone, sealed})):
+            assert bot._sync_projects(usage, subs, names) == []
+            assert set(LAB2.projects) == {keep, sealed, missing}, LAB2.projects
+            assert LAB2.project_index == [keep, sealed, missing]
+            assert json.loads((tmp / "projects.json").read_text()) == LAB2.projects, "cache must drop it too"
+            assert len(sent) == 1 and "gone-p" in sent[0] and "archived" in sent[0], sent
+            assert "sealed-p" not in sent[0]
+            usage.pop_track_originals("premium", sealed)          # restored → now it can go
+            bot._sync_projects(usage, subs, names)
+            assert set(LAB2.projects) == {keep, missing}, LAB2.projects
+            assert len(sent) == 2 and "sealed-p" in sent[1]
+    finally:
+        LAB2.projects, LAB2.project_index = orig
+    print("  ✅ Archived projects dropped + announced; missing ones kept; sealed ones wait")
+
+
+# ─── Message redesign (2026-10-27): fewer, calmer, updated in place ─────────
+
+def test_overcap_alarm_one_message_per_incident():
+    """The alarm used to go out on every poll (16 times in 20 min on 2026-09-29).
+    Now: one message per incident, edited each poll; a new ringing alert only
+    for a new project or after OVERCAP_REPING_SECS; a quiet poll ends it. A
+    project unsealed by hand gets the calm orange wording."""
+    usage, subs, names, _ = _fresh_stores()
+    usage.update({"date": bot.today_str(), "projects": {}})
+    bot._OVERCAP_INCIDENT.clear(); bot._SEALED_AT.clear()
+    oduong, khon = "proj_OWrxxJaWk5MXHBi3HIdPxBDh", "proj_fEboQnaVm4tQCk8kFy0h8s08"
+    usage.add_track_exemption(khon, "normal")                      # unsealed by hand
+    sends, edits, ids, clock = [], [], iter(range(100, 200)), [time.time()]
+
+    def poll(banded):
+        with mock.patch.object(bot, "_fetch_recent_activity_by_band", return_value=banded):
+            bot._handle_overcap(usage, subs, names, True, False)
+        clock[0] += 60
+
+    with mock.patch.object(bot, "_send", side_effect=lambda t, *a, silent=False, **k: (sends.append(t), next(ids))[1]), \
+         mock.patch.object(bot, "_edit_message", side_effect=lambda t, c, m, keyboard=None: (edits.append((m, t)), True)[1]), \
+         mock.patch.object(bot.time, "time", side_effect=lambda: clock[0]):
+        for _ in range(4):
+            poll({khon: {"normal": 3, "premium": 0}})
+        assert len(sends) == 1 and len(edits) == 3, (len(sends), len(edits))
+        assert "Paid use" in sends[0] and "unsealed by hand today" in sends[0] and "🔴" not in sends[0]
+        assert {m for m, _ in edits} == {100} and "(4 polls)" in edits[-1][1], edits[-1]
+        poll({khon: {"normal": 3, "premium": 0}, oduong: {"normal": 40, "premium": 0}})
+        assert len(sends) == 2 and sends[-1].startswith("🔴") and "still running after its seal" in sends[-1]
+        clock[0] += bot.OVERCAP_REPING_SECS
+        poll({khon: {"normal": 3, "premium": 0}, oduong: {"normal": 41, "premium": 0}})
+        assert len(sends) == 3, "a long incident must ping again every 15 min"
+        poll({})                                                     # 20 min without requests
+        assert len(sends) == 3 and LAB2.id not in bot._OVERCAP_INCIDENT
+        poll({oduong: {"normal": 2, "premium": 0}})
+        assert len(sends) == 4, "activity after a quiet poll is a new incident"
+    bot._OVERCAP_INCIDENT.clear()
+    print("  ✅ Over-budget alarm: one message per incident, edited; re-pings on news or every 15 min")
+
+
+def test_seal_and_restore_edit_one_message():
+    """A seal (or restore) is one message edited from 'sealing…' to 'sealed' —
+    it used to be a begin + a done message (87 of them in Sep–Oct 2026)."""
+    usage, subs, names, _ = _fresh_stores()
+    usage.update({"date": bot.today_str(), "projects": {}})
+    bot._release_busy(LAB2)
+    sends, edits = [], []
+    with mock.patch.object(bot, "_throttle_track_for_project", return_value="throttled"), \
+         mock.patch.object(bot, "_send", side_effect=lambda t, *a, silent=False, **k: (sends.append(t), 7)[1]), \
+         mock.patch.object(bot, "_edit_message", side_effect=lambda t, c, m, keyboard=None: (edits.append((m, t)), True)[1]):
+        bot._mass_seal_track("normal", usage, subs, names, consumed=9_555_939)
+        assert len(sends) == 1 and "sealing the 10M group" in sends[0] and "9.56M" in sends[0], sends
+        assert len(edits) == 1 and edits[0][0] == 7, edits
+        assert "10M group sealed" in edits[0][1] and f"{len(LAB2.projects)} project(s) throttled" in edits[0][1]
+        assert "96% of 10M" in edits[0][1] and "<blockquote expandable>" in edits[0][1]
+        sends.clear(); edits.clear()
+        pid = "proj_OWrxxJaWk5MXHBi3HIdPxBDh"
+        usage.add_track_originals("premium", pid, [{"id": "r", "model": "gpt-4o", "max_requests_per_1_minute": 5}])
+        with mock.patch.object(bot, "_restore_track_for_project", return_value="restored"), \
+             mock.patch.object(bot, "_compute_canonical_baseline", return_value={}):
+            bot._mass_unseal_track("premium", usage, subs, names)
+        assert len(sends) == 1 and "restoring the 1M group" in sends[0], sends
+        assert len(edits) == 1 and "1M group restored" in edits[0][1] and "1 project(s)" in edits[0][1]
+    # A chat whose message can't be edited gets the final text as a new, silent message.
+    got = []
+    with mock.patch.object(bot, "_send", side_effect=lambda t, *a, silent=False, **k: got.append((t, silent))), \
+         mock.patch.object(bot, "_edit_message") as em:
+        bot._broadcast_edit({}, lambda n: "final", subs, names, org=LAB2, header=False)
+    assert got == [("final", True)] and not em.called
+    print("  ✅ Seal / restore: one message edited in place; unknown message ids fall back to a silent send")
+
+
+def test_milestones_calm_silent_stale_skipped_merged():
+    """Calm steps arrive silently; several steps crossed in one poll are one
+    message (the highest); steps below the seal point are recorded but not sent
+    once the group is sealed; the used-up alert always rings."""
+    usage, subs, names, _ = _fresh_stores()
+    usage._data["milestones_seeded"] = True
+    got = []
+    with mock.patch.object(bot, "_send", side_effect=lambda t, *a, silent=False, **k: got.append((t, silent))):
+        bot.check_milestones({"total_normal_tokens": 4_100_000, "total_premium_tokens": 0}, usage, subs, names)
+        assert len(got) == 1 and got[0][1] is True and "4.10M" in got[0][0] and "41%" in got[0][0], got
+        assert {1_000_000, 4_000_000} <= usage.get_milestones_notified()
+        got.clear()
+        bot.check_milestones({"total_normal_tokens": 8_050_000, "total_premium_tokens": 0}, usage, subs, names)
+        assert len(got) == 1 and got[0][1] is False and got[0][0].startswith("⚠️"), got
+        got.clear()
+        usage.mark_mass_sealed("normal")
+        bot.check_milestones({"total_normal_tokens": 9_600_000, "total_premium_tokens": 0}, usage, subs, names)
+        assert got == [] and 9_000_000 in usage.get_milestones_notified(), "stale step after the seal was sent"
+        bot.check_milestones({"total_normal_tokens": 10_200_000, "total_premium_tokens": 0}, usage, subs, names)
+        assert len(got) == 1 and got[0][1] is False and "free tokens used up" in got[0][0], got
+    print("  ✅ Milestones: calm ones silent, one per poll, stale ones skipped after a seal")
+
+
+def test_typos_resolve():
+    """'peojects', 'refersh', 'archieve' used to get "Unknown command". A
+    near-miss of a read-only command runs it, with a note; seal / unseal open the
+    archive; a near-miss of a command that changes something only suggests."""
+    s2, subs, names, _ = _fresh_stores()
+    s2._data.update({"date": bot.today_str(), "projects": {}})
+    out, _ = bot.dispatch("@botx peojects", [s2], subs, "botx", "test_primary", names)
+    assert "Read “peojects” as /usage" in out and "No usage today" in out, out
+    assert bot._match_prefix("/refersh", "botx") == "refersh", "a bare /typo must still reach the bot"
+    with mock.patch.object(bot, "fetch_today_usage", return_value=None):
+        out, kb = bot.dispatch("/refersh", [s2], subs, "botx", "test_primary", names)
+    LAB2.poll_now.clear()
+    assert "as /refresh" in out and kb == bot._kb_menu()
+    _, kb = bot.dispatch("/unseal", [s2], subs, "botx", "test_primary", names)
+    assert kb == bot._kb_archive_root()
+    _, kb = bot.dispatch("@botx archieve", [s2], subs, "botx", "test_primary", names)
+    assert kb == bot._kb_archive_root()
+    out, _ = bot.dispatch("@botx arsie", [s2], subs, "botx", "newchat", names)
+    assert "did you mean /arise" in out and "newchat" not in subs.all(), out
+    out, _ = bot.dispatch("@botx xyzzy", [s2], subs, "botx", "test_primary", names)
+    assert out.startswith("Unknown command")
+    assert bot._match_prefix("/shrug", "botx") is None
+    print("  ✅ Typos: read-only commands run with a note; arise/dismiss/setname only suggested")
+
+
+def test_report_error_isolated_per_org():
+    """One org's report raising used to lose the whole reply, other org included."""
+    s2, _, _, _ = _fresh_stores()
+    s3, _, _, _ = _fresh_stores(LAB3)
+
+    def render(u):
+        if u.org is LAB2:
+            raise KeyError("boom")
+        return "lab3 body"
+    out = bot._per_org([s2, s3], render, title="T", footer="F", warn=False)
+    assert out.startswith("T") and out.endswith("F")
+    assert out.index("<b>Lab 2</b>") < out.index("This section failed") < out.index("<b>Lab 3</b>") < out.index("lab3 body")
+    assert "KeyError" in out
+    print("  ✅ A failing org section becomes an error line; the other org still shows")
 
 
 if __name__ == "__main__":
@@ -2287,6 +2499,13 @@ if __name__ == "__main__":
         ("Menu buttons run commands",                   test_menu_button_runs_command),
         ("Lab 3 pays past its free allowance",          test_lab3_pays_past_free_allowance),
         ("Bot token redacted from console",             test_bot_token_redacted_from_console),
+        ("OpenAI's group names in user text",           test_openai_terms_in_user_text),
+        ("Archived projects dropped on sync",           test_archived_projects_dropped),
+        ("Over-budget alarm: one message per incident", test_overcap_alarm_one_message_per_incident),
+        ("Seal / restore: one message edited",          test_seal_and_restore_edit_one_message),
+        ("Milestones: silent, merged, stale skipped",   test_milestones_calm_silent_stale_skipped_merged),
+        ("Typos resolve to the right command",          test_typos_resolve),
+        ("Report error isolated per org",               test_report_error_isolated_per_org),
     ]
     passes, fails = 0, []
     for name, fn in tests:

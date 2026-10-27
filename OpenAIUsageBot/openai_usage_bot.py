@@ -18,6 +18,7 @@ No humor. No filler. Precision in all things.
 import builtins
 import calendar
 import copy
+import difflib
 import html
 import json
 import os
@@ -51,12 +52,12 @@ dotenv.load_dotenv()
 
 # ── Version / changelog (shown in the help footer) ─────────────────────────
 # Keep BOT_UPDATED current and list the few most recent user-facing changes.
-BOT_UPDATED = "2026-09-30"
+BOT_UPDATED = "2026-10-27"
 BOT_CHANGES = (
-    "Fewer commands: refresh · usage · spending · archive (old names still work)",
-    "Tap the buttons under help / refresh, or pick a command from Telegram's / menu",
-    "Now guarding Business AI Lab 3 too (2.5M normal / 250K premium per day)",
-    "Every alert names its org; archive: Seal/Unseal → org → track → project",
+    "Calmer chat: one message per seal and per alarm, updated in place; calm alerts arrive silently",
+    "Tidier replies: one money format, short model names; typos like /refersh still work",
+    "OpenAI's terms: 1M group / 10M group; gpt-6.1-sol, gpt-6-astra, gpt-6-sol, gpt-6-luna covered",
+    "Four commands: refresh · usage · spending · archive — tap the buttons or use the / menu",
 )
 
 BOT_TOKEN        = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -124,7 +125,8 @@ LOGS_DIR         = BOT_DATA_DIR / "logs"
 # Kinds: broadcast | mode | poll | poll_fail | mass_seal | mass_unseal |
 #        manual_seal | manual_unseal | pending_unseal | pending_unseal_stuck |
 #        day_rollover | command | wave_trigger | seal_repair | quarantine |
-#        quarantine_release | chat_migrated | project_discovered | arise_refused
+#        quarantine_release | chat_migrated | project_discovered | project_archived |
+#        arise_refused
 # Best-effort by design: a logging failure prints one line and never breaks
 # the bot. Files are small (a quiet month is well under 1 MB); prune by hand.
 _LOG_LOCK = threading.Lock()
@@ -396,23 +398,23 @@ def _matches_track(model: str, track: str) -> bool:
 # projects, state file and enforcement threads; model classification and the
 # Telegram side are shared.
 #
-#   free       — the daily free allowance (normal, premium): milestones, the
-#                "allowance exhausted" alert, the lane lines. Lab 3 is on usage
-#                tier 1-2, hence 4x smaller (OpenAI's offer: 2.5M / 250K per day).
+#   free       — the daily free tokens (10M group, 1M group): milestones, the
+#                "free tokens used up" alert, the lane lines. Lab 3 is on the
+#                Build tier, hence 4x smaller (OpenAI's offer: 2.5M / 250K a day).
 #   ceiling    — where enforcement works: seal points (ceiling minus the track
 #                buffer), the wave guard and the overcap alarm. Normally = free.
 #                Lab 3's is Lab 2's allowance ON PURPOSE (Bach, 2026-09-30): it
-#                has to pay its way up the usage tiers, so usage past its free
-#                allowance is wanted — up to the same daily room as Lab 2.
+#                has to pay its way up from Build to Launch/Grow, so usage past its
+#                free tokens is wanted — up to the same daily room as Lab 2.
 #   daily_limit— the spend alarm (USD/day); the spend ladders scale with it.
 #                Lab 3's covers its intended paid usage (≈ $2–6/day at both
 #                ceilings, from Lab 2's measured overage prices) with room to
 #                spare, so the alarm still means "something unplanned is billing".
 ORG_SPECS = (
-    dict(id="lab2", label="Business AI Lab 2", key_env="OPENAI_ADMIN_KEY",
+    dict(id="lab2", label="Business AI Lab 2", key_env="OPENAI_ADMIN_KEY", tier="Launch/Grow",
          free=(10_000_000, 1_000_000), ceiling=(10_000_000, 1_000_000), daily_limit=2.00,
          state="usage_state.json", cache="projects.json"),
-    dict(id="lab3", label="Business AI Lab 3", key_env="OPENAI_ADMIN_KEY_LAB3",
+    dict(id="lab3", label="Business AI Lab 3", key_env="OPENAI_ADMIN_KEY_LAB3", tier="Build",
          free=(2_500_000, 250_000), ceiling=(10_000_000, 1_000_000), daily_limit=10.00,
          state="usage_state_lab3.json", cache="projects_lab3.json"),
 )
@@ -421,23 +423,20 @@ ORG_SPECS = (
 # API at startup and hourly — see _sync_projects — so a new project is covered
 # without a code change. Keep these current anyway: they are what the bot knows
 # if it boots with the network down and no projects cache.
-SEED_PROJECTS: dict[str, dict[str, str]] = {"lab2": {
+SEED_PROJECTS: dict[str, dict[str, str]] = {"lab2": {   # active as of 2026-10-27
     "proj_Gkm7qFbBFgmW11VFtO13Uw3F": "Default project",
     "proj_9su0tGI8NsaLE7LHqikCw8VE": "cngvng-project",
-    "proj_4VPu8UTHzBpZiHFQVaYG923d": "hoangha-project",
     "proj_fvkY21dJ0ripiOIA2jCC86f3": "namvuong-project",
     "proj_fEboQnaVm4tQCk8kFy0h8s08": "khonlanh-project",
     "proj_zRWDq4YWIDEkxbgMAjX0xy79": "phongnguyen-project",
     "proj_J4rNEXilII2l889OotmE7YNW": "ngjabach-project",
     "proj_OWrxxJaWk5MXHBi3HIdPxBDh": "oduong-project",
-    "proj_C51oeo4LjmiQefinVfoI8Rs0": "duyanh-project",
-    "proj_cEHeqXeLfsJ6jrQhOXDlt9wH": "minhphung-project",
-    "proj_wmeni3BelwvPUahovs5wQy3i": "kong-project",
-    "proj_E8F4KEaZSMfBuaPhE3Y69BzM": "ngocvo-project",
-    "proj_MIieWaC8hSsgAp4rSaN86BEp": "tubel-project",
     "proj_bUTBrctRsITbimsCqGg3VuJR": "giaotien-project",
 }, "lab3": {
     "proj_zo1iaAChFX81OMGwxRStD76g": "Default project",
+    "proj_rGMhWD0VsEuP0NGWFu16kPkC": "phongnguyen-project",
+    "proj_IrYMgtMY6ZuaZ0vsCKXWSc0b": "haianh-project",
+    "proj_GXgcGPGKn1Xe9Qp1rSRPRLOW": "duyduc-project",
 }}
 
 
@@ -451,6 +450,7 @@ class Org:
     def __init__(self, spec: dict, key: str, seed: dict):
         self.id, self.label, self.key = spec["id"], spec["label"], key
         self.short = self.label.replace("Business AI ", "")          # "Lab 2"
+        self.tier  = spec.get("tier", "")                            # OpenAI's tier name
         self.normal_cap, self.premium_cap = spec["free"]
         self.normal_ceiling, self.premium_ceiling = spec.get("ceiling", spec["free"])
         self.normal_threshold  = int(self.normal_ceiling  * (1 - NORMAL_SEAL_REMAINING_PCT))
@@ -532,8 +532,10 @@ OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 # SOURCE OF TRUTH — re-check when OpenAI updates the offer:
 #   https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai
 #   (section: "What models are included in this offer?")
-# Last synced: 2026-09-22 (verified against a fresh pull of the article — no
-# model added, removed, or moved between groups since 2026-08-21).
+# Last synced: 2026-10-27 (Bach pasted the section; the article blocks scripted
+# fetches with Cloudflare). Added to the 1M group: gpt-6.1-sol, gpt-6-astra,
+# gpt-6-sol, gpt-6-luna — note gpt-6-luna is 1M-group while gpt-5.6-luna is
+# 10M-group. The 10M group is unchanged; o3-mini is still not listed.
 #
 # OpenAI lists DATED SNAPSHOTS (e.g. "gpt-5.4-2026-03-05"). We store the BASE
 # name; _is_listed_variant accepts the exact name or base + a -YYYY-MM-DD
@@ -542,11 +544,14 @@ OPENAI_USAGE_URL = "https://api.openai.com/v1/organization/usage/completions"
 # unlisted. Quota is SHARED across each group. Excluded by OpenAI regardless of
 # name: fine-tuned models, fine-tuning training, evals, and tool use.
 #
-# NOTE ON TIERS: the groups are 1M / 10M for usage tier 3+, but only
-# 250K / 2.5M for tiers 1-2 — set per org in ORG_SPECS (Lab 2 is tier 3+,
-# Lab 3 is tier 1-2). The model lists below are the same for every org.
+# OpenAI's names (used in everything the bot shows — see GROUP_NAMES): the
+# "1M token group" and the "10M token group", sized for the Launch and Grow
+# tiers; Build-tier orgs get 250K / 2.5M. Set per org in ORG_SPECS (Lab 2 is
+# Launch/Grow, Lab 3 is Build). The model lists are the same for every org.
+# In code the groups keep their original track ids: "premium" = 1M group,
+# "normal" = 10M group (state files, events and button data use them).
 #
-# Normal-band models share the org's normal allowance:
+# 10M token group ("normal" track):
 NORMAL_MODEL_PREFIXES = (
     "gpt-5.6-terra", "gpt-5.6-luna",
     "gpt-5.4-mini", "gpt-5.4-nano",
@@ -558,8 +563,9 @@ NORMAL_MODEL_PREFIXES = (
     "o1-mini",
     "codex-mini-latest",
 )
-# Premium-band models share the org's premium allowance:
+# 1M token group ("premium" track):
 PREMIUM_MODEL_PREFIXES = (
+    "gpt-6.1-sol", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.5",
     "gpt-5.4", "gpt-5.2",
@@ -571,6 +577,20 @@ PREMIUM_MODEL_PREFIXES = (
     "o3",
     "o1-preview", "o1",
 )
+
+# User-facing names of the tracks — OpenAI's own terms.
+GROUP_NAMES = {"premium": "1M group", "normal": "10M group"}
+
+
+def _group(track: str) -> str:
+    """OpenAI's name for a track ("1M group" / "10M group"); "quarantine" for
+    the full-seal pseudo-track."""
+    return GROUP_NAMES.get(track, "quarantine")
+
+
+def _mode_label(mode: str) -> str:
+    """An archive mode as shown to users."""
+    return "both groups" if mode == "both" else _group(mode)
 
 # ── Terminal colors (ANSI) ──────────────────────────────────────────────────
 _C_GREEN  = "\033[32m"
@@ -1909,16 +1929,27 @@ def _split_lines(text: str, limit: int) -> list[str]:
 
 
 def _send(text: str, chat_id: str = None, thread_id: int = None,
-          keyboard: list = None) -> None:
+          keyboard: list = None, silent: bool = False) -> Optional[int]:
     """Send `text`, split into several messages if it exceeds Telegram's limit;
-    the keyboard rides on the last part."""
+    the keyboard rides on the last part. Returns the last part's message id
+    (None if it failed). `silent` = Telegram's disable_notification: the
+    message arrives without a sound."""
     parts = _split_message(text)
+    mid = None
     for i, part in enumerate(parts):
-        _send_one(part, chat_id, thread_id, keyboard if i == len(parts) - 1 else None)
+        mid = _send_one(part, chat_id, thread_id, keyboard if i == len(parts) - 1 else None, silent)
+    return mid
+
+
+def _message_id(r) -> Optional[int]:
+    try:
+        return r.json().get("result", {}).get("message_id")
+    except Exception:
+        return None
 
 
 def _send_one(text: str, chat_id: str = None, thread_id: int = None,
-              keyboard: list = None) -> None:
+              keyboard: list = None, silent: bool = False) -> Optional[int]:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     target_chat = str(chat_id or CHAT_ID)
     payload = {"chat_id": target_chat, "text": text, "parse_mode": "HTML"}
@@ -1926,6 +1957,8 @@ def _send_one(text: str, chat_id: str = None, thread_id: int = None,
         payload["message_thread_id"] = thread_id
     if keyboard is not None:
         payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
+    if silent:
+        payload["disable_notification"] = "true"
     try:
         r = _telegram_call(
             "post",
@@ -1934,7 +1967,7 @@ def _send_one(text: str, chat_id: str = None, thread_id: int = None,
             timeout=REQUEST_TIMEOUT,
         )
         if r.ok:
-            return
+            return _message_id(r)
         # Group upgraded to supergroup: the old chat id is permanently dead and
         # Telegram hands us the replacement. Update the stores and re-send once,
         # so alerts don't silently 400 forever (observed live on 2026-08-13).
@@ -1956,16 +1989,19 @@ def _send_one(text: str, chat_id: str = None, thread_id: int = None,
             r2 = _telegram_call("post", url, data=payload, timeout=REQUEST_TIMEOUT)
             if not r2.ok:
                 print(f"[telegram send retry {r2.status_code}] chat={new_id} | {r2.text[:300]}")
-            return
+                return None
+            return _message_id(r2)
         print(f"[telegram send {r.status_code}] chat={target_chat} | {r.text[:400]}")
     except Exception as e:
         print(f"[telegram send network error] {e}")
+    return None
 
 
 def _edit_message(text: str, chat_id: str, message_id: int,
-                  keyboard: list = None) -> None:
-    """Edit an existing message's text + inline keyboard (used by button flows).
-    Pass keyboard=[] to strip buttons, None to leave them unchanged."""
+                  keyboard: list = None) -> bool:
+    """Edit an existing message's text + inline keyboard (button flows, and
+    alerts updated in place). Pass keyboard=[] to strip buttons, None to leave
+    them unchanged. True if the message now shows `text`."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
     payload = {"chat_id": chat_id, "message_id": message_id,
                "text": text, "parse_mode": "HTML"}
@@ -1973,10 +2009,12 @@ def _edit_message(text: str, chat_id: str, message_id: int,
         payload["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
     try:
         r = _telegram_call("post", url, data=payload, timeout=REQUEST_TIMEOUT)
-        if not r.ok and "message is not modified" not in r.text:
-            print(f"[telegram edit {r.status_code}] chat={chat_id} | {r.text[:300]}")
+        if r.ok or "message is not modified" in r.text:
+            return True
+        print(f"[telegram edit {r.status_code}] chat={chat_id} | {r.text[:300]}")
     except Exception as e:
         print(f"[telegram edit network error] {e}")
+    return False
 
 
 def _answer_callback(callback_id: str, text: str = None) -> None:
@@ -1999,25 +2037,71 @@ def _org_header(org: Optional[Org]) -> str:
     return f"🏢 <b>{org.label}</b>\n" if org is not None and len(ORGS) > 1 else ""
 
 
+def _org_section(org: Optional[Org]) -> str:
+    """'🏢 Lab 3 · Build tier' — heads one org's part of a command reply."""
+    if org is None or len(ORGS) < 2:
+        return ""
+    tier = f" · {org.tier} tier" if org.tier == "Build" else ""
+    return f"🏢 <b>{org.short}</b>{tier}\n"
+
+
+def _fmt_day(date: str) -> str:
+    """'2026-10-27' → '27 Oct'."""
+    try:
+        return datetime.strptime(date, "%Y-%m-%d").strftime("%d %b").lstrip("0")
+    except (TypeError, ValueError):
+        return str(date)
+
+
+def _org_tag(org: Optional[Org]) -> str:
+    """'Lab 2 · ' — the org named inline in a one-line alert (empty with one org)."""
+    return f"{org.short} · " if org is not None and len(ORGS) > 1 else ""
+
+
 def _broadcast(fmt_fn, subs: SubscriberStore, names: NameStore = None, *,
-               org: Optional[Org]) -> None:
-    """Send a personalised message to every subscriber.
+               org: Optional[Org], header: bool = True, silent: bool = False) -> dict:
+    """Send a personalised message to every subscriber; returns {chat_id:
+    message_id} so the message can be updated in place (_broadcast_edit).
     `fmt_fn` is a one-arg function: it receives the chat's registered display name
     (or "Bach" when no NameStore is wired) and returns the rendered HTML to send.
-    `org` is REQUIRED (None only for org-less messages): it prefixes the org
-    header and tags the log entry, so an alert can never go out unattributed.
+    `org` is REQUIRED (None only for org-less messages): it tags the log entry
+    and, with `header`, prefixes the org header line — alerts that name the org
+    inline (_org_tag) pass header=False. `silent` sends without a sound (calm
+    milestones and spend notes; seals, used-up quotas and alarms still ring).
 
     Every broadcast is also mirrored to the local intel log (one entry per
     broadcast, canonical "Bach" rendering) — Telegram is no longer the only
     place push alerts exist."""
-    head = _org_header(org)
+    head = _org_header(org) if header else ""
     try:
-        _log_event("broadcast", **({"org": org.id} if org else {}), text=head + fmt_fn("Bach"))
+        _log_event("broadcast", **({"org": org.id} if org else {}), text=head + fmt_fn("Bach"),
+                   **({"silent": True} if silent else {}))
+    except Exception as e:
+        print(f"[intel-log render error] {e}")
+    sent = {}
+    for cid in subs.all():
+        name = names.get(cid) if names is not None else "Bach"
+        sent[cid] = _send(head + fmt_fn(name), cid, silent=silent)
+    return sent
+
+
+def _broadcast_edit(handle: dict, fmt_fn, subs: SubscriberStore, names: NameStore = None, *,
+                    org: Optional[Org], header: bool = True) -> None:
+    """Rewrite an earlier broadcast in place — same chats, same messages, no new
+    ping (a seal's "sealing…" becoming "sealed", a running alarm's tally). A chat
+    whose message can't be edited (the send had failed, or the edit fails) gets
+    the text as a new silent message instead, so nothing is lost."""
+    head = _org_header(org) if header else ""
+    try:
+        _log_event("broadcast_edit", **({"org": org.id} if org else {}), text=head + fmt_fn("Bach"))
     except Exception as e:
         print(f"[intel-log render error] {e}")
     for cid in subs.all():
         name = names.get(cid) if names is not None else "Bach"
-        _send(head + fmt_fn(name), cid)
+        text = head + fmt_fn(name)
+        mid = (handle or {}).get(cid)
+        if mid is None or not _edit_message(text, cid, mid):
+            _send(text, cid, silent=True)
 
 
 def _get_updates(offset: int) -> list[dict]:
@@ -2117,18 +2201,36 @@ def _fmt_cost(usd: Optional[float]) -> str:
 
 
 def _fmt_lane_lines(premium_tok: int, normal_tok: int, lane_costs: Optional[dict],
-                    org: Org, indent: str = "   ") -> list:
-    """The three lane lines shared by every report. Free-tier lanes show tokens
-    against their allowance plus billed cost (which stays 0.00$ until the
-    allowance is exhausted). Exotic has no allowance to count against, so it
-    shows cost only."""
+                    org: Org, indent: str = "") -> list:
+    """The three lane lines shared by every report: each free-token group against
+    its quota with its billed cost (0.00$ until the quota is used up), then the
+    exotic lane (cost only — it has no quota)."""
     lc = lane_costs or {}
-    pc, nc = _fmt_cap(org.premium_cap), _fmt_cap(org.normal_cap)
+
+    def _group_line(icon: str, track: str, used: int) -> str:
+        cap  = org.cap(track)
+        pct  = f" ({used / cap * 100:.0f}%)" if used and cap else ""
+        seal = (f" · seals at {_fmt_tokens(org.threshold(track))}"
+                if org.pays_past_free(track) and used > cap else "")
+        return (f"{indent}{icon} {_group(track)}: <b>{_fmt_tokens(used)}</b> / {_fmt_cap(cap)}"
+                f"{pct} · {_fmt_cost(lc.get(track))}{seal}")
     return [
-        f"{indent}⭐ Premium ({pc}): <b>{_fmt_tokens(premium_tok)}</b> / {pc}. Cost: {_fmt_cost(lc.get('premium'))}",
-        f"{indent}📦 Normal ({nc}): <b>{_fmt_tokens(normal_tok)}</b> / {nc}. Cost: {_fmt_cost(lc.get('normal'))}",
+        _group_line("⭐", "premium", premium_tok),
+        _group_line("📦", "normal", normal_tok),
         f"{indent}🧪 Exotic: <b>{_fmt_cost(lc.get('exotic'))}</b>",
     ]
+
+
+def _meter(frac: float, n: int = 10) -> str:
+    """'▰▰▰▱▱▱▱▱▱▱' — a text gauge for one-line alerts; '+' past full. Rounds
+    down, so a full bar always means the whole quota (96% shows 9 of 10)."""
+    f = max(0, min(n, int(frac * n)))
+    return "▰" * f + "▱" * (n - f) + ("+" if frac > 1 else "")
+
+
+def _fmt_utc(ts: Optional[float] = None) -> str:
+    """'08:34 UTC' — times in alerts and reports are UTC, like the day boundary."""
+    return datetime.fromtimestamp(ts if ts is not None else time.time(), timezone.utc).strftime("%H:%M UTC")
 
 
 def _fmt_ts(ts: Optional[float]) -> str:
@@ -2144,68 +2246,31 @@ def _fmt_month(year: int, month: int) -> str:
 # ── Formatters — auto-messages ─────────────────────────────────────────────
 
 def _paid_note(track: str, org: Optional[Org]) -> str:
-    """Extra line for an allowance-exhausted alert in an org that pays past its
-    free allowance on purpose — billing starting there is the plan, not a leak."""
+    """Extra sentence for a used-up alert in an org that pays past its free
+    allowance on purpose — billing starting there is the plan, not a leak."""
     if org is None or not org.pays_past_free(track):
         return ""
     return (f"\nBy design this org keeps running on paid usage until the "
-            f"{_fmt_tokens(org.threshold(track))} seal point.\n")
+            f"{_fmt_tokens(org.threshold(track))} seal point.")
 
 
-def fmt_token_milestone(threshold: int, current: int, level: str, name: str = "Bach",
-                        org: Optional[Org] = None) -> str:
-    t = _fmt_tokens(threshold)
-    c = _fmt_tokens(current)
-    if level == "casual":
+def fmt_group_milestone(track: str, threshold: int, current: int, level: str, org: Org,
+                        name: str = "Bach") -> str:
+    """Token milestone for one group: two lines with a gauge for the calm and
+    urgent steps, a short alarm when the free tokens are used up."""
+    cap, band = org.cap(track), _group(track)
+    of = "" if band.startswith(_fmt_cap(cap) + " ") else f" of {_fmt_cap(cap)}"
+    if level == "cap":
         return (
-            f"📊 <b>Token Threshold Reached — {t}</b>\n\n"
-            f"Daily consumption stands at <b>{c} tokens</b>.\n"
-            f"Operations remain within acceptable parameters.\n"
-            f"<i>Monitoring continues, Monarch {name}.</i>"
+            f"🚨 <b>{_org_tag(org)}{band} free tokens used up</b> at {_fmt_tokens(current)}\n"
+            f"{band} models now bill at standard rates.{_paid_note(track, org)}\n"
+            f"<i>Your oversight is required, Monarch {name}.</i>"
         )
-    if level == "urgent":
-        return (
-            f"⚠️ <b>High Token Consumption — {t}</b>\n\n"
-            f"Daily usage has reached <b>{c} tokens</b>.\n"
-            f"Expenditure is approaching critical thresholds.\n"
-            f"Your attention is advised, My Liege {name}."
-        )
-    # cap
+    icon = "⚠️" if level == "urgent" else "📊"
     return (
-        f"🚨 <b>Normal Models Allowance Exhausted — {c}</b>\n\n"
-        f"The {t}-token daily allowance for normal models has been crossed.\n"
-        f"Mini models (gpt-4o-mini, o1-mini, o3-mini, etc.) are now billing at standard rates.\n"
-        f"{_paid_note('normal', org)}\n"
-        f"Monarch {name}, the operation requires your oversight."
-    )
-
-
-def fmt_premium_token_milestone(threshold: int, current: int, level: str, org: Org,
-                                name: str = "Bach") -> str:
-    t = _fmt_tokens(threshold)
-    c = _fmt_tokens(current)
-    cap = _fmt_cap(org.premium_cap)
-    if level == "casual":
-        return (
-            f"📊 <b>Premium Token Threshold — {t}</b>\n\n"
-            f"Full-size model consumption stands at <b>{c} tokens</b>.\n"
-            f"Premium models daily allowance: {cap}/day (gpt-4o, gpt-4.1, o1, o3, etc.)\n"
-            f"<i>Monitoring continues, Monarch {name}.</i>"
-        )
-    if level == "urgent":
-        return (
-            f"⚠️ <b>Premium Model — High Usage — {t}</b>\n\n"
-            f"Full-size model usage has reached <b>{c} tokens</b>.\n"
-            f"Approaching the {cap} daily free allowance for premium models.\n"
-            f"Your attention is advised, My Liege {name}."
-        )
-    # cap
-    return (
-        f"🚨 <b>Premium Free Allowance Exhausted — {c}</b>\n\n"
-        f"The {t}-token daily allowance for premium models has been crossed.\n"
-        f"Premium models (gpt-4o, gpt-4.1, o1, o3, etc.) are now billing at standard rates.\n"
-        f"{_paid_note('premium', org)}\n"
-        f"Monarch {name}, the operation requires your oversight."
+        f"{icon} <b>{_org_tag(org)}{band}</b> {_fmt_tokens(current)}\n"
+        f"{_meter(current / cap if cap else 0)} {current / cap * 100 if cap else 0:.0f}%{of} · "
+        f"seals at {_fmt_tokens(org.threshold(track))}"
     )
 
 
@@ -2223,48 +2288,74 @@ def fmt_concurrency_alert(active: dict, org: Org, name: str = "Bach") -> str:
 
 
 def fmt_overcap_active_alert(banded_active: dict, normal_exceeded: bool, premium_exceeded: bool,
-                             org: Org, name: str = "Bach") -> str:
-    """Render the red-tone overcap alert. `banded_active` maps pid → {"normal": int, "premium": int}
-    and contains only projects with usage on at least one exceeded band."""
+                             org: Org, name: str = "Bach", exempt: frozenset = frozenset(),
+                             since: float = None, polls: int = 1) -> str:
+    """Over-budget alarm: projects still using a group past its limit.
+    `banded_active` maps pid → {"normal": reqs, "premium": reqs} (exceeded groups
+    only). `exempt` = projects unsealed by hand today: paying on purpose, so a
+    calmer orange note instead of the red alarm. The message is updated in place
+    for the rest of the incident (see _handle_overcap)."""
+    tracks = [t for t, on in (("normal", normal_exceeded), ("premium", premium_exceeded)) if on]
+
     def _limit_label(track: str) -> str:
         if org.pays_past_free(track):
-            return f"{track.title()} daily ceiling ({_fmt_cap(org.ceiling(track))})"
-        return f"{_band_label(track, org)} free-tier allowance"
+            return f"{_group(track)} daily ceiling ({_fmt_cap(org.ceiling(track))})"
+        return f"{_band_label(track, org)} free quota"
 
-    bands = []
-    if normal_exceeded:
-        bands.append(_limit_label("normal"))
-    if premium_exceeded:
-        bands.append(_limit_label("premium"))
-    band_str = " & ".join(bands)
-
-    def _illegal_reqs(b: dict) -> int:
-        r = 0
-        if normal_exceeded:  r += b.get("normal", 0)
-        if premium_exceeded: r += b.get("premium", 0)
-        return r
-
-    lines = [
-        "🔴 <b>‼️ BUDGET BREACHED — ILLEGAL ACTIVITY DETECTED ‼️</b>\n",
-        f"The <b>{band_str}</b> is <b>exhausted</b>.",
-        "These projects are <b>still burning the exhausted band</b> — every request now bills:\n",
-    ]
-    for pid, b in sorted(banded_active.items(), key=lambda x: _illegal_reqs(x[1]), reverse=True):
-        proj_name = org.projects.get(pid, pid)
-        parts = []
-        if normal_exceeded and b.get("normal", 0) > 0:
-            parts.append(f"{b['normal']:,} normal")
-        if premium_exceeded and b.get("premium", 0) > 0:
-            parts.append(f"{b['premium']:,} premium")
-        detail = " + ".join(parts)
-        lines.append(f"🚨 <b>{proj_name}</b>  —  {detail} reqs in the last {OVERCAP_WINDOW_MINS} min")
-    lines.append("\n<b>HALT ALL NON-ESSENTIAL OPERATIONS IMMEDIATELY.</b>")
-    lines.append(f"<i>(Activity window: last {OVERCAP_WINDOW_MINS} min — accounts for API ingestion lag)</i>")
-    lines.append(f"<i>Monarch {name} — the treasury is bleeding. Your command is required at once.</i>")
+    band_str = " & ".join(_limit_label(t) for t in tracks)
+    calm = all(pid in exempt for pid in banded_active)
+    head = (f"🟠 <b>Paid use</b> · {_org_tag(org)}past the {band_str}" if calm
+            else f"🔴 <b>{_org_tag(org)}billing past the {band_str}</b>")
+    lines = [head]
+    for pid, b in sorted(banded_active.items(), key=lambda x: -sum(x[1].get(t, 0) for t in tracks)):
+        reqs = sum(b.get(t, 0) for t in tracks)
+        why  = "unsealed by hand today" if pid in exempt else "still running after its seal"
+        lines.append(f"<b>{org.projects.get(pid, pid)}</b> — {reqs:,} requests in {OVERCAP_WINDOW_MINS} min · {why}")
+    if not calm:
+        lines.append(f"Seal it: {_archive_hint(org, 'Seal', _group(tracks[0]))}")
+        lines.append(f"<i>Your command is required, Monarch {name}.</i>")
+    lines.append(
+        f"<blockquote expandable>Watching since {_fmt_utc(since)}, checked {_fmt_utc()} "
+        f"({polls} poll{'s' if polls != 1 else ''}). This message updates in place; a new alert "
+        f"comes only if another project starts billing, or every {OVERCAP_REPING_SECS // 60} min "
+        f"while it continues. Requests count over the last {OVERCAP_WINDOW_MINS} min — usage "
+        f"reaches the API 5–15 min late.</blockquote>")
     return "\n".join(lines)
 
 
 # ── Overcap handler ────────────────────────────────────────────────────────
+# One alarm per incident. It used to broadcast on every poll while a group was
+# over its limit: 85 alarms in 16 incidents (Sep–Oct 2026), 16 of them in 20 min
+# on 2026-09-29 for 3–4 requests from a project unsealed by hand. Now the first
+# poll sends, later polls edit that message, and a new (ringing) alert goes out
+# only when another project starts billing or every OVERCAP_REPING_SECS.
+OVERCAP_REPING_SECS = 15 * 60
+_OVERCAP_INCIDENT: dict[str, dict] = {}   # org id -> {date, handle, offenders, first, last_ping, polls}
+
+
+def _overcap_report(usage: "UsageStore", illegal: dict, normal_exceeded: bool,
+                    premium_exceeded: bool, subs, names) -> None:
+    org, now, day = usage.org, time.time(), today_str()
+    inc = _OVERCAP_INCIDENT.get(org.id)
+    if inc is not None and inc["date"] != day:
+        inc = None
+    tracks = [t for t, on in (("normal", normal_exceeded), ("premium", premium_exceeded)) if on]
+    exempt = frozenset(pid for pid in illegal if any(usage.is_exempt(pid, t) for t in tracks))
+    first  = inc["first"] if inc else now
+    polls  = inc["polls"] + 1 if inc else 1
+    fmt = (lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded, ex=exempt, f=first, pc=polls:
+           fmt_overcap_active_alert(r, ne, pe, org, n, exempt=ex, since=f, polls=pc))
+    newcomers = set(illegal) - (inc["offenders"] if inc else set())
+    if inc is None or newcomers or now - inc["last_ping"] >= OVERCAP_REPING_SECS:
+        handle = _broadcast(fmt, subs, names, org=org, header=False)
+        _OVERCAP_INCIDENT[org.id] = {"date": day, "handle": handle, "first": first, "last_ping": now,
+                                     "polls": polls, "offenders": set(illegal) | (inc["offenders"] if inc else set())}
+    else:
+        inc["polls"] = polls
+        inc["offenders"] |= set(illegal)
+        _broadcast_edit(inc["handle"], fmt, subs, names, org=org, header=False)
+
+
 
 def _handle_overcap(usage: UsageStore, subs: SubscriberStore, names: NameStore,
                     normal_exceeded: bool, premium_exceeded: bool) -> None:
@@ -2297,9 +2388,10 @@ def _handle_overcap(usage: UsageStore, subs: SubscriberStore, names: NameStore,
         if mode != "aggressive":
             usage.set_mode("aggressive")
             print(f"[mode] → AGGRESSIVE ({len(illegal)} project(s) burning the exhausted band)")
-        _broadcast(lambda n, r=illegal, ne=normal_exceeded, pe=premium_exceeded, o=usage.org:
-            fmt_overcap_active_alert(r, ne, pe, o, n), subs, names, org=usage.org)
-    elif mode == "aggressive":
+        _overcap_report(usage, illegal, normal_exceeded, premium_exceeded, subs, names)
+        return
+    _OVERCAP_INCIDENT.pop(usage.org.id, None)   # quiet poll: the next activity is a new incident
+    if mode == "aggressive":
         last_ts = usage.get_last_illegal_seen_ts()
         if last_ts and time.time() - last_ts > AGGRESSIVE_REVERT_SECS:
             usage.set_mode("passive")
@@ -2592,9 +2684,11 @@ def _mass_seal_track(track: str, usage: UsageStore, subs: SubscriberStore,
         futs = {ex.submit(_in_org, org, _throttle_track_for_project, pid, track, usage): pid
                 for pid in todo}
         # Announce once the workers are already POSTing — the Telegram send
-        # (retries included) used to sit in front of the first seal.
-        _broadcast(lambda n, t=track, c=consumed, cp=cap:
-            fmt_seal_batch_begin(t, c, cp, org, n, manual=manual), subs, names, org=org)
+        # (retries included) used to sit in front of the first seal. The same
+        # message is edited to "sealed" at the end (was two messages).
+        t0 = time.time()
+        handle = _broadcast(lambda n, t=track, c=consumed, cp=cap:
+            fmt_seal_batch_begin(t, c, cp, org, n, manual=manual), subs, names, org=org, header=False)
         for fut in as_completed(futs):
             pid = futs[fut]
             try:
@@ -2619,8 +2713,10 @@ def _mass_seal_track(track: str, usage: UsageStore, subs: SubscriberStore,
                throttled=[org.projects.get(p, p) for p in throttled],
                exempt=[org.projects.get(p, p) for p in exempt],
                failed=[org.projects.get(p, p) for p in failed])
-    _broadcast(lambda n, t=track, th=len(throttled), ex=len(exempt),
-        f=len(failed): fmt_seal_batch_done(t, th, ex, f, org, n), subs, names, org=org)
+    _broadcast_edit(handle, lambda n, t=track, th=len(throttled), ex=len(exempt), f=len(failed),
+                    c=consumed, sec=int(time.time() - t0):
+                    fmt_seal_batch_done(t, th, ex, f, org, n, consumed=c, secs=sec),
+                    subs, names, org=org, header=False)
 
 
 def _in_org(org: Org, fn, *args):
@@ -2658,7 +2754,9 @@ def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
     pids   = list(sealed.keys())
     if not pids:
         return
-    _broadcast(lambda n, t=track: fmt_unseal_batch_begin(t, n), subs, names, org=usage.org)
+    t0, band = time.time(), _group(track)
+    handle = _broadcast(lambda n, b=band: fmt_unseal_batch_begin(b, n, usage.org), subs, names,
+                        org=usage.org, header=False)
 
     baseline = _compute_canonical_baseline(usage)
 
@@ -2673,8 +2771,9 @@ def _mass_unseal_track(track: str, usage: UsageStore, subs: SubscriberStore,
     failed   = sum(1 for r in results.values() if r == "failed")
     print(f"[mass-unseal] {track} → restored={restored} failed={failed} ({reason})")
     _log_event("mass_unseal", track=track, restored=restored, failed=failed, reason=reason)
-    _broadcast(lambda n, t=track, r=restored, f=failed:
-        fmt_unseal_batch_done(t, r, f, n), subs, names, org=usage.org)
+    _broadcast_edit(handle, lambda n, b=band, r=restored, f=failed, sec=int(time.time() - t0):
+                    fmt_unseal_batch_done(b, r, f, n, usage.org, sec), subs, names,
+                    org=usage.org, header=False)
 
 
 # ── Single-project manual seal / unseal (button-driven) ────────────────────
@@ -2909,11 +3008,13 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
         print("[pending-track-unseal] deferred — another seal/unseal in progress")
         return
     try:
-        tracks_str = " & ".join(sorted(jobs))
+        tracks_str = " & ".join(_group(t) for t in sorted(jobs))
         first_pass = (org.id, day) not in _PENDING_ANNOUNCED
+        handle, t0 = None, time.time()
         if first_pass:
             _PENDING_ANNOUNCED.add((org.id, day))
-            _broadcast(lambda n, t=tracks_str: fmt_unseal_batch_begin(t, n), subs, names, org=org)
+            handle = _broadcast(lambda n, t=tracks_str: fmt_unseal_batch_begin(t, n, org, midnight=True),
+                                subs, names, org=org, header=False)
 
         baseline = _compute_canonical_baseline(usage)
         restored, failed_p, stuck = 0, 0, []
@@ -2939,16 +3040,19 @@ def _process_pending_track_unseals(usage: UsageStore, subs: SubscriberStore,
                     _PENDING_RETRY[(track, pid)] = (
                         attempts, time.time() + min(60 * 2 ** attempts, PENDING_RETRY_MAX_SECS), day)
                     if attempts == PENDING_RETRY_ALERT_AFTER:
-                        stuck.append(f"{org.projects.get(pid, pid)} ({track})")
+                        stuck.append(f"{org.projects.get(pid, pid)} ({_group(track)})")
                     failed_p += 1
                 else:
                     _PENDING_RETRY.pop((track, pid), None)
                     restored += 1
 
         _log_event("pending_unseal", tracks=tracks_str, restored=restored, failed=failed_p)
-        if first_pass or restored:
-            _broadcast(lambda n, r=restored, f=failed_p, t=tracks_str:
-                fmt_unseal_batch_done(t, r, f, n), subs, names, org=org)
+        done = (lambda n, r=restored, f=failed_p, t=tracks_str, sec=int(time.time() - t0):
+                fmt_unseal_batch_done(t, r, f, n, org, sec))
+        if handle is not None:
+            _broadcast_edit(handle, done, subs, names, org=org, header=False)
+        elif restored:   # a later retry that worked
+            _broadcast(done, subs, names, org=org, header=False)
         if stuck:
             _log_event("pending_unseal_stuck", projects=stuck)
             _broadcast(lambda n, s=stuck: fmt_restore_stuck(s, n), subs, names, org=org)
@@ -2970,16 +3074,17 @@ def fmt_restore_stuck(labels: list, name: str = "Bach") -> str:
 # ── Formatters — seal/unseal alerts ────────────────────────────────────────
 
 def _band_label(track: str, org: Org) -> str:
-    if track == "normal":
-        return f"Normal ({_fmt_cap(org.normal_cap)})"
-    if track == "premium":
-        return f"Premium ({_fmt_cap(org.premium_cap)})"
+    """'1M group', or '1M group (250K)' for an org whose free quota isn't the
+    group's namesake size (Build tier)."""
+    if track in GROUP_NAMES:
+        name, cap = _group(track), _fmt_cap(org.cap(track))
+        return name if name.startswith(cap + " ") else f"{name} ({cap})"
     return "Quarantine (all models)"   # QUARANTINE_TRACK
 
 
 def _archive_hint(org: Org, action: str, track_label: str) -> str:
     """Button path for the archive menu, e.g. "/archive → Unseal → Lab 3 →
-    Normal → project" (the org step exists only with more than one org)."""
+    10M group → project" (the org step exists only with more than one org)."""
     org_step = f" → {org.short}" if len(ORGS) > 1 else ""
     return f"/archive → {action}{org_step} → {track_label} → project"
 
@@ -3002,49 +3107,48 @@ def fmt_manual_unseal(proj_name: str, track: str, org: Org, name: str = "Bach") 
 
 def fmt_seal_batch_begin(track: str, consumed: int, cap: int, org: Org,
                          name: str = "Bach", manual: bool = False) -> str:
-    """`cap` is the track's enforcement ceiling. An org that pays past its free
-    allowance reports tokens, not a percentage of the allowance ("hit 320%")."""
-    pct  = consumed / cap * 100 if cap else 100
-    band = _band_label(track, org)
-    level = (f"at {_fmt_tokens(consumed)} (seal point {_fmt_tokens(org.threshold(track))})"
-             if org.pays_past_free(track) else f"at {pct:.0f}%")
-    if manual:   # a button press, not a threshold crossing — don't claim "hit 100%"
-        return (
-            f"🛑 <b>Manual seal — {band} {level} — sealing all projects…</b>\n"
-            f"<i>Throttling {track}-band rate limits to 0 on your order. Stand by, Monarch {name}.</i>"
-        )
-    return (
-        f"🛑 <b>{band} {level.replace('at ', 'hit ', 1)} — begin sealing all projects…</b>\n"
-        f"<i>Throttling {track}-band rate limits to 0. Stand by, Monarch {name}.</i>"
-    )
+    """First state of a seal message (edited to fmt_seal_batch_done when the
+    sweep finishes). `cap` is the group's enforcement ceiling."""
+    why = "on your order" if manual else f"(seal point {_fmt_tokens(org.threshold(track))})"
+    return (f"🛑 <b>{_org_tag(org)}sealing the {_group(track)}</b> at {_fmt_tokens(consumed)} {why}…\n"
+            f"<i>Throttling its rate limits to 0. Stand by, Monarch {name}.</i>")
 
 
 def fmt_seal_batch_done(track: str, throttled: int, exempt: int, failed: int,
-                        org: Org, name: str = "Bach") -> str:
-    band = _band_label(track, org)
-    tail = f"  ({exempt} exempt)" if exempt else ""
-    warn = f"  ⚠️ {failed} failed" if failed else ""
+                        org: Org, name: str = "Bach", consumed: int = None,
+                        secs: int = None) -> str:
+    """Final state of a seal message: the gauge against the group's ceiling, the
+    count, and the details folded (Telegram's expandable quote)."""
+    cap  = org.ceiling(track)
+    head = f"🔒 <b>{_org_tag(org)}{_group(track)} sealed</b> · {_fmt_utc()}"
+    if consumed is not None and cap:
+        head += f"\n{_meter(consumed / cap)} {consumed / cap * 100:.0f}% of {_fmt_cap(cap)}"
+    took = f" · {secs} s" if secs is not None else ""
+    tail = f", {exempt} exempt" if exempt else ""
+    warn = f" · ⚠️ {failed} failed (retrying)" if failed else ""
+    started = f"Sealed at {_fmt_tokens(consumed)}. " if consumed is not None else ""
     return (
-        f"🔒 <b>Done sealing {band}.</b> {throttled} project(s) throttled{tail}{warn}.\n"
-        f"<i>Auto-restore at UTC midnight. Exempt one: "
-        f"{_archive_hint(org, 'Unseal', track.title())}.</i>"
+        f"{head}\n{throttled} project(s) throttled{tail}{warn}{took}\n"
+        f"<blockquote expandable>{started}Auto-restore at 00:00 UTC. Exempt one: "
+        f"{_archive_hint(org, 'Unseal', _group(track))}.</blockquote>"
     )
 
 
-def fmt_unseal_batch_begin(tracks_str: str, name: str = "Bach") -> str:
-    return (
-        f"🔓 <b>Begin unsealing ({tracks_str})…</b>\n"
-        f"<i>Restoring rate limits across all projects. Stand by, Monarch {name}.</i>"
-    )
+def fmt_unseal_batch_begin(tracks_str: str, name: str = "Bach", org: Optional[Org] = None,
+                           midnight: bool = False) -> str:
+    """First state of a restore message (edited to fmt_unseal_batch_done)."""
+    if midnight:
+        return f"🌅 <b>{_org_tag(org)}new day — restoring yesterday's seals</b> ({tracks_str})…"
+    return f"🔓 <b>{_org_tag(org)}restoring the {tracks_str}</b>…"
 
 
 def fmt_unseal_batch_done(tracks_str: str, restored: int, failed: int,
-                          name: str = "Bach") -> str:
-    warn = f"  ⚠️ {failed} still pending (will retry)" if failed else ""
-    return (
-        f"✅ <b>Done unsealing ({tracks_str}).</b> {restored} project(s) restored{warn}.\n"
-        f"<i>Operations resume, Monarch {name}.</i>"
-    )
+                          name: str = "Bach", org: Optional[Org] = None, secs: int = None) -> str:
+    """Final state of a restore message."""
+    warn = f" · ⚠️ {failed} still pending (retrying)" if failed else ""
+    took = f" · {secs} s" if secs is not None else ""
+    return (f"✅ <b>{_org_tag(org)}{tracks_str} restored</b> · {restored} project(s){warn}{took}\n"
+            f"<i>Operations resume, Monarch {name}.</i>")
 
 
 # ── Formatters — command responses ─────────────────────────────────────────
@@ -3072,7 +3176,7 @@ def fmt_daily_snapshot(snap: dict, org: Org) -> str:
             reqs = p.get("num_requests", 0)
             lines.append(
                 f"🔹 <b>{p['name']}</b>\n"
-                f"   🔢 {tot}  ({inp} in / {out} out)  •  {reqs:,} reqs  •  <b>${cost:.4f}</b>"
+                f"   🔢 {tot}  ({inp} in / {out} out)  •  {reqs:,} reqs  •  <b>{_fmt_cost(cost)}</b>"
             )
             lines.append("")
 
@@ -3081,7 +3185,7 @@ def fmt_daily_snapshot(snap: dict, org: Org) -> str:
     cost_note     = f"  <i>(cost as of {_fmt_ts(snap.get('costs_ts'))})</i>" if snap.get("costs_stale") else ""
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     lines.append(
-        f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Cost: <b>${total_cost:.4f}</b> / ${org.daily_limit:.2f}{cost_note}"
+        f"🔢 Tokens: <b>{_fmt_tokens(total_tok)}</b>   💰 Spend: <b>{_fmt_cost(total_cost)}</b> of {_fmt_cost(org.daily_limit)}{cost_note}"
     )
     lines.extend(_fmt_lane_lines(total_premium, total_normal, snap.get("lane_costs"), org))
     return "\n".join(lines)
@@ -3091,144 +3195,110 @@ def fmt_daily_snapshot(snap: dict, org: Org) -> str:
 
 def seed_milestones(snap: dict, usage: UsageStore,
                     subs: "SubscriberStore" = None, names: "NameStore" = None) -> None:
-    """Fire only the highest already-crossed milestone per track on first poll of a day.
+    """Fire only the highest already-crossed milestone per group on first poll of a day.
     Race-safe: the atomic `seed_state` returns True only for the unique caller that
     actually flipped the flag, so concurrent /refresh + poll-loop calls broadcast at
     most once."""
-    total_normal  = snap.get("total_normal_tokens", 0)
-    total_premium = snap.get("total_premium_tokens", 0)
-
     org = usage.org
-    normal_crossed  = [(t, l) for t, l in org.normal_milestones  if total_normal  >= t]
-    premium_crossed = [(t, l) for t, l in org.premium_milestones if total_premium >= t]
-
+    crossed = {
+        "normal":  [(t, l) for t, l in org.normal_milestones  if snap.get("total_normal_tokens", 0)  >= t],
+        "premium": [(t, l) for t, l in org.premium_milestones if snap.get("total_premium_tokens", 0) >= t],
+    }
     # Atomic claim — only the winning caller gets True and broadcasts.
     if not usage.seed_state(
-        normal_thresholds  = [t for t, _ in normal_crossed],
-        premium_thresholds = [t for t, _ in premium_crossed],
+        normal_thresholds  = [t for t, _ in crossed["normal"]],
+        premium_thresholds = [t for t, _ in crossed["premium"]],
     ):
         return
-
-    if normal_crossed and subs:
-        t, l = normal_crossed[-1]   # highest crossed
-        _broadcast(lambda n, t=t, c=total_normal, l=l: fmt_token_milestone(t, c, l, n, org),
-                   subs, names, org=org)
-
-    if premium_crossed and subs:
-        t, l = premium_crossed[-1]
-        _broadcast(lambda n, t=t, c=total_premium, l=l: fmt_premium_token_milestone(t, c, l, org, n),
-                   subs, names, org=org)
+    for track, hits in crossed.items():
+        if hits and subs:
+            t, l = hits[-1]   # highest crossed
+            cur = snap.get(f"total_{track}_tokens", 0)
+            _broadcast(lambda n, tr=track, t=t, c=cur, l=l: fmt_group_milestone(tr, t, c, l, org, n),
+                       subs, names, org=org, header=False, silent=(l == "casual"))
 
 
-def fmt_spend_milestone(threshold: float, current: float, level: str, name: str = "Bach",
-                        limit: float = DAILY_LIMIT) -> str:
-    """Org-wide cumulative spend milestone; `limit` = that org's daily alarm."""
-    if level == "casual":
+def fmt_spend_update(total: float, level: str, projects: list, org: Org,
+                     name: str = "Bach") -> str:
+    """One spend message for everything crossed in a poll: the org's total
+    against its daily alarm, plus each project that crossed its own threshold
+    (`projects` = [(pid, threshold, cost)]). On 2026-10-04 the org alert and
+    khonlanh-project's alert were two messages about the same 0.26$."""
+    lim  = _fmt_cost(org.daily_limit)
+    proj = " · ".join(f"{_pname(pid)} {_fmt_cost(c)} (past {_fmt_cost(t)})" for pid, t, c in projects)
+    if level == "cap":
         return (
-            f"💰 <b>Spend Milestone — ${threshold:.2f}</b>\n\n"
-            f"Cumulative outlay today: <b>${current:.4f}</b> of ${limit:.2f}.\n"
-            f"<i>The treasury is monitored, Monarch {name}.</i>"
+            f"🚨 <b>{_org_tag(org)}spend {_fmt_cost(total)}</b> — past the {lim} daily alarm\n"
+            + (f"{proj}\n" if proj else "")
+            + "Polling sped up. Seals don't stop off-list models (embeddings, image, audio): "
+              "/archive, or stop them at the source.\n"
+            f"<i>Monarch {name}, the operation demands your command.</i>"
         )
-    if level == "urgent":
-        return (
-            f"⚠️ <b>Significant Spend — ${threshold:.2f}</b>\n\n"
-            f"Today's expenditure stands at <b>${current:.4f}</b> of ${limit:.2f}.\n"
-            f"The daily cap is approaching. Your attention is advised, My Liege {name}."
-        )
-    # cap (the org's daily limit)
-    return (
-        f"🚨 <b>Daily Spend Cap Breached — ${current:.4f}</b>\n\n"
-        f"The ${limit:.2f} daily expenditure cap has been crossed.\n"
-        f"Polling escalated to <b>AGGRESSIVE</b>. Use /archive to seal "
-        f"projects manually — note that unlisted models (embeddings, image, audio, etc.) "
-        f"bypass the seal logic and must be stopped at the source.\n\n"
-        f"Monarch {name}, the operation demands your command."
-    )
-
-
-def fmt_project_spend(pid: str, threshold: float, current: float, name: str = "Bach") -> str:
-    proj = _pname(pid)
-    return (
-        f"💸 <b>Project Spend — {proj}</b>\n\n"
-        f"<b>{proj}</b> has crossed <b>${threshold:.2f}</b> today (now ${current:.4f}).\n"
-        f"<i>Single-project anomaly threshold tripped. The wallet is watched, Monarch {name}.</i>"
-    )
+    icon = "⚠️" if level == "urgent" else "💵"
+    return f"{icon} <b>{_org_tag(org)}spend {_fmt_cost(total)}</b> of {lim} today" + (f"\n{proj}" if proj else "")
 
 
 def fmt_unlisted_model(pid: str, model: str, requests: int, tokens: int,
-                       cost: float, name: str = "Bach") -> str:
-    """Alert for first-touch of a model not in either free-tier watchlist.
-    These bill at standard rates from token 1 and are NOT throttled by the seal
-    logic. Embeddings, image gen, audio, fine-tuned models, gpt-3.5, etc."""
-    proj = _pname(pid)
-    cost_str = f"  •  <b>${cost:.4f}</b>" if cost > 0 else ""
+                       cost: float, name: str = "Bach", org: Optional[Org] = None,
+                       quarantine_follows: bool = True) -> str:
+    """First use today of a model outside OpenAI's free-token offer (embeddings,
+    image, audio, fine-tuned, gpt-3.5, …): billed from the first token and not
+    stopped by track seals."""
+    cost_str = f" · ~{_fmt_cost(cost)}" if cost > 0 else ""
+    then = ("The project is being quarantined." if quarantine_follows
+            else "Its quarantine was lifted today, so it keeps running.")
     return (
-        f"🟠 <b>Unlisted Model Activity — Off-Watchlist Spend</b>\n\n"
-        f"Project: <b>{proj}</b>\n"
-        f"Model:   <code>{html.escape(model)}</code>  (not on either free-tier list)\n"
-        f"Usage:   {requests:,} req  •  {_fmt_tokens(tokens)} tok{cost_str}\n\n"
-        f"This model bills at <b>standard rates from the first token</b>. "
-        f"The project will be <b>quarantined</b> — every rate limit throttled "
-        f"to 0 until UTC midnight.\n"
-        f"<i>One alert per (project, model) per day. Monarch {name}, the off-list "
-        f"ledger has shifted.</i>"
+        f"🟠 <b>{_org_tag(org)}{_pname(pid)} used an off-list model</b>\n"
+        f"<code>{html.escape(model)}</code> · {requests:,} req · {_fmt_tokens(tokens)} tokens{cost_str}\n"
+        f"Not in OpenAI's free-token offer — billed from the first token. {then}"
     )
 
 
 def check_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
                 names: NameStore = None) -> tuple[bool, bool]:
-    """Fire alerts for newly crossed org-wide spend milestones AND per-project
-    spend thresholds. Returns (any_milestone_hit, cap_crossed).
-    `cap_crossed` is True the FIRST poll that observes total ≥ the org's daily limit
-    (after that, the milestone is in the notified set and won't re-fire).
-    Cost data has a 5-10 min OpenAI ingestion lag — alerts may arrive slightly
-    delayed, but that's still vastly better than the previous "never" state."""
+    """Org-wide spend milestones (plus one cap-level step per extra overcap step
+    past the alarm, so it never goes silent while the bleed continues) and
+    per-project thresholds, sent as ONE message per poll — silently unless the
+    highest crossing is urgent or the cap. Returns (any_crossed, cap_crossed);
+    `cap_crossed` is True the FIRST poll that observes total ≥ the org's daily
+    limit. Cost data lags 5–10 min, so alerts may arrive slightly late."""
     org = usage.org
     limit, step = org.daily_limit, org.spend_overcap_step
     total_cost = snap.get("total_cost", 0.0) or 0.0
-    hit = False
     cap_crossed = False
 
-    # ── Org-wide spend milestones ───────────────────────────────────────────
     notified = usage.get_spend_milestones_notified()
-    for threshold, level in org.spend_milestones:
-        if total_cost >= threshold and threshold not in notified:
-            hit = True
-            usage.add_spend_milestone_notified(threshold)
-            _broadcast(lambda n, t=threshold, c=total_cost, l=level:
-                fmt_spend_milestone(t, c, l, n, limit), subs, names, org=org)
-            if level == "cap":
-                cap_crossed = True
-
-    # ── Overcap escalation — never go silent while the bleed continues ──────
-    # Every extra overcap step past the cap fires another cap-level alert
-    # (Lab 2: $2.50, $3.00, …). Dynamic thresholds share the same notified list;
-    # they never collide with the static ones (all static thresholds ≤ the limit).
+    org_hits = [(t, l) for t, l in org.spend_milestones if total_cost >= t and t not in notified]
     if total_cost > limit:
-        steps = int((total_cost - limit) / step)
-        for i in range(1, steps + 1):
-            threshold = round(limit + i * step, 2)
-            if threshold not in notified:
-                hit = True
-                cap_crossed = True
-                usage.add_spend_milestone_notified(threshold)
-                _broadcast(lambda n, t=threshold, c=total_cost:
-                    fmt_spend_milestone(t, c, "cap", n, limit), subs, names, org=org)
+        for i in range(1, int((total_cost - limit) / step) + 1):
+            t = round(limit + i * step, 2)
+            if t not in notified:
+                org_hits.append((t, "cap"))
+    for t, l in org_hits:
+        usage.add_spend_milestone_notified(t)
+        cap_crossed = cap_crossed or l == "cap"
 
-    # ── Per-project spend thresholds ────────────────────────────────────────
+    proj_hits: dict[str, tuple] = {}   # pid -> (highest threshold crossed now, cost)
     for pid, p in snap.get("projects", {}).items():
         cost = float(p.get("cost_usd", 0.0) or 0.0)
         if cost <= 0:
             continue
-        proj_notified = usage.get_project_spend_notified(pid)
-        for threshold in org.project_spend_thresholds:
-            if cost >= threshold and threshold not in proj_notified:
-                hit = True
-                usage.add_project_spend_notified(pid, threshold)
-                _broadcast(lambda n, p=pid, t=threshold, c=cost:
-                    fmt_project_spend(p, t, c, n), subs, names, org=org)
+        done = usage.get_project_spend_notified(pid)
+        for t in org.project_spend_thresholds:
+            if cost >= t and t not in done:
+                usage.add_project_spend_notified(pid, t)
+                proj_hits[pid] = (t, cost)
 
-    return hit, cap_crossed
+    if not org_hits and not proj_hits:
+        return False, False
+    if org_hits:
+        level = org_hits[-1][1]
+    else:   # a project alone rings only at its top threshold
+        level = "urgent" if any(t == org.project_spend_thresholds[-1] for t, _ in proj_hits.values()) else "casual"
+    projects = [(pid, t, c) for pid, (t, c) in proj_hits.items()]
+    _broadcast(lambda n, tc=total_cost, l=level, pr=projects: fmt_spend_update(tc, l, pr, org, n),
+               subs, names, org=org, header=False, silent=(level == "casual"))
+    return True, cap_crossed
 
 
 def check_unlisted_models(snap: dict, usage: UsageStore, subs: SubscriberStore,
@@ -3256,8 +3326,11 @@ def check_unlisted_models(snap: dict, usage: UsageStore, subs: SubscriberStore,
                 continue
             est_cost = p_cost * (tok / total_tok) if p_cost > 0 and tok > 0 else 0.0
             usage.mark_unlisted_alerted(pid, model)
-            _broadcast(lambda n, pi=pid, mo=model, r=reqs, t=tok, c=est_cost:
-                fmt_unlisted_model(pi, mo, r, t, c, n), subs, names, org=usage.org)
+            # Silent when a quarantine follows: that message is the one that rings.
+            follows = not usage.is_exempt(pid, QUARANTINE_TRACK)
+            _broadcast(lambda n, pi=pid, mo=model, r=reqs, t=tok, c=est_cost, q=follows:
+                fmt_unlisted_model(pi, mo, r, t, c, n, usage.org, q), subs, names, org=usage.org,
+                header=False, silent=follows)
             fired = True
             print(f"[unlisted-alert] {usage.org.projects.get(pid, pid)}/{model} "
                   f"reqs={reqs} tok={tok} est_cost=${est_cost:.4f}")
@@ -3282,23 +3355,21 @@ QUARANTINE_RETRY_SECS = 180
 
 
 def fmt_quarantine(proj_name: str, models: list, org: Org, name: str = "Bach") -> str:
-    ms = ", ".join(f"<code>{html.escape(m)}</code>" for m in models[:5])
+    ms = ", ".join(f"<code>{html.escape(m)}</code>" for m in models)
     return (
-        f"☣️ <b>{proj_name} — QUARANTINED.</b>\n\n"
-        f"Off-watchlist model usage detected: {ms}\n"
-        f"Unlisted models bill at standard rates from the first token and cannot "
-        f"be selectively throttled — <b>every</b> rate limit of this project is "
-        f"now 0 until UTC midnight.\n"
-        f"<i>Release: {_archive_hint(org, 'Unseal', 'Both')}. "
-        f"Monarch {name}, the breach is contained.</i>"
+        f"☣️ <b>{_org_tag(org)}{proj_name} quarantined</b>\n"
+        f"Used off-list models ({ms}), billed from the first token. Every rate limit of "
+        f"the project is 0 until 00:00 UTC.\n"
+        f"Release: {_archive_hint(org, 'Unseal', 'Both')}\n"
+        f"<i>The breach is contained, Monarch {name}.</i>"
     )
 
 
-def fmt_quarantine_release(proj_name: str, name: str = "Bach") -> str:
+def fmt_quarantine_release(proj_name: str, name: str = "Bach", org: Optional[Org] = None) -> str:
     return (
-        f"🔓 <b>{proj_name} — quarantine lifted.</b>\n"
-        f"<i>All rate limits restored; exempt from re-quarantine until UTC "
-        f"midnight. Off-watchlist spend is on your head now, Monarch {name}.</i>"
+        f"🔓 <b>{_org_tag(org)}{proj_name} released from quarantine</b>\n"
+        f"All rate limits restored; exempt from re-quarantine until 00:00 UTC.\n"
+        f"<i>Off-list spend is on your head now, Monarch {name}.</i>"
     )
 
 
@@ -3368,7 +3439,7 @@ def _quarantine_unlisted_users(snap: dict, usage: UsageStore, subs: SubscriberSt
                 print(f"[quarantine] {proj} sealed (models: {offenders[pid]})")
                 _log_event("quarantine", project=proj, models=offenders[pid])
                 _broadcast(lambda n, p=proj, ms=offenders[pid]:
-                    fmt_quarantine(p, ms, org, n), subs, names, org=org)
+                    fmt_quarantine(p, ms, org, n), subs, names, org=org, header=False)
             elif not retried:
                 _QUARANTINE_NOOP.add((day, pid))
     finally:
@@ -3389,7 +3460,8 @@ def _release_quarantine(pid: str, usage: UsageStore, subs: SubscriberStore,
         usage.add_track_exemption(pid, QUARANTINE_TRACK)
         print(f"[quarantine] {proj} released + exempt")
         _log_event("quarantine_release", project=proj)
-        _broadcast(lambda n, p=proj: fmt_quarantine_release(p, n), subs, names, org=usage.org)
+        _broadcast(lambda n, p=proj: fmt_quarantine_release(p, n, usage.org), subs, names,
+                   org=usage.org, header=False)
         return "unsealed"
     return result
 
@@ -3397,30 +3469,26 @@ def _release_quarantine(pid: str, usage: UsageStore, subs: SubscriberStore,
 def seed_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
                names: NameStore = None) -> None:
     """First-of-day spend seed: mark every already-crossed threshold as notified
-    so we don't flood the chat on bot restart, but fire the HIGHEST one as a
+    so we don't flood the chat on bot restart, but send the HIGHEST one as a
     catch-up so the user sees today's true position. Atomic via claim_spend_seed."""
     if not usage.claim_spend_seed():
         return
-
     org = usage.org
     limit, step = org.daily_limit, org.spend_overcap_step
     total_cost = snap.get("total_cost", 0.0) or 0.0
 
-    # Mark every crossed org threshold as notified — silent — then fire only the
-    # highest as a catch-up broadcast (mirrors token seed_milestones pattern).
-    # Includes the dynamic overcap steps ($2.50, $3.00, …) so a restart at $3.40
-    # doesn't flood every step in one burst on the next poll.
+    # Includes the dynamic overcap steps (Lab 2: $2.50, $3.00, …) so a restart
+    # at $3.40 doesn't flood every step in one burst on the next poll.
     crossed = [(t, l) for t, l in org.spend_milestones if total_cost >= t]
     if total_cost > limit:
-        steps = int((total_cost - limit) / step)
-        for i in range(1, steps + 1):
+        for i in range(1, int((total_cost - limit) / step) + 1):
             crossed.append((round(limit + i * step, 2), "cap"))
     for t, _ in crossed:
         usage.add_spend_milestone_notified(t)
     if crossed and subs:
-        t, l = crossed[-1]
-        _broadcast(lambda n, t=t, c=total_cost, l=l: fmt_spend_milestone(t, c, l, n, limit),
-                   subs, names, org=org)
+        lvl = crossed[-1][1]
+        _broadcast(lambda n, c=total_cost, l=lvl: fmt_spend_update(c, l, [], org, n),
+                   subs, names, org=org, header=False, silent=(lvl == "casual"))
 
     # Per-project: mark crossed silently (no catch-up broadcast — could be many).
     for pid, p in snap.get("projects", {}).items():
@@ -3431,89 +3499,75 @@ def seed_spend(snap: dict, usage: UsageStore, subs: SubscriberStore,
 
 
 def check_milestones(snap: dict, usage: UsageStore, subs: SubscriberStore, names: NameStore = None) -> bool:
-    """Called after every non-seed poll. Fires alerts for newly crossed thresholds.
-    Returns True if at least one new milestone was hit (used to trigger urgent mode)."""
-    hit = False
-
-    org = usage.org
-
-    # Normal band (the org's normal cap)
-    total_tok = snap.get("total_normal_tokens", 0)
-    notified  = usage.get_milestones_notified()
-    for threshold, level in org.normal_milestones:
-        if total_tok >= threshold and threshold not in notified:
-            hit = True
-            usage.add_milestone_notified(threshold)
-            _broadcast(lambda n, t=threshold, c=total_tok, l=level: fmt_token_milestone(t, c, l, n, org),
-                       subs, names, org=org)
-
-    # Premium band (the org's premium cap)
-    total_premium    = snap.get("total_premium_tokens", 0)
-    notified_premium = usage.get_premium_milestones_notified()
-    for threshold, level in org.premium_milestones:
-        if total_premium >= threshold and threshold not in notified_premium:
-            hit = True
-            usage.add_premium_milestone_notified(threshold)
-            _broadcast(lambda n, t=threshold, c=total_premium, l=level:
-                       fmt_premium_token_milestone(t, c, l, org, n), subs, names, org=org)
-
+    """Called after every non-seed poll. One alert per group for the HIGHEST step
+    crossed since the last poll (a jump past 70% and 80% is one message). Calm
+    steps go out silently. Steps below the seal point are recorded but not sent
+    once the group is sealed — on 2026-10-04 a 9.00M warning arrived after the
+    seal message had already said 9.56M. Returns True if any step was crossed
+    (used to trigger urgent mode)."""
+    org, hit = usage.org, False
+    for track, ladder, get, add in (
+            ("normal",  org.normal_milestones,  usage.get_milestones_notified,         usage.add_milestone_notified),
+            ("premium", org.premium_milestones, usage.get_premium_milestones_notified, usage.add_premium_milestone_notified)):
+        total, notified = snap.get(f"total_{track}_tokens", 0), get()
+        crossed = [(t, l) for t, l in ladder if total >= t and t not in notified]
+        if not crossed:
+            continue
+        hit = True
+        for t, _ in crossed:
+            add(t)
+        t, level = crossed[-1]
+        if level != "cap" and usage.is_mass_sealed(track):
+            continue   # stale: the seal message already reported more
+        _broadcast(lambda n, tr=track, t=t, c=total, l=level: fmt_group_milestone(tr, t, c, l, org, n),
+                   subs, names, org=org, header=False, silent=(level == "casual"))
     return hit
 
 
 # ── Command handlers ───────────────────────────────────────────────────────
 
+_SNAPSHOT_DATE_RE = re.compile(r"-\d{4}-\d{2}-\d{2}$")
+
+
+def _model_base(model: str) -> str:
+    """'gpt-4.1-mini-2025-04-14' → 'gpt-4.1-mini' (the dated snapshot wraps on phones)."""
+    return _SNAPSHOT_DATE_RE.sub("", model)
+
+
 def cmd_usage(usage: UsageStore, name: str = "Bach") -> str:
-    """Today's usage of `usage.org` in one report: every project busiest first
-    (tokens, requests, spend, per-model lines — 🧪 marks an off-watchlist model),
-    a by-model total when several projects ran, and the three lane lines.
-    Replaces the tokens / projects / rank / models reports, which each showed a
-    slice of the same data."""
+    """One org's part of /usage: every project busiest first (tokens, requests,
+    spend, a line per model — base name, 🧪 = off-list), then the totals and the
+    three lane lines. Replaces the tokens / projects / rank / models reports."""
     snap     = usage.get()
     projects = snap.get("projects", {})
     active   = {pid: p for pid, p in projects.items()
                 if p.get("total_tokens", 0) > 0 or p.get("cost_usd", 0) > 0}
     if not active:
-        return f"No usage today, Monarch {name}."
+        return "No usage today."
 
     def _mtok(m: dict) -> int:
         return m.get("input", 0) + m.get("output", 0)
 
-    def _tag(model: str) -> str:
-        return " 🧪" if _track_for_model(model) is None else ""
-
-    lines = [f"📊 <b>Usage — {snap.get('date', today_str())}</b>\n"]
-    agg: dict[str, int] = {}
+    lines = []
     for pid, p in sorted(active.items(), key=lambda x: (x[1].get("total_tokens", 0),
                                                          x[1].get("cost_usd", 0)), reverse=True):
-        lines.append(f"🔹 <b>{p['name']}</b>  {_fmt_tokens(p.get('total_tokens', 0))}  ·  "
-                     f"{p.get('num_requests', 0):,} reqs  ·  ${p.get('cost_usd', 0.0):.4f}")
+        lines.append(f"<b>{p['name']}</b> · {_fmt_tokens(p.get('total_tokens', 0))} · "
+                     f"{p.get('num_requests', 0):,} req · {_fmt_cost(p.get('cost_usd', 0.0))}")
         for model, m in sorted(p.get("models", {}).items(), key=lambda x: _mtok(x[1]), reverse=True):
-            agg[model] = agg.get(model, 0) + _mtok(m)
-            lines.append(f"   <code>{html.escape(model)}</code>  {_fmt_tokens(m.get('input', 0))} in / "
-                         f"{_fmt_tokens(m.get('output', 0))} out  ({m.get('requests', 0):,} reqs){_tag(model)}")
-        lines.append("")
-
-    total_tok = sum(p.get("total_tokens", 0) for p in active.values())
-    if len(active) > 1 and agg:
-        lines.append("<b>By model</b>")
-        for model, tok in sorted(agg.items(), key=lambda x: x[1], reverse=True):
-            lines.append(f"   <code>{html.escape(model)}</code>  {_fmt_tokens(tok)}  "
-                         f"({tok * 100 // max(total_tok, 1)}%){_tag(model)}")
-        lines.append("")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"🔢 Total: <b>{_fmt_tokens(total_tok)}</b>  •  "
-                 f"{sum(p.get('num_requests', 0) for p in active.values()):,} requests  •  "
-                 f"💰 <b>${snap.get('total_cost', 0.0):.4f}</b>")
+            tag = " 🧪" if _track_for_model(model) is None else ""
+            lines.append(f"   <code>{html.escape(_model_base(model))}</code> {_fmt_tokens(m.get('input', 0))} in / "
+                         f"{_fmt_tokens(m.get('output', 0))} out{tag}")
+    lines.append(f"Total <b>{_fmt_tokens(sum(p.get('total_tokens', 0) for p in active.values()))}</b> · "
+                 f"{sum(p.get('num_requests', 0) for p in active.values()):,} req · "
+                 f"spend <b>{_fmt_cost(snap.get('total_cost', 0.0))}</b>")
     lines.extend(_fmt_lane_lines(snap.get("total_premium_tokens", 0),
                                  snap.get("total_normal_tokens", 0), snap.get("lane_costs"), usage.org))
     return "\n".join(lines)
 
 
 def cmd_spending(usage: UsageStore, name: str = "Bach") -> str:
-    """The money view of `usage.org`, fetched live: this month and last month per
-    project, plus the last 31 days' token and request totals (the old `recent`
-    report, whose per-project costs duplicated these two months)."""
+    """One org's part of /spending, fetched live: this month and last month per
+    project, plus the last 31 days' token and request totals."""
     org        = usage.org
     now        = datetime.now(timezone.utc)
     cy, cm     = now.year, now.month
@@ -3523,34 +3577,26 @@ def cmd_spending(usage: UsageStore, name: str = "Bach") -> str:
         f_prev   = ex.submit(_in_org, org, _fetch_monthly_costs, org, py, pm)
         f_recent = ex.submit(_in_org, org, _fetch_recent_usage, org, 31)
     curr_costs, prev_costs, recent = f_curr.result(), f_prev.result(), f_recent.result()
-
-    lines = ["💰 <b>Spending</b>\n"]
+    err = html.escape(org.last_api_error or "unknown")
+    lines = []
 
     def _section(label: str, costs: Optional[dict]):
-        lines.append(f"<b>── {label} ──</b>")
         if costs is None:
-            lines.append(f"  ⚠️ OpenAI API error ({html.escape(org.last_api_error or 'unknown')}) — "
-                         f"spend unknown, NOT zero.\n")
+            lines.append(f"<b>{label}</b> · ⚠️ OpenAI API error ({err}) — spend unknown, NOT zero.")
             return
+        lines.append(f"<b>{label}</b> · <b>{_fmt_cost(sum(costs.values()))}</b>")
         active = {pid: v for pid, v in costs.items() if v > 0.0}
-        if active:
-            for pid, cost in sorted(active.items(), key=lambda x: x[1], reverse=True):
-                proj_label = "Unattributed" if pid == "__org__" else org.projects.get(pid, pid)
-                lines.append(f"  • {proj_label}: <b>${cost:.4f}</b>")
-        else:
-            lines.append("  No spend recorded.")
-        lines.append(f"  Total: <b>${sum(costs.values()):.4f}</b>\n")
+        if not active:
+            lines.append("   No spend recorded.")
+        for pid, cost in sorted(active.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"   {'Unattributed' if pid == '__org__' else org.projects.get(pid, pid)}: {_fmt_cost(cost)}")
 
-    _section(_fmt_month(cy, cm) + " (current)", curr_costs)
-    _section(_fmt_month(py, pm) + " (previous)", prev_costs)
-
-    lines.append("<b>── Last 31 days ──</b>")
+    _section(_fmt_month(cy, cm) + " (so far)", curr_costs)
+    _section(_fmt_month(py, pm), prev_costs)
     if recent is None:
-        lines.append(f"  ⚠️ OpenAI API error ({html.escape(org.last_api_error or 'unknown')}) — "
-                     f"usage unknown, NOT zero.")
+        lines.append(f"<b>Last 31 days</b> · ⚠️ OpenAI API error ({err}) — usage unknown, NOT zero.")
     else:
-        lines.append(f"  🔢 <b>{_fmt_tokens(recent[0])}</b> tokens   📨 <b>{recent[1]:,}</b> requests")
-    lines.append(f"\n<i>Monarch {name}, your accounts are presented in full.</i>")
+        lines.append(f"<b>Last 31 days</b> · {_fmt_tokens(recent[0])} tokens · {recent[1]:,} requests")
     return "\n".join(lines)
 
 
@@ -3558,7 +3604,7 @@ def cmd_spending(usage: UsageStore, name: str = "Bach") -> str:
 #
 # Flow:  archive  →  [Seal] [Unseal] [Cancel]            (status of every org)
 #          → action chosen → [Lab 2] [Lab 3] [Cancel]    (the org — skipped with one org)
-#            → org chosen → [Normal] [Premium] [Both] [Cancel]   (the "mode")
+#            → org chosen → [1M group] [10M group] [Both] [Cancel]   (the "mode")
 #              → mode chosen → that org's project buttons + [ALL] [Cancel]
 #                → project chosen → applies seal/unseal, re-renders the status
 #
@@ -3577,18 +3623,23 @@ def cmd_spending(usage: UsageStore, name: str = "Bach") -> str:
 # giaotien-project (created 2026-09-22) went a week outside every seal,
 # quarantine and archive button because it wasn't in the hardcoded table. Each
 # org's live project list is merged in at startup and hourly, and cached to disk
-# (Org.cache_path) so a reboot with DNS down still knows every project.
+# (Org.cache_path) so a reboot with DNS down still knows every project. Projects
+# the API reports ARCHIVED are dropped (six Lab 2 projects on 2026-10-27 would
+# otherwise have stayed in every seal sweep and archive menu for good) — never
+# merely-missing ones: a short API reply must not unguard a live project.
 OPENAI_PROJECTS_URL = "https://api.openai.com/v1/organization/projects"
 PROJECT_SYNC_SECS   = 3600
 _PROJECT_NAME_UNSAFE = re.compile(r"[<>&]")   # names land in HTML-mode Telegram messages
 
 
-def _fetch_active_projects(org: Org) -> Optional[dict[str, str]]:
-    """{project_id: name} for every active project of `org`; None on failure."""
-    out: dict[str, str] = {}
+def _fetch_projects(org: Org) -> Optional[tuple[dict[str, str], set[str]]]:
+    """({project_id: name} of active projects, {ids the API reports archived})
+    for `org`; None on failure."""
+    active: dict[str, str] = {}
+    archived: set[str] = set()
     after = None
     while True:
-        params = {"limit": 100}
+        params = {"limit": 100, "include_archived": "true"}
         if after:
             params["after"] = after
         try:
@@ -3602,10 +3653,14 @@ def _fetch_active_projects(org: Org) -> Optional[dict[str, str]]:
             return None
         data = r.json()
         for p in data.get("data", []):
-            if p.get("id") and p.get("status", "active") == "active":
-                out[p["id"]] = _PROJECT_NAME_UNSAFE.sub("", p.get("name") or "") or p["id"]
+            if not p.get("id"):
+                continue
+            if p.get("status", "active") == "active":
+                active[p["id"]] = _PROJECT_NAME_UNSAFE.sub("", p.get("name") or "") or p["id"]
+            elif p.get("status") == "archived":
+                archived.add(p["id"])
         if not data.get("has_more") or not data.get("last_id"):
-            return out
+            return active, archived
         after = data["last_id"]
 
 
@@ -3613,7 +3668,7 @@ def _merge_projects(org: Org, found: dict[str, str]) -> list[str]:
     """Merge `found` into org.projects / org.project_index; return newly added ids.
     Both are REBOUND, never mutated in place: other threads iterate them, and an
     in-place insert would raise 'dictionary changed size during iteration' there.
-    Append-only, so existing archive-button indices never shift."""
+    New projects are appended; removal happens only in _drop_archived."""
     foreign = [p for p in found if any(p in o.projects for o in ORGS.values() if o is not org)]
     if foreign:
         # Project ids are globally unique, so another org owning one means a
@@ -3626,6 +3681,22 @@ def _merge_projects(org: Org, found: dict[str, str]) -> list[str]:
         org.projects      = {**org.projects, **{p: found[p] for p in new + renamed}}
         org.project_index = org.project_index + [p for p in new if p not in org.project_index]
     return new
+
+
+def _drop_archived(usage: "UsageStore", archived: set) -> list[str]:
+    """Remove projects the API reports archived from `usage.org`'s table (rebound,
+    like _merge_projects); return their names. One still holding a seal capture
+    or a queued restore stays until that is restored — the restore needs it."""
+    org  = usage.org
+    held = {pid for tracks in (usage.get_sealed_tracks(), usage.get_pending_track_unseal())
+            for info in tracks.values() for pid in info.get("originals_by_project", {})}
+    gone = [p for p in org.projects if p in archived and p not in held]
+    if not gone:
+        return []
+    labels = [org.projects[p] for p in gone]
+    org.projects      = {p: n for p, n in org.projects.items() if p not in gone}
+    org.project_index = [p for p in org.project_index if p not in gone]
+    return labels
 
 
 def _load_project_cache(org: Org) -> None:
@@ -3646,15 +3717,22 @@ def _sync_projects(usage: "UsageStore", subs: "SubscriberStore" = None,
     """Pull `usage.org`'s live project list, merge it, persist its cache, and
     announce any new project. Returns the newly added ids, or None if the API
     call failed."""
-    org   = usage.org
-    found = _fetch_active_projects(org)
-    if found is None:
+    org     = usage.org
+    fetched = _fetch_projects(org)
+    if fetched is None:
         return None
-    new = _merge_projects(org, found)
+    found, archived = fetched
+    new     = _merge_projects(org, found)
+    dropped = _drop_archived(usage, archived)
     try:
         _atomic_write_json(org.cache_path, org.projects)
     except Exception as e:
         print(f"[projects] cache write failed: {e}")
+    if dropped:
+        print(f"[projects] archived on the platform, no longer guarded: {', '.join(dropped)}")
+        _log_event("project_archived", org=org.id, projects=dropped)
+        if subs is not None:
+            _broadcast(lambda n, l=dropped: fmt_archived_projects(l, n), subs, names, org=org)
     if new:
         labels = [org.projects[p] for p in new]
         print(f"[projects] new project(s) detected: {', '.join(labels)}")
@@ -3662,6 +3740,15 @@ def _sync_projects(usage: "UsageStore", subs: "SubscriberStore" = None,
         if subs is not None:
             _broadcast(lambda n, l=labels: fmt_new_projects(l, n), subs, names, org=org)
     return new
+
+
+def fmt_archived_projects(labels: list, name: str = "Bach") -> str:
+    items = "\n".join(f"• <b>{l}</b>" for l in labels)
+    return (
+        f"🗄️ <b>Project(s) archived on the platform</b>\n\n{items}\n\n"
+        "Dropped from track seals, quarantine and the archive controls.\n"
+        f"<i>Monarch {name}, the ledger is pruned.</i>"
+    )
 
 
 def fmt_new_projects(labels: list, name: str = "Bach") -> str:
@@ -3697,8 +3784,8 @@ def _kb_archive_orgs(action: str) -> list:
 def _kb_archive_mode(action: str, org: Org) -> list:
     return [
         [
-            {"text": "📦 Normal",  "callback_data": f"arch:{org.id}:{action}:normal:-"},
-            {"text": "⭐ Premium", "callback_data": f"arch:{org.id}:{action}:premium:-"},
+            {"text": "⭐ 1M group",  "callback_data": f"arch:{org.id}:{action}:premium:-"},
+            {"text": "📦 10M group", "callback_data": f"arch:{org.id}:{action}:normal:-"},
         ],
         [
             {"text": "🔱 Both",    "callback_data": f"arch:{org.id}:{action}:both:-"},
@@ -3824,7 +3911,7 @@ def handle_archive_callback(data: str, usages: dict, subs: SubscriberStore,
     if pidx == "-":
         # Mode chosen → show that org's project picker.
         return (f"{_fmt_archive_status(usage, name)}\n\n"
-                f"<b>{verb.title()} — {org.short} — {mode} — pick a project:</b>",
+                f"<b>{verb.title()} — {org.short} — {_mode_label(mode)} — pick a project:</b>",
                 _kb_archive_projects(action, mode, usage), None)
 
     # Project (or ALL) chosen → apply. Everything that can fail (validation,
@@ -3846,10 +3933,10 @@ def handle_archive_callback(data: str, usages: dict, subs: SubscriberStore,
                 _mass_unseal_track(QUARANTINE_TRACK, usage, subs, names,
                                    reason="manual all (quarantine)")
         placeholder = (f"{_fmt_archive_status(usage, name)}\n\n"
-                       f"🔄 <i>Working on {action} ALL {org.short} ({mode}) — "
+                       f"🔄 <i>Working on {action} ALL {org.short} ({_mode_label(mode)}) — "
                        f"watch chat for progress…</i>")
         after_kb, prompt = _kb_archive_root, ""
-        toast = f"Started {action} ALL {org.short} ({mode})."
+        toast = f"Started {action} ALL {org.short} ({_mode_label(mode)})."
     else:
         # Single project — the id must be one of THIS org's projects.
         pid = pidx
@@ -3867,11 +3954,11 @@ def handle_archive_callback(data: str, usages: dict, subs: SubscriberStore,
                 # (restores off-watchlist rows + exempts from re-quarantine today).
                 _release_quarantine(pid, usage, subs, names)
         placeholder = (f"{_fmt_archive_status(usage, name)}\n\n"
-                       f"🔄 <i>Working on {action} {proj} ({org.short}, {mode})…</i>")
+                       f"🔄 <i>Working on {action} {proj} ({org.short}, {_mode_label(mode)})…</i>")
         after_kb = lambda: _kb_archive_projects(action, mode, usage)
         # The picker stays up afterwards — keep saying what its buttons do.
-        prompt = f"<b>{verb.title()} — {org.short} — {mode} — pick a project:</b>"
-        toast = f"Started {action} {proj} ({org.short}, {mode})."
+        prompt = f"<b>{verb.title()} — {org.short} — {_mode_label(mode)} — pick a project:</b>"
+        toast = f"Started {action} {proj} ({org.short}, {_mode_label(mode)})."
 
     if not _try_claim_busy(org):
         return None, None, f"A seal/unseal is already running on {org.short} — try again shortly."
@@ -3898,7 +3985,7 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach", sign_off: bool = 
     lines = [f"🗃️ <b>Archive — {title}{snap.get('date', today_str())}</b>\n"]
 
     lines.append("<b>Tracks</b>")
-    for track, consumed in (("normal", n_tok), ("premium", p_tok)):
+    for track, consumed in (("premium", p_tok), ("normal", n_tok)):
         cap, threshold = org.cap(track), org.threshold(track)
         pct = consumed / cap * 100 if cap else 0
         n_sealed = len(sealed_tracks.get(track, {}).get("originals_by_project", {}))
@@ -3910,25 +3997,25 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach", sign_off: bool = 
             tag = f"✅ active · seals at {_fmt_tokens(threshold)}"
         else:
             tag = "✅ active"
-        lines.append(f"  • <b>{track}</b>: {_fmt_tokens(consumed)} / {_fmt_cap(cap)} "
+        lines.append(f"  • <b>{_group(track)}</b>: {_fmt_tokens(consumed)} / {_fmt_cap(cap)} "
                      f"({pct:.1f}%). Cost: {_fmt_cost(lane_costs.get(track))}  —  {tag}")
     lines.append(f"  • <b>exotic</b>: {_fmt_cost(lane_costs.get('exotic'))} "
-                 f"(off-watchlist spend — no free allowance)")
+                 f"(models outside the offer — billed from the first token)")
     lines.append("")
 
     lines.append("<b>Projects</b>")
     for pid, proj_name in sorted(org.projects.items(), key=lambda kv: kv[1]):
         tags = []
         if pid in sealed_tracks.get(QUARANTINE_TRACK, {}).get("originals_by_project", {}):
-            tags.append("☣️")                            # quarantined (off-watchlist use)
-        for t in ("normal", "premium"):
+            tags.append("☣️")                            # quarantined (off-list use)
+        for t in ("premium", "normal"):
             if pid in sealed_tracks.get(t, {}).get("originals_by_project", {}):
-                tags.append(f"🔒{t[0].upper()}")        # 🔒N / 🔒P
+                tags.append(f"🔒{_tag(t)}")             # 🔒1M / 🔒10M
         for t in exemptions.get(pid, []):
-            tags.append(f"🔓{t[0].upper()}")
+            tags.append(f"🔓{_tag(t)}")
         for t in pending_tracks:
             if pid in pending_tracks[t].get("originals_by_project", {}):
-                tags.append(f"⏳{t[0].upper()}")
+                tags.append(f"⏳{_tag(t)}")
         status = " ".join(tags) if tags else "✅"
         lines.append(f"  • <b>{proj_name}</b> — {status}")
     if sign_off:
@@ -3937,9 +4024,14 @@ def _fmt_archive_status(usage: UsageStore, name: str = "Bach", sign_off: bool = 
     return "\n".join(lines)
 
 
+def _tag(track: str) -> str:
+    """Short track tag for the archive project list: 1M / 10M / Q."""
+    return {"premium": "1M", "normal": "10M"}.get(track, "Q")
+
+
 def _archive_legend(name: str) -> list:
     return ["<i>🔒=sealed ☣️=quarantined 🔓=exempt ⏳=restore-pending · "
-            "N=normal P=premium F=quarantine</i>",
+            "1M / 10M = token group, Q = quarantine</i>",
             f"<i>Monarch {name}, the archive registry is presented.</i>"]
 
 
@@ -3950,30 +4042,27 @@ def _fmt_archive_all(usages: list, name: str = "Bach") -> str:
 
 
 def _refresh_section(usage: UsageStore) -> str:
-    """One org's block of the /refresh reply (fresh fetch, cached on failure)."""
+    """One org's part of the /refresh reply (fresh fetch, cached on failure)."""
     org = usage.org
     with _org_context(org):
         snap = fetch_today_usage(org)
         if snap:
             enriched   = _enrich_costs(snap, usage)
-            total      = enriched.get("total_cost", 0.0)
-            total_tok  = sum(p.get("total_tokens", 0) for p in snap.get("projects", {}).values())
-            stale_note = (f"  <i>(cost as of {_fmt_ts(enriched.get('costs_ts'))})</i>"
+            stale_note = (f" <i>(cost as of {_fmt_utc(enriched.get('costs_ts'))})</i>"
                           if enriched.get("costs_stale") else "")
             return "\n".join([
-                f"{_org_header(org)}Tokens today: <b>{_fmt_tokens(total_tok)}</b>",
                 *_fmt_lane_lines(snap.get("total_premium_tokens", 0),
                                  snap.get("total_normal_tokens", 0), enriched.get("lane_costs"), org),
-                f"Spend today:  <b>${total:.4f}</b>{stale_note}",
+                f"💵 Spend today: <b>{_fmt_cost(enriched.get('total_cost', 0.0))}</b>{stale_note}",
                 *_fmt_guard_lines(usage),
             ])
         cached = usage.get()
         if cached and cached.get("projects"):
             enriched = _enrich_costs(cached, usage, live=False)
-            return (f"{_org_header(org)}⚠️ <b>OpenAI API error ({html.escape(org.last_api_error or 'unknown')}) "
+            return (f"⚠️ <b>OpenAI API error ({html.escape(org.last_api_error or 'unknown')}) "
                     f"— showing last known data.</b>\n\n"
                     + fmt_daily_snapshot(enriched, org))
-        return (f"{_org_header(org)}⚠️ <b>OpenAI API error ({html.escape(org.last_api_error or 'unknown')}) "
+        return (f"⚠️ <b>OpenAI API error ({html.escape(org.last_api_error or 'unknown')}) "
                 f"and no prior data — this org is not being guarded.</b>")
 
 
@@ -3985,25 +4074,23 @@ def _fmt_guard_lines(usage: UsageStore) -> list:
     pending = usage.get_pending_track_unseal()
     names   = usage.org.projects
     bits = []
-    for t in ("normal", "premium"):
+    for t in ("premium", "normal"):
         n = len(sealed.get(t, {}).get("originals_by_project", {}))
         if n:
-            bits.append(f"🔒 {t} ×{n}")
+            bits.append(f"🔒 {_group(t)} ×{n}")
     q = sealed.get(QUARANTINE_TRACK, {}).get("originals_by_project", {})
     if q:
         bits.append("☣️ " + ", ".join(names.get(pid, pid) for pid in q))
     n_pending = len({pid for info in pending.values() for pid in info.get("originals_by_project", {})})
     if n_pending:
         bits.append(f"⏳ {n_pending} restore(s) pending")
-    lines = [f"Guard: {' · '.join(bits)}"] if bits else []
+    lines = [f"🛡 Guard: {' · '.join(bits)}"] if bits else []
     active = usage.get_active_projects()
-    window = usage.get_active_window_mins()
     if active:
         top = sorted(active.items(), key=lambda x: x[1], reverse=True)
-        lines.append(f"⚡ Active (last {window} min): "
-                     + ", ".join(f"{names.get(pid, pid)} ({n:,})" for pid, n in top))
+        lines.append("⚡ Active now: " + ", ".join(f"{names.get(pid, pid)} ({n:,} req)" for pid, n in top))
     else:
-        lines.append(f"⚡ Active (last {window} min): none")
+        lines.append("⚡ Active now: none")
     return lines
 
 
@@ -4020,14 +4107,10 @@ def cmd_refresh(usages: list, subs: SubscriberStore, names: NameStore = None,
     the Telegram thread."""
     for u in usages:
         u.org.poll_now.set()
-    sections = _map_orgs(usages, _refresh_section)
-    return "\n".join([
-        "🔄 <b>Data refreshed.</b>\n",
-        "\n\n".join(sections),
-        "",
-        "<i>A full check is running now — any alert or seal follows in chat.</i>",
-        f"<i>Intelligence updated, Monarch {name}.</i>",
-    ])
+    now = datetime.now(timezone.utc)
+    return _per_org(usages, _refresh_section, warn=False,
+                    title=f"🔄 <b>Status</b> · {_fmt_day(now.strftime('%Y-%m-%d'))}, {now:%H:%M} UTC",
+                    footer=f"<i>Full check running. The ledger is current, Monarch {name}.</i>")
 
 
 def cmd_arise(chat_id: str, subs: SubscriberStore, name: str = "Bach", thread_id: int = None) -> str:
@@ -4104,7 +4187,12 @@ COMMAND_ALIASES = {
     "recent": "spending", "bill": "spending",
     "active": "refresh", "status": "refresh",
     "start": "help", "menu": "help",
+    "seal": "archive", "unseal": "archive", "archives": "archive",
 }
+# A near-miss of one of these runs it anyway, with a note (6 of 326 commands
+# in Sep–Oct 2026 were typos: peojects, archieve, refersh, …). Commands that
+# change something (arise, dismiss, setname) only get a suggestion.
+_SAFE_GUESS = {"refresh", "usage", "spending", "archive", "help"}
 # Telegram's "/" menu (setMyCommands) and the tap menu under help / refresh.
 MENU_COMMANDS = (
     ("refresh",  "🔄 Refresh",  "Today per org + run a full check now"),
@@ -4118,6 +4206,12 @@ def _canonical(cmd: str) -> Optional[str]:
     cmd = cmd.lower()
     cmd = COMMAND_ALIASES.get(cmd, cmd)
     return cmd if cmd in COMMANDS else None
+
+
+def _guess(cmd: str) -> Optional[str]:
+    """Nearest command for a typo ('peojects' → 'usage'), or None."""
+    near = difflib.get_close_matches(cmd.lower(), list(COMMANDS) + list(COMMAND_ALIASES), n=1, cutoff=0.75)
+    return _canonical(near[0]) if near else None
 
 
 def _kb_menu() -> list:
@@ -4146,7 +4240,7 @@ def _match_prefix(text: str, bot_username: Optional[str]) -> Optional[str]:
         tail = tail[0] if tail else ""
         if not cmd or (target and target.lower() != me):
             return None
-        if not target and _canonical(cmd) is None:
+        if not target and _canonical(cmd) is None and _guess(cmd) not in _SAFE_GUESS:
             return None
         return f"{cmd} {tail}".strip()
     return None
@@ -4166,13 +4260,23 @@ def _api_warning(usage: UsageStore) -> str:
     return ""
 
 
-def _per_org(usages: list, render) -> str:
+def _per_org(usages: list, render, title: str = None, footer: str = None,
+             warn: bool = True) -> str:
     """Run a single-org report for every org, one labelled section each —
     rendered in parallel, so one org's slow API can't double the Telegram
-    thread's wait."""
+    thread's wait — between an optional title and footer. A section that raises
+    becomes an error line; it used to sink the whole reply, other org included."""
     def _one(u):
-        return _org_header(u.org) + _api_warning(u) + render(u)
-    return "\n\n".join(_map_orgs(usages, _one))
+        try:
+            body = render(u)
+        except Exception as e:
+            print(f"[report error] {u.org.id}: {type(e).__name__}: {e}")
+            _log_event("report_error", org=u.org.id, error=f"{type(e).__name__}: {e}"[:300])
+            body = (f"⚠️ <b>This section failed</b> ({html.escape(type(e).__name__)}) — "
+                    f"the rest of the reply is unaffected.")
+        return _org_section(u.org) + (_api_warning(u) if warn else "") + body
+    out = "\n\n".join(_map_orgs(usages, _one))
+    return "\n\n".join(x for x in (title, out, footer) if x)
 
 
 def _map_orgs(usages: list, fn) -> list:
@@ -4196,27 +4300,37 @@ def dispatch(text: str, usages: list, subs: SubscriberStore,
     parts = rest.split()
     typed = parts[0].lower() if parts else "help"
     cmd   = _canonical(typed)
-
-    name = names.get(chat_id) if names else "Bach"
+    name  = names.get(chat_id) if names else "Bach"
+    note  = ""
+    if cmd is None:
+        guess = _guess(typed)
+        if guess in _SAFE_GUESS:
+            cmd, note = guess, f"<i>Read “{html.escape(typed)}” as /{guess}.</i>\n\n"
+        elif guess:
+            return f"Unknown command <code>{html.escape(typed)}</code> — did you mean /{guess}?", None
 
     if cmd == "setname":
         new_name = " ".join(parts[1:]) if len(parts) > 1 else ""
         return (cmd_setname(chat_id, new_name, names) if names else "Name store unavailable."), None
 
-    if cmd == "archive":
-        return cmd_archive(usages, name)   # (text, keyboard)
-
+    today = _fmt_day(today_str())
     routes = {
+        "archive":  lambda: cmd_archive(usages, name),
         "refresh":  lambda: (cmd_refresh(usages, subs, names, name), _kb_menu()),
-        "usage":    lambda: (_per_org(usages, lambda u: cmd_usage(u, name)), None),
-        "spending": lambda: (_per_org(usages, lambda u: cmd_spending(u, name)), None),
+        "usage":    lambda: (_per_org(usages, lambda u: cmd_usage(u, name),
+                                      title=f"📊 <b>Usage</b> · {today}",
+                                      footer=f"<i>All accounted for, Monarch {name}.</i>"), None),
+        "spending": lambda: (_per_org(usages, lambda u: cmd_spending(u, name),
+                                      title="💰 <b>Spending</b>",
+                                      footer=f"<i>Your accounts are presented in full, Monarch {name}.</i>"), None),
         "help":     lambda: (cmd_help(bot_username, name), _kb_menu()),
         "arise":    lambda: (cmd_arise(chat_id, subs, name, thread_id), None),
         "dismiss":  lambda: (cmd_dismiss(chat_id, subs, name), None),
     }
     handler = routes.get(cmd)
     if handler:
-        return handler()
+        text, kb = handler()
+        return note + text, kb
 
     mention = f"@{bot_username}" if bot_username else "@bot"
     return (f"Unknown command: <code>{html.escape(typed)}</code>. "
